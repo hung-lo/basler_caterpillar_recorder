@@ -1,0 +1,69 @@
+# Ten-second end-to-end test using the same image settings as the pilot.
+# Run previews first, then use this before starting the long recording.
+
+project: monarch_behavior_smoke_test
+subject: camera_setup
+output_root: ./recordings_test
+
+experiment:
+  animal_ids: [M01, M02, M03, M04, M05, M06, M07]
+  notes: "Ten-second camera and encoder test."
+ffmpeg: null
+
+schedule:
+  clip_duration_s: 10
+  interval_s: 10
+  number_of_clips: 1
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+cameras:
+  - label: arena_A_M01-M04
+    animal_ids: [M01, M02, M03, M04]
+    model: acA4024-29uc
+    serial: null
+    fps: 5
+    width: 4024
+    height: 3036
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+    output_width: 2012
+    output_height: 1518
+    exposure_us: 6000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30
+
+  - label: arena_B_M05-M07
+    animal_ids: [M05, M06, M07]
+    model: a2A1920-160ucBAS
+    serial: null
+    fps: 5
+    width: 1920
+    height: 1200
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+    output_width: 1920
+    output_height: 1200
+    exposure_us: 4000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30

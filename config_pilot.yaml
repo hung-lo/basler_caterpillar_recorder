@@ -1,0 +1,82 @@
+# Fast-start pilot configuration for two Basler color USB cameras.
+# Run `python record_basler.py --list-cameras` first. Because the two models are
+# unique, model matching works without serial numbers. Add serial values later
+# if the setup ever contains duplicate models.
+
+project: monarch_behavior_pilot
+subject: cohort_pilot01
+output_root: ./recordings
+
+experiment:
+  animal_ids: [M01, M02, M03, M04, M05, M06, M07]
+  outcome_definition: successful_adult_eclosion
+  notes: "Pilot: fixed individual enclosures; edit IDs before recording."
+
+# Optional absolute path or command name. Leaving this null uses ffmpeg on PATH.
+ffmpeg: null
+
+schedule:
+  # Start-to-start scheduling. Equal values make continuous back-to-back clips.
+  # The recommended pilot is continuous recording split into 30-minute files.
+  clip_duration_s: 1800
+  interval_s: 1800
+  total_duration_h: 24
+  # Alternative to total_duration_h:
+  # number_of_clips: 48
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+cameras:
+  # Recommended role: fixed overhead 2 x 2 grid containing M01-M04.
+  # Full sensor data are acquired at 5 fps, then downscaled before H.264 encoding.
+  - label: arena_A_M01-M04
+    animal_ids: [M01, M02, M03, M04]
+    model: acA4024-29uc
+    serial: null
+    fps: 5
+    width: 4024
+    height: 3036
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+    output_width: 2012
+    output_height: 1518
+    exposure_us: 6000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30
+
+  # Recommended role: fixed overhead 2 x 2 grid containing M05-M07, with one
+  # empty position available for a scale/lighting reference.
+  - label: arena_B_M05-M07
+    animal_ids: [M05, M06, M07]
+    model: a2A1920-160ucBAS
+    serial: null
+    fps: 5
+    width: 1920
+    height: 1200
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+    output_width: 1920
+    output_height: 1200
+    exposure_us: 4000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30
