@@ -17,7 +17,10 @@ The current repository includes:
 - `config_one_camera_test.yaml`: a ten-second one-camera baseline test for the `a2A1920-160ucBAS` using serial `40604036`.
 - `config_one_camera_test_rotated_ccw.yaml`: the current rotated single-camera test for serial `40604036`, using a cropped ROI and a 90-degree counter-clockwise output rotation.
 - `config_one_camera_test_rotated_preview.yaml`: a ten-second rotated single-camera test with the lightweight recording preview enabled.
-- `config_one_camera_test_rotated_crop_preview.yaml`: a ten-second rotated single-camera test that keeps a native centered crop and enables the lightweight recording preview.
+- `config_one_camera_test_rotated_crop_preview.yaml`: a legacy single-camera crop-preview config with outdated metadata; prefer `config_experiment_day1.yaml`.
+- `config_experiment_day1.yaml`: the production one-camera day-1 configuration for the current `a2A1920-160ucBAS` camera.
+- `config_multiclip_smoke_test.yaml`: the three-clip pre-experiment smoke test.
+- `validate_session.py`: a session validator for clip structure, timing, and metadata.
 - `QUICKSTART.md`: a shorter setup-and-run checklist.
 - `requirements.txt`: the Python dependencies for the recorder.
 
@@ -139,6 +142,35 @@ The preview-enabled example configs already in this repo are:
 
 - `config_one_camera_test_rotated_preview.yaml`
 - `config_one_camera_test_rotated_crop_preview.yaml`
+
+## Pre-experiment multi-clip test
+
+Use this before the long pilot to confirm repeated clip creation, remuxing, preview, and session validation:
+
+```bash
+python record_basler.py --list-cameras
+
+python record_basler.py \
+  --config config_multiclip_smoke_test.yaml \
+  --dry-run
+
+caffeinate -i python record_basler.py \
+  --config config_multiclip_smoke_test.yaml
+```
+
+After the run, validate the generated session:
+
+```bash
+python validate_session.py recordings_test/monarch_behavior_multiclip_test/cohort_C01-C04/SESSION_DIRECTORY
+```
+
+Notes:
+
+- `--preview LABEL` is preview-only and does not record;
+- `recording_preview.enabled: true` shows the lightweight monitor while actual recording is running;
+- use `caffeinate -i` on macOS for unattended acquisition;
+- keep the MacBook plugged in with the lid open;
+- near-continuous finite clips have a brief boundary gap.
 
 ## Validate and record
 

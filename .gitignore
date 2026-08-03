@@ -3,6 +3,6 @@ __pycache__/
 *.pyc
 recordings/
 recordings_test/
-/*.png
+*.png
 *.log
 .DS_Store

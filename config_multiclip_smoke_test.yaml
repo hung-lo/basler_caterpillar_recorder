@@ -1,0 +1,59 @@
+# Three-clip end-to-end smoke test for the connected a2A1920-160ucBAS camera.
+# Exercises repeated acquisition, remuxing, scheduling, preview, and metadata.
+
+project: monarch_behavior_multiclip_test
+subject: cohort_C01-C04
+output_root: ./recordings_test
+
+experiment:
+  animal_ids: [C01, C02, C03, C04]
+  notes: "Three-clip end-to-end test of repeated acquisition, remuxing, scheduling, preview, and metadata."
+
+ffmpeg: null
+
+schedule:
+  clip_duration_s: 30
+  interval_s: 30
+  number_of_clips: 3
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 600
+  max_height: 720
+  show_status: true
+
+cameras:
+  - label: arena_C01-C04
+    animal_ids: [C01, C02, C03, C04]
+    model: a2A1920-160ucBAS
+    serial: "40604036"
+    fps: 5
+
+    # Approximately centered native sensor crop; the script aligns the ROI to
+    # the camera's valid increments if needed.
+    width: 1440
+    height: 1200
+    offset_x: 300
+    offset_y: 0
+
+    binning: 1
+    pixel_format: auto
+
+    # Software downscaling after rotation; preserves the rotated aspect ratio.
+    output_width: 960
+    exposure_us: 4000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 270
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30

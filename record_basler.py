@@ -1422,6 +1422,32 @@ def write_session_manifest(
     shutil.copy2(config_path, session_dir / "config_used.yaml")
 
 
+def write_session_summary(
+    session_dir: Path,
+    completed_clips: int,
+    requested_clips: Optional[int],
+    stopped_by_signal: bool,
+    any_failure: bool,
+) -> None:
+    if any_failure:
+        exit_status = "failure"
+    elif stopped_by_signal:
+        exit_status = "interrupted"
+    else:
+        exit_status = "success"
+
+    summary = {
+        "completed_clips": completed_clips,
+        "requested_clips": requested_clips,
+        "stopped_by_signal": stopped_by_signal,
+        "any_failure": any_failure,
+        "finished_utc": utc_now().isoformat(),
+        "exit_status": exit_status,
+    }
+    with (session_dir / "session_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, default=str)
+
+
 def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
     schedule = dict(config.get("schedule") or {})
     clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
@@ -1486,10 +1512,15 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     bindings: list[CameraBinding] = []
     stop_event = threading.Event()
     preview_active_event = threading.Event()
+    stopped_by_signal = False
+    clip_index = 0
+    any_failure = False
     if preview_settings.enabled:
         preview_active_event.set()
 
     def request_stop(signum: int, _frame: Any) -> None:
+        nonlocal stopped_by_signal
+        stopped_by_signal = True
         LOG.warning("Received signal %s; stopping after the current frame", signum)
         stop_event.set()
 
@@ -1510,8 +1541,6 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         encoding_cfg = dict(config.get("encoding") or {})
 
         session_start_mono_ns = time.monotonic_ns()
-        clip_index = 0
-        any_failure = False
 
         while not stop_event.is_set():
             if number_of_clips is not None and clip_index >= number_of_clips:
@@ -1616,8 +1645,18 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             clip_index += 1
 
         LOG.info("Recording finished after %d completed clip(s)", clip_index)
-        return 1 if any_failure else 0
+        return 130 if stopped_by_signal and not any_failure else (1 if any_failure else 0)
     finally:
+        try:
+            write_session_summary(
+                session_dir=session_dir,
+                completed_clips=clip_index,
+                requested_clips=number_of_clips,
+                stopped_by_signal=stopped_by_signal,
+                any_failure=any_failure,
+            )
+        except Exception as exc:
+            LOG.warning("Could not write session summary: %s", exc)
         close_bindings(bindings)
 
 
