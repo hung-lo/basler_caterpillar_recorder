@@ -2,7 +2,7 @@
 # A native sensor ROI removes most unused dark side margins without downsampling.
 # Verify in --preview mode that every enclosure remains comfortably inside the crop.
 
-project: monarch_behavior_smoke_test_5min
+project: 4_caterpillar_15min_feeding
 subject: camera_40604036
 output_root: ./recordings_test
 
@@ -13,8 +13,8 @@ experiment:
 ffmpeg: null
 
 schedule:
-  clip_duration_s: 60
-  interval_s: 60
+  clip_duration_s: 900
+  interval_s: 900
   number_of_clips: 1
 
 encoding:
