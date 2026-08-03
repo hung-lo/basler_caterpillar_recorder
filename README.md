@@ -7,6 +7,22 @@ This repository is a practical starter for scheduled recording from the two Basl
 
 The supplied script runs on Windows or recent macOS through Basler pylon/pypylon and uses FFmpeg for consistent H.264/MP4 output.
 
+## Repository files
+
+The current repository includes:
+
+- `record_basler.py`: the recorder CLI for listing cameras, live preview, dry runs, and scheduled recording.
+- `config_pilot.yaml`: the default two-camera pilot configuration for long recording into `./recordings`.
+- `config_smoke_test.yaml`: a ten-second two-camera end-to-end test that writes into `./recordings_test`.
+- `config_one_camera_test.yaml`: a ten-second one-camera baseline test for the `a2A1920-160ucBAS` using serial `40604036`.
+- `config_one_camera_test_rotated_ccw.yaml`: the current rotated single-camera test for serial `40604036`, using a cropped ROI and a 90-degree counter-clockwise output rotation.
+- `config_one_camera_test_rotated_preview.yaml`: a ten-second rotated single-camera test with the lightweight recording preview enabled.
+- `config_one_camera_test_rotated_crop_preview.yaml`: a ten-second rotated single-camera test that keeps a native centered crop and enables the lightweight recording preview.
+- `QUICKSTART.md`: a shorter setup-and-run checklist.
+- `requirements.txt`: the Python dependencies for the recorder.
+
+The one-camera example files are specific to the currently used `a2A1920-160ucBAS` serial `40604036`. If you swap cameras, update those serial values before recording.
+
 ## Recommended pilot decision
 
 Start with the simplest design that preserves identity and outcome labels:
@@ -119,6 +135,11 @@ recording_preview:
 
 This preview is display-only: the full transformed frame still goes to FFmpeg. Camera threads publish only an occasional downscaled copy, so the preview is allowed to drop monitor frames rather than slow acquisition. During recording, `q` or Escape hides the preview without stopping acquisition, `s` saves the latest low-resolution monitor frame into the clip directory, and `Ctrl+C` still stops the recording cleanly.
 
+The preview-enabled example configs already in this repo are:
+
+- `config_one_camera_test_rotated_preview.yaml`
+- `config_one_camera_test_rotated_crop_preview.yaml`
+
 ## Validate and record
 
 Validate paths and schedule without opening cameras:
@@ -131,6 +152,24 @@ Run one ten-second end-to-end test with both cameras:
 
 ```bash
 python record_basler.py --config config_smoke_test.yaml
+```
+
+Run the one-camera baseline test for the current a2A setup:
+
+```bash
+python record_basler.py --config config_one_camera_test.yaml
+```
+
+Run the current rotated one-camera test:
+
+```bash
+python record_basler.py --config config_one_camera_test_rotated_ccw.yaml
+```
+
+Run the rotated one-camera test with recording preview:
+
+```bash
+python record_basler.py --config config_one_camera_test_rotated_preview.yaml
 ```
 
 Open both MP4 files and inspect the JSON sidecars. Confirm that `success` is true, `grab_failures` is zero, `measured_receive_fps` is close to the requested rate, and `mp4_remux_succeeded` is true. Then start the pilot:
