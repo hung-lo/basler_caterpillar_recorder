@@ -60,6 +60,15 @@ def iso_utc_from_ns(value_ns: int) -> str:
     return dt.datetime.fromtimestamp(value_ns / 1e9, tz=dt.timezone.utc).isoformat()
 
 
+def format_clock_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def sanitize_token(value: str) -> str:
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
     cleaned = "".join(ch if ch in allowed else "-" for ch in value.strip())
@@ -338,6 +347,8 @@ class PreviewPacket:
     frame_index: int
     frame: np.ndarray
     host_monotonic_ns: int
+    elapsed_s: float
+    planned_duration_s: float
     measured_receive_fps: Optional[float]
 
 
@@ -788,22 +799,29 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         if packet.measured_receive_fps is not None
         else "starting"
     )
+    elapsed_text = format_clock_duration(packet.elapsed_s)
+    total_text = format_clock_duration(packet.planned_duration_s)
+    progress = 0.0
+    if packet.planned_duration_s > 0:
+        progress = max(0.0, min(1.0, packet.elapsed_s / packet.planned_duration_s))
     lines = [
         f"REC | {packet.label} | clip {packet.clip_index:04d}",
-        f"frame {packet.frame_index} | {fps_text} | q hide | s snapshot",
+        f"{elapsed_text} / {total_text} | frame {packet.frame_index + 1} | {fps_text}",
     ]
+
+    overlay = display.copy()
+    panel_height = 72
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (display.shape[1], panel_height),
+        (24, 24, 24),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+
     y = 26
     for line in lines:
-        cv2.putText(
-            display,
-            line,
-            (12, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 0),
-            4,
-            cv2.LINE_AA,
-        )
         cv2.putText(
             display,
             line,
@@ -815,6 +833,37 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
             cv2.LINE_AA,
         )
         y += 24
+
+    bar_left = 12
+    bar_top = 54
+    bar_width = max(60, display.shape[1] - 24)
+    bar_height = 10
+    cv2.rectangle(
+        display,
+        (bar_left, bar_top),
+        (bar_left + bar_width, bar_top + bar_height),
+        (82, 82, 82),
+        -1,
+    )
+    filled_width = int(round(bar_width * progress))
+    if filled_width > 0:
+        cv2.rectangle(
+            display,
+            (bar_left, bar_top),
+            (bar_left + filled_width, bar_top + bar_height),
+            (90, 190, 255),
+            -1,
+        )
+    cv2.putText(
+        display,
+        "q hide | s snapshot",
+        (12, 68),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
+    )
     return display
 
 
@@ -1115,6 +1164,8 @@ def record_one_camera(
                                 frame_index=frame_count - 1,
                                 frame=monitor_frame,
                                 host_monotonic_ns=host_mono_ns,
+                                elapsed_s=max(0.0, (host_mono_ns - planned_start_mono_ns) / 1e9),
+                                planned_duration_s=(planned_stop_mono_ns - planned_start_mono_ns) / 1e9,
                                 measured_receive_fps=measured_preview_fps,
                             ),
                         )

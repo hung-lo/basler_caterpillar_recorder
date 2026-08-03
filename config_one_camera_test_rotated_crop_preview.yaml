@@ -2,12 +2,12 @@
 # A native sensor ROI removes most unused dark side margins without downsampling.
 # Verify in --preview mode that every enclosure remains comfortably inside the crop.
 
-project: monarch_behavior_smoke_test
-subject: camera_40604036_native_crop
+project: monarch_behavior_smoke_test_5min
+subject: camera_40604036
 output_root: ./recordings_test
 
 experiment:
-  animal_ids: [M05, M06, M07]
+  animal_ids: [C01, C02, C03, C04]
   notes: "Native 1440 x 1200 ROI, rotated 90 degrees CCW; no binning or software downsampling."
 
 ffmpeg: null
