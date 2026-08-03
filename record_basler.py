@@ -794,6 +794,9 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     if not settings.show_status:
         return display
 
+    font = cv2.FONT_HERSHEY_DUPLEX
+    controls_font_scale = 0.42
+    controls_text = "q hide | s snapshot"
     fps_text = (
         f"{packet.measured_receive_fps:.2f} fps"
         if packet.measured_receive_fps is not None
@@ -808,9 +811,15 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         f"REC | {packet.label} | clip {packet.clip_index:04d}",
         f"{elapsed_text} / {total_text} | frame {packet.frame_index + 1} | {fps_text}",
     ]
+    (controls_width, _), _ = cv2.getTextSize(
+        controls_text,
+        font,
+        controls_font_scale,
+        1,
+    )
 
     overlay = display.copy()
-    panel_height = 72
+    panel_height = 78
     cv2.rectangle(
         overlay,
         (0, 0),
@@ -826,7 +835,7 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
             display,
             line,
             (12, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
+            font,
             0.55,
             (255, 255, 255),
             1,
@@ -834,10 +843,22 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         )
         y += 24
 
+    controls_x = max(12, display.shape[1] - controls_width - 12)
+    cv2.putText(
+        display,
+        controls_text,
+        (controls_x, 24),
+        font,
+        controls_font_scale,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
+    )
+
     bar_left = 12
-    bar_top = 54
+    bar_top = 60
     bar_width = max(60, display.shape[1] - 24)
-    bar_height = 10
+    bar_height = 8
     cv2.rectangle(
         display,
         (bar_left, bar_top),
@@ -854,16 +875,6 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
             (90, 190, 255),
             -1,
         )
-    cv2.putText(
-        display,
-        "q hide | s snapshot",
-        (12, 68),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.43,
-        (235, 235, 235),
-        1,
-        cv2.LINE_AA,
-    )
     return display
 
 

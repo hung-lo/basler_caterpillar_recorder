@@ -13,8 +13,8 @@ experiment:
 ffmpeg: null
 
 schedule:
-  clip_duration_s: 300
-  interval_s: 300
+  clip_duration_s: 60
+  interval_s: 60
   number_of_clips: 1
 
 encoding:
@@ -48,6 +48,8 @@ cameras:
     pixel_format: auto
 
     # No output_width/output_height: preserve native ROI pixels. After rotate: 1200 x 1440.
+    output_width: 960 
+    # Leave output_height absent to preserve aspect ratio automatically.
     exposure_us: 4000
     gain: 0
     auto_exposure: false
