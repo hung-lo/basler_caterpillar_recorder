@@ -32,11 +32,11 @@ cameras:
     height: 1200
     offset_x: 0
     offset_y: 0
-    binning: 1
+    binning: 2
     pixel_format: auto
     output_width: 1200
     output_height: 1920
-    exposure_us: 4000
+    exposure_us: 5000
     gain: 0
     auto_exposure: false
     auto_gain: false
