@@ -13,8 +13,8 @@ experiment:
 ffmpeg: null
 
 schedule:
-  clip_duration_s: 10
-  interval_s: 10
+  clip_duration_s: 300
+  interval_s: 300
   number_of_clips: 1
 
 encoding:
@@ -41,7 +41,7 @@ cameras:
     # The script aligns these values to the camera's valid increments if needed.
     width: 1440
     height: 1200
-    offset_x: 240
+    offset_x: 300
     offset_y: 0
 
     binning: 1
