@@ -1,0 +1,47 @@
+# Ten-second end-to-end test for one Basler a2A1920-160ucBAS camera.
+# Camera serial: 40604036
+
+project: monarch_behavior_smoke_test
+subject: camera_40604036
+output_root: ./recordings_test
+
+experiment:
+  animal_ids: [M05, M06, M07]
+  notes: "Ten-second one-camera acquisition and encoder test using a2A1920-160ucBAS."
+
+ffmpeg: null
+
+schedule:
+  clip_duration_s: 10
+  interval_s: 10
+  number_of_clips: 1
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+cameras:
+  - label: arena_B_M05-M07
+    animal_ids: [M05, M06, M07]
+    model: a2A1920-160ucBAS
+    serial: "40604036"
+    fps: 5
+    width: 1920
+    height: 1200
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+    output_width: 1920
+    output_height: 1200
+    exposure_us: 4000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30
