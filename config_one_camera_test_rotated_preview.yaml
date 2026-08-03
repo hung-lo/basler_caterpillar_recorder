@@ -1,5 +1,5 @@
 # Ten-second end-to-end test for one Basler a2A1920-160ucBAS camera.
-# Camera serial: 40604036
+# Full 1920 x 1200 sensor ROI; encoded as 1200 x 1920 after 90-degree CCW rotation.
 
 project: monarch_behavior_smoke_test
 subject: camera_40604036
@@ -7,12 +7,12 @@ output_root: ./recordings_test
 
 experiment:
   animal_ids: [M05, M06, M07]
-  notes: "Ten-second one-camera acquisition and encoder test using a2A1920-160ucBAS, rotated 90 degrees counter-clockwise."
+  notes: "One-camera test with a lightweight preview during recording."
 
 ffmpeg: null
 
 schedule:
-  clip_duration_s: 300
+  clip_duration_s: 10
   interval_s: 10
   number_of_clips: 1
 
@@ -21,6 +21,13 @@ encoding:
   preset: veryfast
   crf: 25
   gop_seconds: 2
+
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 600
+  max_height: 720
+  show_status: true
 
 cameras:
   - label: arena_B_M05-M07
@@ -32,11 +39,11 @@ cameras:
     height: 1200
     offset_x: 0
     offset_y: 0
-    binning: 2
+    binning: 1
     pixel_format: auto
     output_width: 1200
     output_height: 1920
-    exposure_us: 5000
+    exposure_us: 4000
     gain: 0
     auto_exposure: false
     auto_gain: false

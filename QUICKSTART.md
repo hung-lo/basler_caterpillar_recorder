@@ -53,6 +53,21 @@ Run a ten-second two-camera test:
 python record_basler.py --config config_smoke_test.yaml
 ```
 
+If you want a live monitor window during recording, use the example one-camera preview config:
+
+```bash
+python record_basler.py --config config_one_camera_test_rotated_preview.yaml
+```
+
+To test a centered native crop on that same camera before committing to it:
+
+```bash
+python record_basler.py \
+  --config config_one_camera_test_rotated_crop_preview.yaml \
+  --preview arena_B_M05-M07
+python record_basler.py --config config_one_camera_test_rotated_crop_preview.yaml
+```
+
 Open both MP4 files. In each JSON sidecar confirm:
 
 - `success: true`

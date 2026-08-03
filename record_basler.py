@@ -6,6 +6,7 @@ The recorder:
 - applies low-level camera settings through pypylon;
 - records simultaneous clips from multiple cameras;
 - writes H.264 video through FFmpeg;
+- optionally shows a non-blocking low-resolution preview while recording;
 - saves compressed per-frame timestamps and JSON metadata;
 - supports continuous recording via back-to-back finite clips or duty-cycled recording.
 
@@ -319,6 +320,89 @@ def apply_frame_transform(frame: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     return np.ascontiguousarray(frame)
 
 
+@dataclasses.dataclass(frozen=True)
+class RecordingPreviewSettings:
+    """Low-overhead monitor preview shown while video is being recorded."""
+
+    enabled: bool = False
+    fps: float = 1.0
+    max_width: int = 640
+    max_height: int = 720
+    show_status: bool = True
+
+
+@dataclasses.dataclass
+class PreviewPacket:
+    label: str
+    clip_index: int
+    frame_index: int
+    frame: np.ndarray
+    host_monotonic_ns: int
+    measured_receive_fps: Optional[float]
+
+
+def parse_recording_preview_settings(config: dict[str, Any]) -> RecordingPreviewSettings:
+    raw = config.get("recording_preview") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("recording_preview must be a mapping/object")
+
+    settings = RecordingPreviewSettings(
+        enabled=bool(raw.get("enabled", False)),
+        fps=float(raw.get("fps", 1.0)),
+        max_width=int(raw.get("max_width", 640)),
+        max_height=int(raw.get("max_height", 720)),
+        show_status=bool(raw.get("show_status", True)),
+    )
+    if settings.fps <= 0:
+        raise ValueError("recording_preview.fps must be positive")
+    if settings.max_width < 64 or settings.max_height < 64:
+        raise ValueError("recording_preview.max_width and max_height must be at least 64")
+    return settings
+
+
+def resize_frame_to_fit(frame: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
+    """Return a display copy that fits inside the requested bounding box."""
+
+    height, width = frame.shape[:2]
+    scale = min(1.0, max_width / width, max_height / height)
+    if scale < 1.0:
+        target_width = max(2, round(width * scale))
+        target_height = max(2, round(height * scale))
+        resized = cv2.resize(
+            frame,
+            (target_width, target_height),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        resized = frame
+
+    # The pylon-converted array may refer to reusable grab-buffer memory. The
+    # queue must therefore own an independent copy before the grab is released.
+    return np.ascontiguousarray(resized).copy()
+
+
+def put_latest_preview(preview_queue: queue.Queue[PreviewPacket], packet: PreviewPacket) -> None:
+    """Publish without ever blocking acquisition or building a backlog."""
+
+    try:
+        preview_queue.put_nowait(packet)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        preview_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        preview_queue.put_nowait(packet)
+    except queue.Full:
+        # A consumer/producer race can refill the one-item queue. Dropping this
+        # monitor frame is always preferable to delaying scientific acquisition.
+        pass
+
+
 @dataclasses.dataclass
 class CameraBinding:
     label: str
@@ -401,11 +485,22 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     # Binning changes full-sensor spatial sampling while preserving field of view.
     # Unsupported nodes are logged and skipped.
     binning = int(camera_cfg.get("binning", 1) or 1)
-    try_set(camera, "BinningHorizontal", binning)
-    try_set(camera, "BinningVertical", binning)
-    if camera_cfg.get("binning_mode"):
-        try_set(camera, "BinningHorizontalMode", str(camera_cfg["binning_mode"]))
-        try_set(camera, "BinningVerticalMode", str(camera_cfg["binning_mode"]))
+    if binning < 1:
+        raise ValueError("camera binning must be >= 1")
+    if binning > 1:
+        horizontal_ok, _ = try_set(camera, "BinningHorizontal", binning)
+        vertical_ok, _ = try_set(camera, "BinningVertical", binning)
+        if not horizontal_ok or not vertical_ok:
+            LOG.warning(
+                "%s does not support the requested %dx%d camera binning; "
+                "recording will continue at the camera ROI resolution",
+                label,
+                binning,
+                binning,
+            )
+        if camera_cfg.get("binning_mode"):
+            try_set(camera, "BinningHorizontalMode", str(camera_cfg["binning_mode"]))
+            try_set(camera, "BinningVerticalMode", str(camera_cfg["binning_mode"]))
 
     # Reset offsets before enlarging the ROI, then apply requested dimensions and
     # final offsets. Width/height values are aligned to each node's valid increment.
@@ -439,8 +534,9 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     else:
         try_set(camera, "ExposureAuto", "Off")
         if camera_cfg.get("exposure_us") is not None:
-            try_set(camera, "ExposureTime", float(camera_cfg["exposure_us"]))
-            try_set(camera, "ExposureTimeAbs", float(camera_cfg["exposure_us"]))
+            exposure_ok, _ = try_set(camera, "ExposureTime", float(camera_cfg["exposure_us"]))
+            if not exposure_ok:
+                try_set(camera, "ExposureTimeAbs", float(camera_cfg["exposure_us"]))
 
     auto_gain = bool(camera_cfg.get("auto_gain", False))
     if auto_gain:
@@ -448,8 +544,9 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     else:
         try_set(camera, "GainAuto", "Off")
         if camera_cfg.get("gain") is not None:
-            try_set(camera, "Gain", float(camera_cfg["gain"]))
-            try_set(camera, "GainRaw", int(camera_cfg["gain"]))
+            gain_ok, _ = try_set(camera, "Gain", float(camera_cfg["gain"]))
+            if not gain_ok:
+                try_set(camera, "GainRaw", int(camera_cfg["gain"]))
 
     if camera_cfg.get("balance_white_auto") is not None:
         mode = "Continuous" if bool(camera_cfg["balance_white_auto"]) else "Off"
@@ -679,6 +776,140 @@ class ClipResult:
     error: Optional[str] = None
 
 
+def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSettings) -> np.ndarray:
+    """Create a display-only copy with a compact recording status overlay."""
+
+    display = packet.frame.copy()
+    if not settings.show_status:
+        return display
+
+    fps_text = (
+        f"{packet.measured_receive_fps:.2f} fps"
+        if packet.measured_receive_fps is not None
+        else "starting"
+    )
+    lines = [
+        f"REC | {packet.label} | clip {packet.clip_index:04d}",
+        f"frame {packet.frame_index} | {fps_text} | q hide | s snapshot",
+    ]
+    y = 26
+    for line in lines:
+        cv2.putText(
+            display,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 24
+    return display
+
+
+def destroy_preview_windows(window_names: Iterable[str]) -> None:
+    for window_name in window_names:
+        try:
+            cv2.destroyWindow(window_name)
+        except cv2.error:
+            pass
+    try:
+        cv2.waitKey(1)
+    except cv2.error:
+        pass
+
+
+def monitor_recording_threads(
+    threads: list[threading.Thread],
+    preview_queues: dict[str, queue.Queue[PreviewPacket]],
+    preview_settings: RecordingPreviewSettings,
+    preview_active_event: threading.Event,
+    clip_dir: Path,
+) -> None:
+    """Keep recording windows responsive while camera workers acquire frames."""
+
+    if not preview_active_event.is_set() or not preview_queues:
+        for thread in threads:
+            thread.join()
+        return
+
+    latest: dict[str, PreviewPacket] = {}
+    window_names: set[str] = set()
+    snapshot_count = 0
+
+    try:
+        while any(thread.is_alive() for thread in threads):
+            updated_labels: set[str] = set()
+            for label, preview_queue in preview_queues.items():
+                newest: Optional[PreviewPacket] = None
+                while True:
+                    try:
+                        newest = preview_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                if newest is not None:
+                    latest[label] = newest
+                    updated_labels.add(label)
+
+            key = -1
+            if preview_active_event.is_set() and (latest or window_names):
+                try:
+                    for label in updated_labels:
+                        packet = latest[label]
+                        window_name = f"Recording preview - {label}"
+                        window_names.add(window_name)
+                        cv2.imshow(window_name, draw_recording_preview(packet, preview_settings))
+                    if window_names:
+                        key = cv2.waitKey(20) & 0xFF
+                    else:
+                        time.sleep(0.02)
+                except cv2.error as exc:
+                    LOG.warning(
+                        "Recording preview was disabled because OpenCV could not "
+                        "open or update a window: %s",
+                        exc,
+                    )
+                    preview_active_event.clear()
+                    destroy_preview_windows(window_names)
+            else:
+                time.sleep(0.02)
+
+            if key in (ord("q"), 27):
+                LOG.info("Recording preview hidden; acquisition continues")
+                preview_active_event.clear()
+                destroy_preview_windows(window_names)
+            elif key == ord("s") and latest:
+                snapshot_count += 1
+                snapshot_dir = clip_dir / "monitor_snapshots"
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+                stamp = compact_utc(utc_now())
+                for packet in latest.values():
+                    snapshot_path = snapshot_dir / (
+                        f"{packet.label}_clip{packet.clip_index:04d}_"
+                        f"frame{packet.frame_index:08d}_{stamp}_{snapshot_count:03d}.png"
+                    )
+                    if cv2.imwrite(str(snapshot_path), packet.frame):
+                        LOG.info("Saved monitor snapshot %s", snapshot_path)
+                    else:
+                        LOG.warning("Could not save monitor snapshot %s", snapshot_path)
+
+        for thread in threads:
+            thread.join()
+    finally:
+        destroy_preview_windows(window_names)
+
+
 def create_preview_frame(binding: CameraBinding, timeout_ms: int = 3000) -> np.ndarray:
     camera = binding.camera
     camera.StartGrabbingMax(1)
@@ -709,6 +940,9 @@ def record_one_camera(
     ready_barrier: threading.Barrier,
     stop_event: threading.Event,
     result_queue: queue.Queue[ClipResult],
+    preview_queue: Optional[queue.Queue[PreviewPacket]],
+    preview_settings: RecordingPreviewSettings,
+    preview_active_event: threading.Event,
 ) -> None:
     label = binding.label
     camera = binding.camera
@@ -743,6 +977,9 @@ def record_one_camera(
     ffmpeg_return_code: Optional[int] = None
     output_width: Optional[int] = None
     output_height: Optional[int] = None
+    preview_interval_ns = max(1, round(1e9 / preview_settings.fps))
+    next_preview_mono_ns = planned_start_mono_ns
+    preview_publish_failed = False
 
     metadata: dict[str, Any] = {
         "camera": binding.info,
@@ -753,6 +990,7 @@ def record_one_camera(
         "requested_settings": binding.requested,
         "actual_settings": binding.actual_settings,
         "encoding": encoding_cfg,
+        "recording_preview": dataclasses.asdict(preview_settings),
         "video_path": str(final_path),
         "temporary_video_path": str(temp_path),
         "timestamps_path": str(timestamps_path),
@@ -847,6 +1085,49 @@ def record_one_camera(
                 last_host_mono_ns = host_mono_ns
                 last_camera_timestamp = camera_timestamp
                 frame_count += 1
+
+                if (
+                    preview_queue is not None
+                    and preview_active_event.is_set()
+                    and not preview_publish_failed
+                    and host_mono_ns >= next_preview_mono_ns
+                ):
+                    try:
+                        measured_preview_fps = None
+                        if (
+                            first_host_mono_ns is not None
+                            and host_mono_ns > first_host_mono_ns
+                            and frame_count > 1
+                        ):
+                            measured_preview_fps = (frame_count - 1) / (
+                                (host_mono_ns - first_host_mono_ns) / 1e9
+                            )
+                        monitor_frame = resize_frame_to_fit(
+                            frame,
+                            preview_settings.max_width,
+                            preview_settings.max_height,
+                        )
+                        put_latest_preview(
+                            preview_queue,
+                            PreviewPacket(
+                                label=label,
+                                clip_index=clip_index,
+                                frame_index=frame_count - 1,
+                                frame=monitor_frame,
+                                host_monotonic_ns=host_mono_ns,
+                                measured_receive_fps=measured_preview_fps,
+                            ),
+                        )
+                        next_preview_mono_ns = host_mono_ns + preview_interval_ns
+                    except Exception as exc:
+                        # Preview is monitoring-only. Never allow it to abort or
+                        # delay the scientific recording.
+                        preview_publish_failed = True
+                        LOG.warning(
+                            "%s recording preview disabled after an internal error: %s",
+                            label,
+                            exc,
+                        )
             finally:
                 grab.Release()
 
@@ -1082,6 +1363,7 @@ def write_session_manifest(
 def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
     schedule = dict(config.get("schedule") or {})
     clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
+    preview_settings = parse_recording_preview_settings(config)
 
     project = sanitize_token(str(config.get("project", "caterpillar")))
     subject = sanitize_token(str(config.get("subject", "cohort")))
@@ -1100,6 +1382,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         total_duration_s,
         number_of_clips,
     )
+    LOG.info(
+        "Recording preview: enabled=%s fps=%.3g max_size=%dx%d",
+        preview_settings.enabled,
+        preview_settings.fps,
+        preview_settings.max_width,
+        preview_settings.max_height,
+    )
 
     if dry_run:
         shutil.copy2(config_path, session_dir / "config_used.yaml")
@@ -1112,6 +1401,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     "interval_s": interval_s,
                     "total_duration_s": total_duration_s,
                     "number_of_clips": number_of_clips,
+                    "recording_preview": dataclasses.asdict(preview_settings),
                 },
                 handle,
                 indent=2,
@@ -1133,6 +1423,9 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     used_serials: set[str] = set()
     bindings: list[CameraBinding] = []
     stop_event = threading.Event()
+    preview_active_event = threading.Event()
+    if preview_settings.enabled:
+        preview_active_event.set()
 
     def request_stop(signum: int, _frame: Any) -> None:
         LOG.warning("Received signal %s; stopping after the current frame", signum)
@@ -1190,7 +1483,10 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
             barrier = threading.Barrier(len(bindings) + 1)
             results: queue.Queue[ClipResult] = queue.Queue()
-            threads = []
+            threads: list[threading.Thread] = []
+            preview_queues: dict[str, queue.Queue[PreviewPacket]] = {}
+            if preview_active_event.is_set():
+                preview_queues = {binding.label: queue.Queue(maxsize=1) for binding in bindings}
             for binding in bindings:
                 thread = threading.Thread(
                     target=record_one_camera,
@@ -1207,6 +1503,9 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         "ready_barrier": barrier,
                         "stop_event": stop_event,
                         "result_queue": results,
+                        "preview_queue": preview_queues.get(binding.label),
+                        "preview_settings": preview_settings,
+                        "preview_active_event": preview_active_event,
                     },
                     daemon=False,
                 )
@@ -1219,8 +1518,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 LOG.error("Camera workers did not become ready in time")
                 stop_event.set()
 
-            for thread in threads:
-                thread.join()
+            monitor_recording_threads(
+                threads=threads,
+                preview_queues=preview_queues,
+                preview_settings=preview_settings,
+                preview_active_event=preview_active_event,
+                clip_dir=clip_dir,
+            )
 
             clip_results: list[ClipResult] = []
             while not results.empty():

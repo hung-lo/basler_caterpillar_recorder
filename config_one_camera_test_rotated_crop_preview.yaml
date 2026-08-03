@@ -1,0 +1,59 @@
+# Recommended ten-second camera test based on the supplied arena image.
+# A native sensor ROI removes most unused dark side margins without downsampling.
+# Verify in --preview mode that every enclosure remains comfortably inside the crop.
+
+project: monarch_behavior_smoke_test
+subject: camera_40604036_native_crop
+output_root: ./recordings_test
+
+experiment:
+  animal_ids: [M05, M06, M07]
+  notes: "Native 1440 x 1200 ROI, rotated 90 degrees CCW; no binning or software downsampling."
+
+ffmpeg: null
+
+schedule:
+  clip_duration_s: 10
+  interval_s: 10
+  number_of_clips: 1
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 600
+  max_height: 720
+  show_status: true
+
+cameras:
+  - label: arena_B_M05-M07
+    animal_ids: [M05, M06, M07]
+    model: a2A1920-160ucBAS
+    serial: "40604036"
+    fps: 5
+
+    # Native sensor crop: x = 240..1679, y = 0..1199.
+    # The script aligns these values to the camera's valid increments if needed.
+    width: 1440
+    height: 1200
+    offset_x: 240
+    offset_y: 0
+
+    binning: 1
+    pixel_format: auto
+
+    # No output_width/output_height: preserve native ROI pixels. After rotate: 1200 x 1440.
+    exposure_us: 4000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+    rotate: 270
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30

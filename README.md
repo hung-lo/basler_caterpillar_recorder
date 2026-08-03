@@ -104,6 +104,21 @@ Preview controls:
 
 For setup only, `auto_exposure: true` and `auto_gain: true` can help find a usable range. For the actual experiment, return to manual exposure/gain so leaf replacement and animal position do not change image brightness automatically. Use diffuse lighting and the lowest gain that gives a clean image.
 
+### Preview while recording
+
+You can optionally show a lightweight monitor window during recording by adding:
+
+```yaml
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 640
+  max_height: 720
+  show_status: true
+```
+
+This preview is display-only: the full transformed frame still goes to FFmpeg. Camera threads publish only an occasional downscaled copy, so the preview is allowed to drop monitor frames rather than slow acquisition. During recording, `q` or Escape hides the preview without stopping acquisition, `s` saves the latest low-resolution monitor frame into the clip directory, and `Ctrl+C` still stops the recording cleanly.
+
 ## Validate and record
 
 Validate paths and schedule without opening cameras:
@@ -200,7 +215,7 @@ The script attempts camera binning only when the requested nodes are exposed by 
 - transmit Bayer 8-bit data to limit USB bandwidth;
 - resize on the computer before H.264 encoding.
 
-Cropping reduces field of view; resizing preserves it. Therefore, do not replace full-sensor acquisition with a small central ROI unless all enclosures remain inside that ROI.
+Cropping reduces field of view while preserving native detail; resizing preserves field of view while reducing detail. The included `config_one_camera_test_rotated_crop_preview.yaml` shows one way to test a centered native crop on the a2A camera. Treat that file as an experiment-specific starting point, and confirm in `--preview` mode that every enclosure remains comfortably inside the crop before recording.
 
 ## Night recording limitation
 
