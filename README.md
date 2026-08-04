@@ -6,13 +6,15 @@ This repository is set up for the currently connected Basler camera:
 - serial: `40604036`
 - label used in YAML: `camera1`
 
-The configs in this repo cover both full-FoV and downsampled runs. All of them use the same connected camera and the same 90-degree counter-clockwise rotation:
+The main recording configs in this repo target that camera and use the same 90-degree counter-clockwise rotation. The repo also includes Windows-specific sample configs:
 
 - `config_pilot.yaml`: 24-hour pilot, full sensor FoV, archive enabled.
 - `config_experiment_day1.yaml`: day-1 production config, preview enabled, archive enabled, downsampled to about `960 x 1536`.
 - `config_smoke_test.yaml`: ten-second smoke test, archive disabled.
 - `config_multiclip_smoke_test.yaml`: two-clip preview smoke test, full sensor FoV, archive disabled.
 - `config_archive_smoke_test.yaml`: three-clip archive integration test with preview and external-drive transfer.
+- `config_windows_test.yaml`: short Windows smoke test; update the model and serial if your Windows camera differs.
+- `config_windows_long_recording.yaml`: five-hour Windows long-run example for `a2A1920-160ucBAS` serial `40604036`, with built-in sleep prevention and `robocopy` archive transfer.
 
 ## On-disk layout
 
@@ -37,7 +39,7 @@ recordings/
           monitor_snapshots/
 ```
 
-Exact subsecond timing stays in the JSON metadata and the timestamp CSV. The same shortened hierarchy is copied to the archive drive under `/Volumes/Dr. Rose/Hung_MBL` when archive mode is enabled.
+Exact subsecond timing stays in the JSON metadata and the timestamp CSV. The same shortened hierarchy is copied to the configured archive destination when archive mode is enabled.
 
 ## Repository files
 
@@ -47,6 +49,8 @@ Exact subsecond timing stays in the JSON metadata and the timestamp CSV. The sam
 - `config_smoke_test.yaml`: a ten-second one-camera smoke test for `./recordings_test`.
 - `config_multiclip_smoke_test.yaml`: a two-clip pre-experiment smoke test with preview enabled.
 - `config_archive_smoke_test.yaml`: a three-clip archive smoke test with preview enabled.
+- `config_windows_test.yaml`: a one-clip Windows smoke test template.
+- `config_windows_long_recording.yaml`: a Windows five-hour archive-enabled long-run config.
 - `validate_session.py`: session validator for clip structure, timing, summary state, and leftover temporary files.
 - `QUICKSTART.md`: a short setup-and-run checklist.
 - `requirements.txt`: Python dependencies for the recorder.
@@ -141,22 +145,30 @@ Notes:
 
 - `--preview camera1` is preview-only and does not record
 - `recording_preview.enabled: true` shows the lightweight monitor while actual recording is running
-- use `caffeinate -i` on macOS for unattended acquisition
+- set `system.prevent_sleep_during_recording: true` to let the recorder manage sleep prevention on macOS and Windows
+- `caffeinate -i` still works on macOS if you prefer to keep sleep prevention outside the YAML
 - keep the MacBook plugged in with the lid open
 - near-continuous finite clips have a brief boundary gap
 
 ## Archive workflow
 
-The archive-enabled configs `config_pilot.yaml`, `config_experiment_day1.yaml`, and `config_archive_smoke_test.yaml` record locally first, then rsync each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` after confirming that `/Volumes/Dr. Rose` is a real mounted drive.
+The archive-enabled configs record locally first, then copy each finished clip directory into a generated `.incoming/*.partial` directory, verify the copy with a Python SHA-256 manifest, promote the partial directory to the final visible clip directory, and only then delete the local clip. `backend: auto` selects `rsync` on macOS/Linux and `robocopy` on Windows.
 
 The recorder keeps the local session metadata, writes transfer ledgers, verifies the external copy, and deletes each local clip directory only after verification succeeds. If the external drive is missing or the archive backlog grows too large, the recorder stops before starting another clip.
 
-Before using an archive config, mount the drive and check that the local SSD still has plenty of free space. The built-in safety defaults are a 50 GB hard clip cap and a 120 GB minimum free-space gate before each new clip.
+Before using an archive config, mount the drive and check that the local SSD still has plenty of free space. The built-in safety defaults are a 50 GB hard clip cap and a 120 GB minimum free-space gate before each new clip. On Windows, keep the archive destination inside the mounted drive root, for example `required_mount_point: "D:/"` and `destination_root: "D:/Hung_MBL"`.
 
 Run the archive smoke test with:
 
 ```bash
 caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
+```
+
+For the Windows five-hour example:
+
+```powershell
+python record_basler.py --config config_windows_long_recording.yaml --dry-run
+python record_basler.py --config config_windows_long_recording.yaml
 ```
 
 ## Record and validate
@@ -185,7 +197,7 @@ Run the full-FoV day-1 config:
 python record_basler.py --config config_experiment_day1.yaml
 ```
 
-On macOS, prevent idle sleep during recording with `caffeinate -i`. Keep the MacBook on power, leave the lid open, and disable automatic sleep on the power adapter when possible. For preview-enabled runs, use:
+On macOS, prevent idle sleep during recording with either `system.prevent_sleep_during_recording: true` in the YAML or `caffeinate -i` outside the recorder. Keep the MacBook on power, leave the lid open, and disable automatic sleep on the power adapter when possible. For preview-enabled runs, use:
 
 ```bash
 caffeinate -i python record_basler.py --config config_experiment_day1.yaml
@@ -197,7 +209,7 @@ Open the MP4 file and inspect the JSON sidecar. Confirm that `success` is true, 
 python record_basler.py --config config_pilot.yaml
 ```
 
-For long macOS runs, prefer:
+For long macOS runs, you can still prefer:
 
 ```bash
 caffeinate -i python record_basler.py --config config_pilot.yaml

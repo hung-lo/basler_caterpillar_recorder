@@ -4,7 +4,7 @@
 
 - Put one larva per labeled enclosure; use IDs outside the enclosure, not marks on the body.
 - Mount the camera overhead, lock focus/aperture, use diffuse visible illumination during the normal light phase, and keep the computer on AC power.
-- Connect the camera directly to USB 3 if possible. Record to a local SSD and disable system sleep.
+- Connect the camera directly to USB 3 if possible. Record to a local SSD and disable system sleep, or set `system.prevent_sleep_during_recording: true` in the YAML.
 
 ## Software
 
@@ -79,6 +79,19 @@ Open the MP4 file and inspect the JSON sidecar. In the JSON confirm:
 
 The archive-enabled configs record locally first, then verify and copy each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` before deleting the local clip directory.
 
+On Windows, the recorder can also manage sleep prevention and archive transfer itself. The long-run sample config is `config_windows_long_recording.yaml`, which uses:
+
+- `system.prevent_sleep_during_recording: true`
+- `archive.backend: auto`
+- `destination_root: "D:/Hung_MBL"`
+- `required_mount_point: "D:/"`
+
+Validate it before opening the camera:
+
+```powershell
+python record_basler.py --config config_windows_long_recording.yaml --dry-run
+```
+
 The short on-disk naming scheme is:
 
 ```text
@@ -98,5 +111,11 @@ caffeinate -i python record_basler.py --config config_pilot.yaml
 ```
 
 The default is near-continuous 5-fps recording in 30-minute MP4 clips for 24 hours. Stop cleanly with `Ctrl+C`.
+
+For the Windows five-hour example, run:
+
+```powershell
+python record_basler.py --config config_windows_long_recording.yaml
+```
 
 Before leaving it unattended, run at least 10-30 minutes and extrapolate daily storage from the actual MP4 sizes. Check the first several JSON files for dropped frames.

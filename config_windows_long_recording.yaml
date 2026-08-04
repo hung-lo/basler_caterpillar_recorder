@@ -1,0 +1,120 @@
+# Windows long-term recording configuration.
+#
+# Camera:
+#   Basler a2A1920-160ucBAS
+#   serial 40604036
+#
+# External archive:
+#   D:/Hung_MBL
+#
+# Before the first five-hour run:
+#   1. Run --list-cameras.
+#   2. Run --dry-run.
+#   3. Run --preview camera1.
+#   4. Temporarily change the schedule to three 20-second clips
+#      and confirm archive validation passes.
+
+project: monarch_behavior_windows
+subject: cohort_C01-C08
+
+# Record each active clip to the internal SSD first.
+# Path.expanduser() converts ~ to the current Windows user profile.
+output_root: "~/Documents/BaslerRecordings"
+
+experiment:
+  animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
+  outcome_definition: successful_adult_eclosion
+  notes: "Windows long-term recording; fixed individual enclosures under one full-FoV camera."
+
+# Leave null when ffmpeg.exe is on PATH.
+ffmpeg: null
+
+system:
+  prevent_sleep_during_recording: true
+
+archive:
+  enabled: true
+
+  # auto selects robocopy on Windows and rsync on macOS/Linux.
+  backend: auto
+
+  # Use forward slashes in YAML on Windows.
+  destination_root: "D:/Hung_MBL"
+  required_mount_point: "D:/"
+
+  # Windows built-in copy backend.
+  robocopy_executable: robocopy
+
+  # Retained for macOS compatibility when this config is adapted.
+  rsync_executable: /usr/bin/rsync
+
+  copy_timeout_s: 3600
+
+  transfer_after_each_clip: true
+  background_transfer: true
+  delete_local_clip_after_verified_transfer: true
+  retain_local_session_metadata: true
+
+  # The implementation performs a Python SHA-256 manifest comparison.
+  verification: sha256
+
+  # Conservative safety thresholds for 10-minute clips.
+  max_clip_size_gb: 10
+  min_local_free_gb_before_clip: 20
+  min_external_free_gb_before_transfer: 50
+  max_unarchived_clips: 2
+  stop_before_next_clip_on_transfer_failure: true
+
+schedule:
+  # Start-to-start scheduling.
+  # 30 clips x 10 minutes = approximately 5 hours.
+  clip_duration_s: 600
+  interval_s: 600
+  number_of_clips: 30
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 600
+  max_height: 720
+  show_status: true
+
+cameras:
+  - label: camera1
+    animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
+
+    model: a2A1920-160ucBAS
+    serial: "40604036"
+
+    fps: 5
+
+    # Full native sensor field of view.
+    width: 1920
+    height: 1200
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+
+    # Keep native rotated resolution for the small caterpillars.
+    # Uncomment for a smaller approximately 960 x 1536 video:
+    # output_width: 960
+
+    exposure_us: 5000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+
+    # 90 degrees counterclockwise.
+    rotate: 270
+    flip_horizontal: false
+    flip_vertical: false
+
+    max_num_buffer: 30
