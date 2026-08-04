@@ -1,0 +1,74 @@
+# Windows smoke-test configuration for the detected Basler acA4024-29uc.
+# Serial detected on this laptop: 24682363
+#
+# Preview only:
+#   python record_basler.py --config config_windows_test.yaml --preview camera1
+#
+# Short recording test:
+#   python record_basler.py --config config_windows_test.yaml
+
+project: basler_windows_test
+subject: camera_24682363
+output_root: ./recordings_test
+
+experiment:
+  animal_ids: []
+  notes: "Windows smoke test using Basler acA4024-29uc, serial 24682363."
+
+# Leave null when ffmpeg.exe is available on PATH.
+# Otherwise use a path such as:
+# ffmpeg: "C:/ffmpeg/bin/ffmpeg.exe"
+ffmpeg: null
+
+# Start with local recording only. Enable Windows archiving only after
+# the camera, preview, encoding, and multi-clip workflow have passed.
+archive:
+  enabled: false
+
+schedule:
+  clip_duration_s: 10
+  interval_s: 10
+  number_of_clips: 1
+
+encoding:
+  codec: libx264
+  preset: veryfast
+  crf: 25
+  gop_seconds: 2
+
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 800
+  max_height: 700
+  show_status: true
+
+cameras:
+  - label: camera1
+    animal_ids: []
+    model: acA4024-29uc
+    serial: "24682363"
+
+    # Full native sensor field of view.
+    fps: 5
+    width: 4024
+    height: 3036
+    offset_x: 0
+    offset_y: 0
+    binning: 1
+    pixel_format: auto
+
+    # Downscale the saved video for this first test.
+    # Comment this out later to test native-resolution recording.
+    output_width: 1200
+
+    exposure_us: 5000
+    gain: 0
+    auto_exposure: false
+    auto_gain: false
+    balance_white_auto: false
+
+    rotate: 0
+    flip_horizontal: false
+    flip_vertical: false
+    max_num_buffer: 30
