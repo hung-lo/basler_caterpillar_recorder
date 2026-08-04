@@ -6,7 +6,7 @@ subject: cohort_C01-C04_day1
 output_root: ./recordings
 
 experiment:
-  animal_ids: [C01, C02, C03, C04]
+  animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
   notes: "One-camera monarch caterpillar pilot. Full 1920 x 1200 sensor FoV, rotated 90 degrees counter-clockwise and downsampled to approximately 960 x 1536."
 
 ffmpeg: null
@@ -47,7 +47,7 @@ recording_preview:
 
 cameras:
   - label: camera1
-    animal_ids: [C01, C02, C03, C04]
+    animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
     model: a2A1920-160ucBAS
     serial: "40604036"
     fps: 5
