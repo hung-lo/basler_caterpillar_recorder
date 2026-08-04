@@ -47,7 +47,7 @@ cameras:
 
     # Software downscaling after rotation; preserves the full FoV.
     output_width: 960
-    exposure_us: 4000
+    exposure_us: 5000
     gain: 0
     auto_exposure: false
     auto_gain: false
