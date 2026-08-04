@@ -204,10 +204,10 @@ Run the rotated one-camera test with recording preview:
 python record_basler.py --config config_one_camera_test_rotated_preview.yaml
 ```
 
-On macOS, prevent idle sleep during recording with `caffeinate`. For preview-enabled runs, the most useful form is:
+On macOS, prevent idle sleep during recording with `caffeinate -i`. Keep the MacBook on power, leave the lid open, and disable automatic sleep on the power adapter when possible. For preview-enabled runs, the most useful form is:
 
 ```bash
-caffeinate -di python record_basler.py --config config_one_camera_test_rotated_preview.yaml
+caffeinate -i python record_basler.py --config config_one_camera_test_rotated_preview.yaml
 ```
 
 Open both MP4 files and inspect the JSON sidecars. Confirm that `success` is true, `grab_failures` is zero, `measured_receive_fps` is close to the requested rate, and `mp4_remux_succeeded` is true. Then start the pilot:
@@ -219,7 +219,7 @@ python record_basler.py --config config_pilot.yaml
 For long macOS runs, prefer:
 
 ```bash
-caffeinate -di python record_basler.py --config config_pilot.yaml
+caffeinate -i python record_basler.py --config config_pilot.yaml
 ```
 
 Stop cleanly with `Ctrl+C`.

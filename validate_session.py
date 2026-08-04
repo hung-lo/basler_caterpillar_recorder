@@ -54,6 +54,17 @@ def first_present(mapping: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def load_json_mapping(path: Path) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        return None, f"could not read JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, "JSON root is not an object"
+    return data, None
+
+
 def coerce_int(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -70,6 +81,22 @@ def coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def coerce_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "yes", "1", "on"}:
+            return True
+        if text in {"false", "no", "0", "off"}:
+            return False
+    return None
 
 
 @dataclasses.dataclass
@@ -132,10 +159,10 @@ def read_timestamp_stats(path: Path) -> TimestampStats:
         reader = csv.DictReader(handle)
         for row in reader:
             row_count += 1
-            utc_ns = coerce_int(first_present(row, "host_utc_ns"))
+            utc_ns = coerce_int(first_present(row, "host_utc_ns", "utc_ns", "timestamp_ns"))
             if utc_ns is None:
-                utc_ns = parse_iso_ns(first_present(row, "host_utc_iso"))
-            mono_ns = coerce_int(first_present(row, "host_monotonic_ns"))
+                utc_ns = parse_iso_ns(first_present(row, "host_utc_iso", "utc_iso", "timestamp_iso"))
+            mono_ns = coerce_int(first_present(row, "host_monotonic_ns", "monotonic_ns", "mono_ns"))
 
             if first_utc_ns is None and utc_ns is not None:
                 first_utc_ns = utc_ns
@@ -182,6 +209,27 @@ def expected_label_order(config: dict[str, Any]) -> list[str]:
     return labels
 
 
+def parse_session_summary(session_dir: Path) -> tuple[Optional[dict[str, Any]], list[str]]:
+    summary_path = session_dir / "session_summary.json"
+    issues: list[str] = []
+    if not summary_path.exists():
+        return None, [f"missing session summary: {summary_path.name}"]
+    summary, error = load_json_mapping(summary_path)
+    if error is not None:
+        return None, [f"{summary_path.name}: {error}"]
+    return summary, issues
+
+
+def find_leftover_capture_mkvs(session_dir: Path) -> list[Path]:
+    return sorted(session_dir.rglob("*.capture.mkv"))
+
+
+def format_optional(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return str(value)
+
+
 def validate_clip_camera(
     clip_index: int,
     expected_duration_s: Optional[float],
@@ -197,10 +245,8 @@ def validate_clip_camera(
     if not timestamps_path.exists():
         issues.append(f"missing timestamps: {timestamps_path.name}")
 
-    try:
-        with json_path.open("r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
-    except Exception as exc:
+    metadata, error = load_json_mapping(json_path)
+    if error is not None:
         return ClipCameraReport(
             clip_index=clip_index,
             camera_label=camera_cfg.get("label", ""),
@@ -218,14 +264,9 @@ def validate_clip_camera(
             last_utc_ns=None,
             observed_duration_s=None,
             median_receive_fps=None,
-            issues=issues + [f"could not read JSON: {exc}"],
+            issues=issues + [error],
         )
 
-    if not isinstance(metadata, dict):
-        issues.append("JSON sidecar does not contain an object")
-        metadata = {}
-
-    label = str(first_present(metadata, "label") or first_present(metadata.get("requested_settings", {}) if isinstance(metadata.get("requested_settings"), dict) else {}, "label") or camera_cfg.get("label") or "").strip()
     requested_settings = metadata.get("requested_settings")
     actual_settings = metadata.get("actual_settings")
     if not isinstance(requested_settings, dict):
@@ -234,17 +275,27 @@ def validate_clip_camera(
     if not isinstance(actual_settings, dict):
         actual_settings = {}
 
-    success = bool(metadata.get("success")) if "success" in metadata else False
-    grab_failures = coerce_int(first_present(metadata, "grab_failures", "grabFailures"))
+    label = str(
+        first_present(metadata, "label")
+        or first_present(requested_settings, "label")
+        or camera_cfg.get("label")
+        or ""
+    ).strip()
+    success = coerce_bool(first_present(metadata, "success"))
+    if success is None:
+        success = False
+        issues.append("success missing or invalid")
+    grab_failures = coerce_int(first_present(metadata, "grab_failures", "grabFailures", "grab_failures_count"))
     mp4_remux_succeeded = metadata.get("mp4_remux_succeeded")
     if mp4_remux_succeeded is None:
         mp4_remux_succeeded = metadata.get("mp4RemuxSucceeded")
-    if mp4_remux_succeeded is not None:
-        mp4_remux_succeeded = bool(mp4_remux_succeeded)
+    mp4_remux_succeeded = coerce_bool(mp4_remux_succeeded)
     frame_count = coerce_int(first_present(metadata, "frame_count", "frames"))
     requested_fps = coerce_float(first_present(requested_settings, "fps"))
     if requested_fps is None:
-        requested_fps = coerce_float(first_present(actual_settings, "AcquisitionFrameRate", "AcquisitionFrameRateAbs"))
+        requested_fps = coerce_float(
+            first_present(actual_settings, "AcquisitionFrameRate", "AcquisitionFrameRateAbs")
+        )
     if requested_fps is not None and expected_duration_s is not None:
         expected_frames = requested_fps * expected_duration_s
     else:
@@ -335,20 +386,78 @@ def validate_session(session_dir: Path) -> int:
     clip_duration_s = coerce_float(schedule.get("clip_duration_s")) if isinstance(schedule, dict) else None
     camera_configs = config.get("cameras") if isinstance(config.get("cameras"), list) else []
     expected_labels = expected_label_order(config)
+    summary, summary_issues = parse_session_summary(session_dir)
 
     clip_dirs = sorted(
         [item for item in session_dir.iterdir() if item.is_dir() and item.name.startswith("clip_")],
         key=lambda path: path.name,
     )
+    leftover_mkvs = find_leftover_capture_mkvs(session_dir)
 
     print(f"Session: {session_dir}")
     print(f"Config: {config.get('project')!r} / {config.get('subject')!r}")
     print(f"Clip dirs: {len(clip_dirs)}")
+    print(f"Temp MKVs: {len(leftover_mkvs)}")
 
     if number_of_clips is not None and len(clip_dirs) != number_of_clips:
         problems.append(
             f"expected {number_of_clips} clip directories from config_used.yaml, found {len(clip_dirs)}"
         )
+
+    if summary is not None:
+        completed_clips = coerce_int(summary.get("completed_clips"))
+        requested_clips = coerce_int(summary.get("requested_clips"))
+        stopped_by_signal = coerce_bool(summary.get("stopped_by_signal"))
+        any_failure = coerce_bool(summary.get("any_failure"))
+        exit_status = summary.get("exit_status")
+        finished_utc = summary.get("finished_utc")
+        unexpected_exception = summary.get("unexpected_exception")
+
+        print(
+            "Summary: "
+            f"completed_clips={format_optional(completed_clips)} "
+            f"requested_clips={format_optional(requested_clips)} "
+            f"stopped_by_signal={format_optional(stopped_by_signal)} "
+            f"any_failure={format_optional(any_failure)} "
+            f"exit_status={format_optional(exit_status)} "
+            f"finished_utc={format_optional(finished_utc)} "
+            f"unexpected_exception={format_optional(unexpected_exception)}"
+        )
+
+        if completed_clips is None:
+            problems.append("session_summary.json: completed_clips missing or invalid")
+        elif completed_clips != len(clip_dirs):
+            problems.append(
+                f"session_summary.json: completed_clips {completed_clips} does not match the {len(clip_dirs)} clip directories found"
+            )
+
+        if number_of_clips is not None and requested_clips != number_of_clips:
+            problems.append(
+                f"session_summary.json: requested_clips {requested_clips} does not match config_used.yaml number_of_clips {number_of_clips}"
+            )
+
+        if any_failure is None:
+            problems.append("session_summary.json: any_failure missing or invalid")
+        elif any_failure:
+            problems.append("session_summary.json: any_failure is true")
+
+        if exit_status != "success":
+            problems.append(f"session_summary.json: exit_status is {exit_status!r}, expected 'success'")
+
+        if stopped_by_signal is None:
+            problems.append("session_summary.json: stopped_by_signal missing or invalid")
+        elif stopped_by_signal:
+            problems.append("session_summary.json: stopped_by_signal is true")
+
+        if unexpected_exception not in (None, ""):
+            problems.append(f"session_summary.json: unexpected_exception is {unexpected_exception!r}")
+    else:
+        problems.extend(summary_issues)
+
+    if leftover_mkvs:
+        problems.append(f"found {len(leftover_mkvs)} leftover temporary MKV file(s)")
+        for path in leftover_mkvs:
+            problems.append(f"leftover temporary MKV: {path}")
 
     clip_reports: list[ClipCameraReport] = []
     per_camera_reports: dict[str, list[ClipCameraReport]] = {label: [] for label in expected_labels}

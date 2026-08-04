@@ -492,6 +492,7 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
         selected, _ = try_set(camera, "TriggerSelector", trigger_selector)
         if selected:
             try_set(camera, "TriggerMode", "Off")
+            break
 
     # Binning changes full-sensor spatial sampling while preserving field of view.
     # Unsupported nodes are logged and skipped.
@@ -613,8 +614,8 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     actual["chunk_timestamp_enabled"] = chunk_enabled
 
     converter = pylon.ImageFormatConverter()
-    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-    converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+    converter.OutputPixelFormat.Value = pylon.PixelType_BGR8packed
+    converter.OutputBitAlignment.Value = pylon.OutputBitAlignment_MsbAligned
 
     return CameraBinding(
         label=label,
@@ -1428,14 +1429,9 @@ def write_session_summary(
     requested_clips: Optional[int],
     stopped_by_signal: bool,
     any_failure: bool,
+    unexpected_exception: Optional[str],
+    exit_status: str,
 ) -> None:
-    if any_failure:
-        exit_status = "failure"
-    elif stopped_by_signal:
-        exit_status = "interrupted"
-    else:
-        exit_status = "success"
-
     summary = {
         "completed_clips": completed_clips,
         "requested_clips": requested_clips,
@@ -1443,15 +1439,22 @@ def write_session_summary(
         "any_failure": any_failure,
         "finished_utc": utc_now().isoformat(),
         "exit_status": exit_status,
+        "unexpected_exception": unexpected_exception,
     }
-    with (session_dir / "session_summary.json").open("w", encoding="utf-8") as handle:
+    summary_path = session_dir / "session_summary.json"
+    temp_path = summary_path.with_suffix(".json.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, default=str)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, summary_path)
 
 
 def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
     schedule = dict(config.get("schedule") or {})
     clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
     preview_settings = parse_recording_preview_settings(config)
+    requested_clips = number_of_clips
 
     project = sanitize_token(str(config.get("project", "caterpillar")))
     subject = sanitize_token(str(config.get("subject", "cohort")))
@@ -1515,6 +1518,8 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     stopped_by_signal = False
     clip_index = 0
     any_failure = False
+    unexpected_exception: Optional[str] = None
+    exit_status = "running"
     if preview_settings.enabled:
         preview_active_event.set()
 
@@ -1645,19 +1650,44 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             clip_index += 1
 
         LOG.info("Recording finished after %d completed clip(s)", clip_index)
-        return 130 if stopped_by_signal and not any_failure else (1 if any_failure else 0)
+    except KeyboardInterrupt:
+        stopped_by_signal = True
+        exit_status = "interrupted"
+        LOG.warning("KeyboardInterrupt received; stopping recording")
+        stop_event.set()
+    except Exception as exc:
+        any_failure = True
+        unexpected_exception = repr(exc)
+        exit_status = "exception"
+        LOG.exception("Unhandled exception during recording")
+        stop_event.set()
     finally:
+        if exit_status == "running":
+            if any_failure:
+                exit_status = "failed"
+            elif stopped_by_signal:
+                exit_status = "interrupted"
+            else:
+                exit_status = "success"
         try:
             write_session_summary(
                 session_dir=session_dir,
                 completed_clips=clip_index,
-                requested_clips=number_of_clips,
+                requested_clips=requested_clips,
                 stopped_by_signal=stopped_by_signal,
                 any_failure=any_failure,
+                unexpected_exception=unexpected_exception,
+                exit_status=exit_status,
             )
         except Exception as exc:
             LOG.warning("Could not write session summary: %s", exc)
         close_bindings(bindings)
+
+    if exit_status == "interrupted":
+        return 130
+    if exit_status in {"failed", "exception"}:
+        return 1
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:

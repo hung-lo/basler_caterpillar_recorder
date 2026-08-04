@@ -53,6 +53,12 @@ Run a ten-second two-camera test:
 python record_basler.py --config config_smoke_test.yaml
 ```
 
+On macOS, keep the machine on power, leave the lid open, and use `caffeinate -i` for unattended runs so the display can sleep without the system idling out:
+
+```bash
+caffeinate -i python record_basler.py --config config_smoke_test.yaml
+```
+
 If you want a live monitor window during recording, use the example one-camera preview config:
 
 ```bash
@@ -80,7 +86,7 @@ Open both MP4 files. In each JSON sidecar confirm:
 Edit `project`, `subject`, `animal_ids`, and the schedule in `config_pilot.yaml`, then run:
 
 ```bash
-python record_basler.py --config config_pilot.yaml
+caffeinate -i python record_basler.py --config config_pilot.yaml
 ```
 
 The default is near-continuous 5-fps recording in 30-minute MP4 clips for 24 hours. Stop cleanly with `Ctrl+C`.
