@@ -23,10 +23,10 @@ That produces an encoded frame of about `960 x 1536` while preserving the full f
 ## Repository files
 
 - `record_basler.py`: recorder CLI for listing cameras, live preview, dry runs, and scheduled recording.
-- `config_pilot.yaml`: the long one-camera pilot configuration for `./recordings`.
-- `config_smoke_test.yaml`: a ten-second one-camera smoke test for `./recordings_test`.
+- `config_pilot.yaml`: the long one-camera full-FoV pilot configuration for `./recordings`.
+- `config_smoke_test.yaml`: a ten-second one-camera full-FoV smoke test for `./recordings_test`.
 - `config_experiment_day1.yaml`: the full-FoV day-1 production config with preview enabled.
-- `config_multiclip_smoke_test.yaml`: a three-clip pre-experiment smoke test with preview enabled.
+- `config_multiclip_smoke_test.yaml`: a three-clip pre-experiment full-FoV smoke test with preview enabled.
 - `validate_session.py`: session validator for clip structure, timing, summary state, and leftover temporary files.
 - `QUICKSTART.md`: a short setup-and-run checklist.
 - `requirements.txt`: Python dependencies for the recorder.
