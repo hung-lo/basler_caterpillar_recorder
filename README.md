@@ -14,6 +14,31 @@ The configs in this repo cover both full-FoV and downsampled runs. All of them u
 - `config_multiclip_smoke_test.yaml`: two-clip preview smoke test, full sensor FoV, archive disabled.
 - `config_archive_smoke_test.yaml`: three-clip archive integration test with preview and external-drive transfer.
 
+## On-disk layout
+
+Sessions now use a compact one-second timestamp at the session level, and each clip directory keeps only the clip index and clock time. Camera files use only the camera label.
+
+```text
+recordings/
+  monarch_behavior_pilot/
+    cohort_pilot01/
+      20260804_101405/
+        config_used.yaml
+        session_manifest.json
+        session_summary.json
+        recorder.log
+        clip_0000_101406/
+          camera1.mp4
+          camera1.timestamps.csv.gz
+          camera1.json
+          camera1.capture.mkv
+          camera1.ffmpeg.log
+          camera1.remux.log
+          monitor_snapshots/
+```
+
+Exact subsecond timing stays in the JSON metadata and the timestamp CSV. The same shortened hierarchy is copied to the archive drive under `/Volumes/Dr. Rose/Hung_MBL` when archive mode is enabled.
+
 ## Repository files
 
 - `record_basler.py`: recorder CLI for listing cameras, live preview, dry runs, and scheduled recording.

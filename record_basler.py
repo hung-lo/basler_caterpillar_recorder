@@ -52,8 +52,22 @@ def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def compact_utc(value: dt.datetime) -> str:
-    return value.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+def session_stamp_utc(value: dt.datetime) -> str:
+    """UTC session directory timestamp, sortable to one-second precision."""
+
+    return value.astimezone(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def clip_clock_utc(value: dt.datetime) -> str:
+    """UTC clip clock time; the session directory already stores the date."""
+
+    return value.astimezone(dt.timezone.utc).strftime("%H%M%S")
+
+
+def snapshot_stamp_utc(value: dt.datetime) -> str:
+    """Compact UTC timestamp for optional monitoring snapshots."""
+
+    return value.astimezone(dt.timezone.utc).strftime("%H%M%S")
 
 
 def iso_utc_from_ns(value_ns: int) -> str:
@@ -75,6 +89,18 @@ def sanitize_token(value: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned.strip("-_") or "unnamed"
+
+
+def choose_unique_directory(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    for suffix in range(2, 1000):
+        candidate = path.with_name(f"{path.name}_{suffix:02d}")
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError(f"Could not choose a unique directory for {path}")
 
 
 def ensure_even(value: int) -> int:
@@ -735,7 +761,7 @@ class FFmpegWriter:
         self.fps = fps
         self.encoding_cfg = encoding_cfg
         self.process: Optional[subprocess.Popen[bytes]] = None
-        self.stderr_path = temp_path.with_suffix(temp_path.suffix + ".ffmpeg.log")
+        self.stderr_path = final_path.with_name(f"{final_path.stem}.ffmpeg.log")
         self.stderr_handle: Any = None
 
     def start(self) -> None:
@@ -816,7 +842,7 @@ class FFmpegWriter:
             return return_code, False
 
         # MKV is resilient during capture. Remuxing is fast and does not recompress.
-        remux_log = self.final_path.with_suffix(self.final_path.suffix + ".remux.log")
+        remux_log = self.final_path.with_name(f"{self.final_path.stem}.remux.log")
         command = [
             self.ffmpeg,
             "-hide_banner",
@@ -1622,11 +1648,11 @@ def monitor_recording_threads(
                 snapshot_count += 1
                 snapshot_dir = clip_dir / "monitor_snapshots"
                 snapshot_dir.mkdir(parents=True, exist_ok=True)
-                stamp = compact_utc(utc_now())
                 for packet in latest.values():
                     snapshot_path = snapshot_dir / (
-                        f"{packet.label}_clip{packet.clip_index:04d}_"
-                        f"frame{packet.frame_index:08d}_{stamp}_{snapshot_count:03d}.png"
+                        f"{sanitize_token(packet.label)}_"
+                        f"frame{packet.frame_index:08d}_"
+                        f"{snapshot_stamp_utc(utc_now())}_{snapshot_count:03d}.png"
                     )
                     if cv2.imwrite(str(snapshot_path), packet.frame):
                         LOG.info("Saved monitor snapshot %s", snapshot_path)
@@ -1679,18 +1705,11 @@ def record_one_camera(
     camera = binding.camera
     requested_fps = float(binding.requested.get("fps", binding.fps))
     actual_fps = float(binding.actual_settings.get("AcquisitionFrameRate") or requested_fps)
-    prefix = "_".join(
-        [
-            sanitize_token(str(binding.requested.get("project_override") or "")),
-            label,
-            f"clip{clip_index:04d}",
-            compact_utc(clip_start_utc),
-        ]
-    ).strip("_")
-    final_path = clip_dir / f"{prefix}.mp4"
-    temp_path = clip_dir / f"{prefix}.capture.mkv"
-    timestamps_path = clip_dir / f"{prefix}.timestamps.csv.gz"
-    metadata_path = clip_dir / f"{prefix}.json"
+    file_stem = sanitize_token(label)
+    final_path = clip_dir / f"{file_stem}.mp4"
+    temp_path = clip_dir / f"{file_stem}.capture.mkv"
+    timestamps_path = clip_dir / f"{file_stem}.timestamps.csv.gz"
+    metadata_path = clip_dir / f"{file_stem}.json"
 
     writer: Optional[FFmpegWriter] = None
     timestamp_handle: Any = None
@@ -2102,13 +2121,26 @@ def write_session_manifest(
     config: dict[str, Any],
     bindings: list[CameraBinding],
     ffmpeg: str,
+    *,
+    session_name: str,
+    session_start_utc: dt.datetime,
 ) -> None:
     manifest = {
         "created_utc": utc_now().isoformat(),
+        "session_name": session_name,
+        "session_start_utc": session_start_utc.isoformat(),
         "platform": sys.platform,
         "python": sys.version,
         "config_source": str(config_path.resolve()),
         "ffmpeg": ffmpeg,
+        "naming": {
+            "version": 2,
+            "session_directory_format": "YYYYMMDD_HHMMSS",
+            "clip_directory_format": "clip_NNNN_HHMMSS",
+            "camera_file_stem": "camera label",
+            "path_time_precision": "seconds",
+            "scientific_timestamp_precision": "nanoseconds where available",
+        },
         "config": config,
         "cameras": [
             {
@@ -2163,8 +2195,8 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     subject = sanitize_token(str(config.get("subject", "cohort")))
     output_root = Path(str(config.get("output_root", "./recordings"))).expanduser()
     session_start_utc = utc_now()
-    session_name = f"{project}_{subject}_{compact_utc(session_start_utc)}"
-    session_dir = output_root / project / subject / session_name
+    session_dir = choose_unique_directory(output_root / project / subject / session_stamp_utc(session_start_utc))
+    session_name = session_dir.name
     session_dir.mkdir(parents=True, exist_ok=False)
     setup_logging(session_dir, verbose)
 
@@ -2276,13 +2308,20 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     try:
         for camera_cfg_raw in camera_cfgs:
             camera_cfg = dict(camera_cfg_raw)
-            camera_cfg["project_override"] = f"{project}_{subject}"
             device = match_device(camera_cfg, devices, used_serials)
             info = camera_info_dict(device)
             used_serials.add(info["serial"])
             bindings.append(configure_camera(camera_cfg, device))
 
-        write_session_manifest(session_dir, config_path, config, bindings, ffmpeg)
+        write_session_manifest(
+            session_dir,
+            config_path,
+            config,
+            bindings,
+            ffmpeg,
+            session_name=session_name,
+            session_start_utc=session_start_utc,
+        )
         if archive_settings.enabled:
             archive_manager = ArchiveManager(
                 settings=archive_settings,
@@ -2407,7 +2446,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             planned_stop_mono_ns = planned_start_mono_ns + round(clip_duration_s * 1e9)
             delay_to_start_s = (planned_start_mono_ns - time.monotonic_ns()) / 1e9
             clip_start_utc = utc_now() + dt.timedelta(seconds=delay_to_start_s)
-            clip_dir = session_dir / f"clip_{clip_index:04d}_{compact_utc(clip_start_utc)}"
+            clip_dir = session_dir / f"clip_{clip_index:04d}_{clip_clock_utc(clip_start_utc)}"
             clip_dir.mkdir(parents=True, exist_ok=False)
             LOG.info(
                 "Starting clip %d at %s for %.1f s",

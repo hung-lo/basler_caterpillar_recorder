@@ -79,6 +79,16 @@ Open the MP4 file and inspect the JSON sidecar. In the JSON confirm:
 
 The archive-enabled configs record locally first, then verify and copy each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` before deleting the local clip directory.
 
+The short on-disk naming scheme is:
+
+```text
+20260804_101405/
+  clip_0000_101406/
+    camera1.mp4
+    camera1.timestamps.csv.gz
+    camera1.json
+```
+
 ## Start the pilot
 
 Edit `project`, `subject`, `animal_ids`, and the schedule in `config_pilot.yaml`, then run:

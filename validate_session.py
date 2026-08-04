@@ -99,6 +99,14 @@ def coerce_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def sanitize_token(value: str) -> str:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    cleaned = "".join(ch if ch in allowed else "-" for ch in value.strip())
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-_") or "unnamed"
+
+
 @dataclasses.dataclass
 class TimestampStats:
     row_count: int
@@ -220,8 +228,40 @@ def parse_session_summary(session_dir: Path) -> tuple[Optional[dict[str, Any]], 
     return summary, issues
 
 
+def parse_archive_summary(session_dir: Path) -> tuple[Optional[dict[str, Any]], list[str]]:
+    summary_path = session_dir / "archive_summary.json"
+    issues: list[str] = []
+    if not summary_path.exists():
+        return None, [f"missing archive summary: {summary_path.name}"]
+    summary, error = load_json_mapping(summary_path)
+    if error is not None:
+        return None, [f"{summary_path.name}: {error}"]
+    return summary, issues
+
+
 def find_leftover_capture_mkvs(session_dir: Path) -> list[Path]:
     return sorted(session_dir.rglob("*.capture.mkv"))
+
+
+def resolve_clip_camera_artifacts(clip_dir: Path, label: str) -> tuple[Optional[Path], Optional[str], list[str]]:
+    stem = sanitize_token(label)
+    exact_json = clip_dir / f"{stem}.json"
+    if exact_json.exists():
+        return exact_json, "v2", []
+
+    legacy_json_matches = sorted(clip_dir.glob(f"*_{stem}_clip*.json"))
+    if len(legacy_json_matches) == 1:
+        return legacy_json_matches[0], "legacy", []
+    if len(legacy_json_matches) == 0:
+        return None, None, [f"missing JSON sidecar for {label!r}"]
+    return (
+        None,
+        None,
+        [
+            f"expected exactly one legacy JSON sidecar for {label!r}, "
+            f"found {len(legacy_json_matches)}",
+        ],
+    )
 
 
 def format_optional(value: Any) -> str:
@@ -386,7 +426,12 @@ def validate_session(session_dir: Path) -> int:
     clip_duration_s = coerce_float(schedule.get("clip_duration_s")) if isinstance(schedule, dict) else None
     camera_configs = config.get("cameras") if isinstance(config.get("cameras"), list) else []
     expected_labels = expected_label_order(config)
+    archive_config = config.get("archive") if isinstance(config.get("archive"), dict) else {}
+    archive_enabled = bool(archive_config.get("enabled", False)) if isinstance(archive_config, dict) else False
     summary, summary_issues = parse_session_summary(session_dir)
+    archive_summary, archive_summary_issues = (
+        parse_archive_summary(session_dir) if archive_enabled else (None, [])
+    )
 
     clip_dirs = sorted(
         [item for item in session_dir.iterdir() if item.is_dir() and item.name.startswith("clip_")],
@@ -454,6 +499,66 @@ def validate_session(session_dir: Path) -> int:
     else:
         problems.extend(summary_issues)
 
+    if archive_enabled:
+        if archive_summary is not None:
+            queued_clips = coerce_int(archive_summary.get("queued_clips"))
+            processed_clips = coerce_int(archive_summary.get("processed_clips"))
+            successful_clips = coerce_int(archive_summary.get("successful_clips"))
+            failed_clips = coerce_int(archive_summary.get("failed_clips"))
+            failure_detected = coerce_bool(archive_summary.get("failure_detected"))
+            completed_utc = archive_summary.get("completed_utc")
+
+            print(
+                "Archive summary: "
+                f"queued_clips={format_optional(queued_clips)} "
+                f"processed_clips={format_optional(processed_clips)} "
+                f"successful_clips={format_optional(successful_clips)} "
+                f"failed_clips={format_optional(failed_clips)} "
+                f"failure_detected={format_optional(failure_detected)} "
+                f"completed_utc={format_optional(completed_utc)}"
+            )
+
+            if queued_clips is None:
+                problems.append("archive_summary.json: queued_clips missing or invalid")
+            elif queued_clips != len(clip_dirs):
+                problems.append(
+                    f"archive_summary.json: queued_clips {queued_clips} does not match the {len(clip_dirs)} clip directories found"
+                )
+
+            if processed_clips is None:
+                problems.append("archive_summary.json: processed_clips missing or invalid")
+            elif processed_clips != len(clip_dirs):
+                problems.append(
+                    f"archive_summary.json: processed_clips {processed_clips} does not match the {len(clip_dirs)} clip directories found"
+                )
+
+            if successful_clips is None:
+                problems.append("archive_summary.json: successful_clips missing or invalid")
+            elif successful_clips != len(clip_dirs):
+                problems.append(
+                    f"archive_summary.json: successful_clips {successful_clips} does not match the {len(clip_dirs)} clip directories found"
+                )
+
+            if failed_clips is None:
+                problems.append("archive_summary.json: failed_clips missing or invalid")
+            elif failed_clips != 0:
+                problems.append(f"archive_summary.json: failed_clips is {failed_clips}")
+
+            if failure_detected is None:
+                problems.append("archive_summary.json: failure_detected missing or invalid")
+            elif failure_detected:
+                problems.append("archive_summary.json: failure_detected is true")
+
+            results = archive_summary.get("results")
+            if not isinstance(results, list):
+                problems.append("archive_summary.json: results missing or invalid")
+            elif len(results) != len(clip_dirs):
+                problems.append(
+                    f"archive_summary.json: results length {len(results)} does not match the {len(clip_dirs)} clip directories found"
+                )
+        else:
+            problems.extend(archive_summary_issues)
+
     if leftover_mkvs:
         problems.append(f"found {len(leftover_mkvs)} leftover temporary MKV file(s)")
         for path in leftover_mkvs:
@@ -461,6 +566,7 @@ def validate_session(session_dir: Path) -> int:
 
     clip_reports: list[ClipCameraReport] = []
     per_camera_reports: dict[str, list[ClipCameraReport]] = {label: [] for label in expected_labels}
+    naming_layouts: set[str] = set()
 
     for clip_dir in clip_dirs:
         try:
@@ -476,6 +582,8 @@ def validate_session(session_dir: Path) -> int:
             )
 
         reports_by_label: dict[str, ClipCameraReport] = {}
+        clip_layouts: set[str] = set()
+
         for json_path in json_files:
             try:
                 with json_path.open("r", encoding="utf-8") as handle:
@@ -521,8 +629,32 @@ def validate_session(session_dir: Path) -> int:
             per_camera_reports.setdefault(label, []).append(report)
 
         for expected_label in expected_labels:
-            if expected_label not in reports_by_label:
+            json_path, layout, resolution_issues = resolve_clip_camera_artifacts(clip_dir, expected_label)
+            if layout is not None:
+                clip_layouts.add(layout)
+            for issue in resolution_issues:
+                problems.append(f"{clip_dir.name}: {issue}")
+            if json_path is None:
                 problems.append(f"{clip_dir.name}: missing camera report for {expected_label!r}")
+                continue
+            if expected_label not in reports_by_label:
+                report = validate_clip_camera(
+                    clip_index=clip_index,
+                    expected_duration_s=clip_duration_s,
+                    camera_cfg=next(
+                        (item for item in camera_configs if str(item.get("label")) == expected_label),
+                        {"label": expected_label},
+                    ),
+                    json_path=json_path,
+                )
+                reports_by_label[expected_label] = report
+                clip_reports.append(report)
+                per_camera_reports.setdefault(expected_label, []).append(report)
+
+        if clip_layouts:
+            naming_layouts.update(clip_layouts)
+            if len(clip_layouts) > 1:
+                problems.append(f"{clip_dir.name}: mixed naming layouts detected: {sorted(clip_layouts)}")
 
     for label in expected_labels:
         reports = sorted(per_camera_reports.get(label, []), key=lambda item: item.clip_index)
@@ -555,6 +687,13 @@ def validate_session(session_dir: Path) -> int:
                 warnings.append(gap_line + " exceeds 5s warning threshold")
             else:
                 print(gap_line)
+
+    if naming_layouts == {"v2"}:
+        print("Naming layout: v2")
+    elif naming_layouts == {"legacy"}:
+        print("Naming layout: legacy")
+    elif naming_layouts:
+        print(f"Naming layout: mixed ({', '.join(sorted(naming_layouts))})")
 
     if warnings:
         print("Warnings:")
