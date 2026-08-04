@@ -62,7 +62,7 @@ cameras:
     # Comment this out later to test native-resolution recording.
     output_width: 1200
 
-    exposure_us: 5000
+    exposure_us: 10000
     gain: 0
     auto_exposure: false
     auto_gain: false
