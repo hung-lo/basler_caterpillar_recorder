@@ -614,8 +614,8 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     actual["chunk_timestamp_enabled"] = chunk_enabled
 
     converter = pylon.ImageFormatConverter()
-    converter.OutputPixelFormat.Value = pylon.PixelType_BGR8packed
-    converter.OutputBitAlignment.Value = pylon.OutputBitAlignment_MsbAligned
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+    converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 
     return CameraBinding(
         label=label,
