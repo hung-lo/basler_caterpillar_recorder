@@ -28,9 +28,9 @@ archive:
   stop_before_next_clip_on_transfer_failure: true
 
 schedule:
-  clip_duration_s: 3600
-  interval_s: 3600
-  number_of_clips: 24
+  clip_duration_s: 600
+  interval_s: 600
+  number_of_clips: 30 # do 5 hr now just to check
 
 encoding:
   codec: libx264
@@ -62,8 +62,8 @@ cameras:
     pixel_format: auto
 
     # Software downscaling after rotation; preserves the full FoV.
-    output_width: 960
-    exposure_us: 5000
+    # output_width: 960 ## don't downsample for now
+    exposure_us: 6000
     gain: 0
     auto_exposure: false
     auto_gain: false
