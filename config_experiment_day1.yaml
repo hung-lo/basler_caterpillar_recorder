@@ -11,6 +11,22 @@ experiment:
 
 ffmpeg: null
 
+archive:
+  enabled: true
+  destination_root: "/Volumes/Dr. Rose/Hung_MBL"
+  required_mount_point: "/Volumes/Dr. Rose"
+  rsync_executable: /usr/bin/rsync
+  transfer_after_each_clip: true
+  background_transfer: true
+  delete_local_clip_after_verified_transfer: true
+  retain_local_session_metadata: true
+  verification: checksum
+  max_clip_size_gb: 50
+  min_local_free_gb_before_clip: 120
+  min_external_free_gb_before_transfer: 60
+  max_unarchived_clips: 2
+  stop_before_next_clip_on_transfer_failure: true
+
 schedule:
   clip_duration_s: 3600
   interval_s: 3600

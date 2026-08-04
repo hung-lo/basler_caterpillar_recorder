@@ -1,17 +1,14 @@
-# Fast-start pilot configuration for the single connected Basler camera.
-# Run `python record_basler.py --list-cameras` first, then confirm serial
-# 40604036 if the camera ever changes.
+# Three-clip end-to-end archive smoke test for the connected a2A1920-160ucBAS camera.
+# Exercises repeated acquisition, remuxing, scheduling, preview, archive transfer, and metadata.
 
-project: monarch_behavior_pilot
-subject: cohort_pilot01
-output_root: ./recordings
+project: monarch_behavior_multiclip_test
+subject: cohort_C01-C04
+output_root: ./recordings_test
 
 experiment:
-  animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
-  outcome_definition: successful_adult_eclosion
-  notes: "Pilot: fixed individual enclosures under one full-FoV camera; edit IDs before recording."
+  animal_ids: [C01, C02, C03, C04]
+  notes: "Three-clip end-to-end test of repeated acquisition, remuxing, scheduling, preview, archive transfer, and metadata."
 
-# Optional absolute path or command name. Leaving this null uses ffmpeg on PATH.
 ffmpeg: null
 
 archive:
@@ -31,13 +28,9 @@ archive:
   stop_before_next_clip_on_transfer_failure: true
 
 schedule:
-  # Start-to-start scheduling. Equal values make continuous back-to-back clips.
-  # The recommended pilot is continuous recording split into 30-minute files.
-  clip_duration_s: 1800
-  interval_s: 1800
-  total_duration_h: 24
-  # Alternative to total_duration_h:
-  # number_of_clips: 48
+  clip_duration_s: 20
+  interval_s: 20
+  number_of_clips: 3
 
 encoding:
   codec: libx264
@@ -45,11 +38,16 @@ encoding:
   crf: 25
   gop_seconds: 2
 
+recording_preview:
+  enabled: true
+  fps: 1
+  max_width: 600
+  max_height: 720
+  show_status: true
+
 cameras:
-  # Full native sensor field of view at 5 fps, rotated 90 degrees CCW and
-  # downscaled after rotation to keep file sizes practical.
   - label: camera1
-    animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
+    animal_ids: [C01, C02, C03, C04]
     model: a2A1920-160ucBAS
     serial: "40604036"
     fps: 5

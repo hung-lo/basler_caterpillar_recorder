@@ -6,27 +6,22 @@ This repository is set up for the currently connected Basler camera:
 - serial: `40604036`
 - label used in YAML: `camera1`
 
-The active configs use the full native sensor field of view:
+The configs in this repo cover both full-FoV and downsampled runs. All of them use the same connected camera and the same 90-degree counter-clockwise rotation:
 
-- `width: 1920`
-- `height: 1200`
-- `offset_x: 0`
-- `offset_y: 0`
-
-They keep the 90-degree counter-clockwise rotation and software downscaling:
-
-- `rotate: 270`
-- `output_width: 960`
-
-That produces an encoded frame of about `960 x 1536` while preserving the full field of view.
+- `config_pilot.yaml`: 24-hour pilot, full sensor FoV, archive enabled.
+- `config_experiment_day1.yaml`: day-1 production config, preview enabled, archive enabled, downsampled to about `960 x 1536`.
+- `config_smoke_test.yaml`: ten-second smoke test, archive disabled.
+- `config_multiclip_smoke_test.yaml`: two-clip preview smoke test, full sensor FoV, archive disabled.
+- `config_archive_smoke_test.yaml`: three-clip archive integration test with preview and external-drive transfer.
 
 ## Repository files
 
 - `record_basler.py`: recorder CLI for listing cameras, live preview, dry runs, and scheduled recording.
-- `config_pilot.yaml`: the long one-camera full-FoV pilot configuration for `./recordings`.
-- `config_smoke_test.yaml`: a ten-second one-camera full-FoV smoke test for `./recordings_test`.
-- `config_experiment_day1.yaml`: the full-FoV day-1 production config with preview enabled.
-- `config_multiclip_smoke_test.yaml`: a three-clip pre-experiment full-FoV smoke test with preview enabled.
+- `config_pilot.yaml`: the long one-camera pilot configuration for `./recordings`.
+- `config_experiment_day1.yaml`: the day-1 production config with preview enabled.
+- `config_smoke_test.yaml`: a ten-second one-camera smoke test for `./recordings_test`.
+- `config_multiclip_smoke_test.yaml`: a two-clip pre-experiment smoke test with preview enabled.
+- `config_archive_smoke_test.yaml`: a three-clip archive smoke test with preview enabled.
 - `validate_session.py`: session validator for clip structure, timing, summary state, and leftover temporary files.
 - `QUICKSTART.md`: a short setup-and-run checklist.
 - `requirements.txt`: Python dependencies for the recorder.
@@ -94,6 +89,7 @@ The preview-enabled example configs in this repo are:
 
 - `config_experiment_day1.yaml`
 - `config_multiclip_smoke_test.yaml`
+- `config_archive_smoke_test.yaml`
 
 ## Pre-experiment multi-clip test
 
@@ -124,6 +120,20 @@ Notes:
 - keep the MacBook plugged in with the lid open
 - near-continuous finite clips have a brief boundary gap
 
+## Archive workflow
+
+The archive-enabled configs `config_pilot.yaml`, `config_experiment_day1.yaml`, and `config_archive_smoke_test.yaml` record locally first, then rsync each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` after confirming that `/Volumes/Dr. Rose` is a real mounted drive.
+
+The recorder keeps the local session metadata, writes transfer ledgers, verifies the external copy, and deletes each local clip directory only after verification succeeds. If the external drive is missing or the archive backlog grows too large, the recorder stops before starting another clip.
+
+Before using an archive config, mount the drive and check that the local SSD still has plenty of free space. The built-in safety defaults are a 50 GB hard clip cap and a 120 GB minimum free-space gate before each new clip.
+
+Run the archive smoke test with:
+
+```bash
+caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
+```
+
 ## Record and validate
 
 Validate paths and schedule without opening cameras:
@@ -136,6 +146,12 @@ Run the ten-second smoke test:
 
 ```bash
 python record_basler.py --config config_smoke_test.yaml
+```
+
+Run the archive smoke test once the external drive is mounted:
+
+```bash
+caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
 ```
 
 Run the full-FoV day-1 config:
@@ -166,10 +182,10 @@ Stop cleanly with `Ctrl+C`.
 
 Connect the camera directly to a USB 3 port when possible. If frames are incomplete or skipped, shorten or replace the cable, or reduce frame rate/throughput.
 
-The example config records 30-minute clips for 24 hours. Equal clip duration and interval produce near-continuous recording. There is a short boundary gap while a clip closes and the next writer starts.
+The pilot config records 30-minute clips for 24 hours. Equal clip duration and interval produce near-continuous recording. There is a short boundary gap while a clip closes and the next writer starts.
 
 ## Storage check before the long run
 
 Compression depends strongly on leaf texture, sensor noise, and movement, so do not rely on a fixed estimate. After the smoke test, run a 10- or 30-minute test and extrapolate from the resulting file sizes.
 
-Keep at least 15-20% of the recording disk free. Write directly to a local SSD during acquisition; copy to network or archival storage after clips close.
+The archive workflow already stages clips locally and moves them to the external drive after verification, so the main thing to protect is the internal SSD used for active recording. Keep well above the 120 GB free-space threshold before each clip and mount the archive drive before starting a long run.

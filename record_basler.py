@@ -340,6 +340,45 @@ class RecordingPreviewSettings:
     show_status: bool = True
 
 
+@dataclasses.dataclass(frozen=True)
+class ArchiveSettings:
+    enabled: bool = False
+    destination_root: Path = dataclasses.field(
+        default_factory=lambda: Path("/Volumes/Dr. Rose/Hung_MBL")
+    )
+    required_mount_point: Path = dataclasses.field(
+        default_factory=lambda: Path("/Volumes/Dr. Rose")
+    )
+    rsync_executable: str = "/usr/bin/rsync"
+    transfer_after_each_clip: bool = True
+    background_transfer: bool = True
+    delete_local_clip_after_verified_transfer: bool = True
+    retain_local_session_metadata: bool = True
+    verification: str = "checksum"
+    max_clip_size_gb: float = 50.0
+    min_local_free_gb_before_clip: float = 120.0
+    min_external_free_gb_before_transfer: float = 60.0
+    max_unarchived_clips: int = 2
+    stop_before_next_clip_on_transfer_failure: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class ArchivePreflightResult:
+    enabled: bool
+    ok: bool
+    errors: list[str]
+    rsync_path: Optional[str]
+    required_mount_point: str
+    required_mount_is_mount: bool
+    destination_root: str
+    destination_created: bool
+    destination_writable: bool
+    local_free_gb: Optional[float]
+    destination_free_gb: Optional[float]
+    path_conflict: bool
+    archive_session_dir: str
+
+
 @dataclasses.dataclass
 class PreviewPacket:
     label: str
@@ -369,6 +408,38 @@ def parse_recording_preview_settings(config: dict[str, Any]) -> RecordingPreview
     if settings.max_width < 64 or settings.max_height < 64:
         raise ValueError("recording_preview.max_width and max_height must be at least 64")
     return settings
+
+
+def parse_archive_settings(config: dict[str, Any]) -> ArchiveSettings:
+    raw = config.get("archive") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("archive must be a mapping/object")
+
+    destination_root = Path(str(raw.get("destination_root", "/Volumes/Dr. Rose/Hung_MBL"))).expanduser()
+    required_mount_point = Path(str(raw.get("required_mount_point", "/Volumes/Dr. Rose"))).expanduser()
+    rsync_executable = str(raw.get("rsync_executable", "/usr/bin/rsync"))
+    verification = str(raw.get("verification", "checksum")).strip().lower() or "checksum"
+
+    return ArchiveSettings(
+        enabled=bool(raw.get("enabled", False)),
+        destination_root=destination_root,
+        required_mount_point=required_mount_point,
+        rsync_executable=rsync_executable,
+        transfer_after_each_clip=bool(raw.get("transfer_after_each_clip", True)),
+        background_transfer=bool(raw.get("background_transfer", True)),
+        delete_local_clip_after_verified_transfer=bool(
+            raw.get("delete_local_clip_after_verified_transfer", True)
+        ),
+        retain_local_session_metadata=bool(raw.get("retain_local_session_metadata", True)),
+        verification=verification,
+        max_clip_size_gb=float(raw.get("max_clip_size_gb", 50.0)),
+        min_local_free_gb_before_clip=float(raw.get("min_local_free_gb_before_clip", 120.0)),
+        min_external_free_gb_before_transfer=float(raw.get("min_external_free_gb_before_transfer", 60.0)),
+        max_unarchived_clips=int(raw.get("max_unarchived_clips", 2)),
+        stop_before_next_clip_on_transfer_failure=bool(
+            raw.get("stop_before_next_clip_on_transfer_failure", True)
+        ),
+    )
 
 
 def resize_frame_to_fit(frame: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
@@ -729,7 +800,7 @@ class FFmpegWriter:
         except BrokenPipeError as exc:
             raise RuntimeError(f"FFmpeg stopped while writing {self.temp_path}") from exc
 
-    def close_and_remux(self) -> tuple[int, bool]:
+    def close_and_remux(self, *, keep_temp: bool = False) -> tuple[int, bool]:
         if self.process is None:
             return -1, False
         if self.process.stdin is not None:
@@ -763,7 +834,8 @@ class FFmpegWriter:
         with remux_log.open("wb") as log_handle:
             remux = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=log_handle, check=False)
         if remux.returncode == 0:
-            self.temp_path.unlink(missing_ok=True)
+            if not keep_temp:
+                self.temp_path.unlink(missing_ok=True)
             if remux_log.stat().st_size == 0:
                 remux_log.unlink(missing_ok=True)
             if self.stderr_path.exists() and self.stderr_path.stat().st_size == 0:
@@ -786,6 +858,598 @@ class ClipResult:
     metadata_path: Path
     video_path: Optional[Path]
     error: Optional[str] = None
+
+
+def bytes_to_gib(value: int) -> float:
+    return value / float(1024**3)
+
+
+def tree_stats(path: Path) -> tuple[int, int]:
+    """Return recursive file count and byte total for a directory tree."""
+
+    if not path.exists():
+        return 0, 0
+    file_count = 0
+    total_bytes = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_file():
+            file_count += 1
+            try:
+                total_bytes += candidate.stat().st_size
+            except FileNotFoundError:
+                continue
+    return file_count, total_bytes
+
+
+def paths_overlap(a: Path, b: Path) -> bool:
+    try:
+        resolved_a = a.resolve()
+        resolved_b = b.resolve()
+    except Exception:
+        return False
+    return (
+        resolved_a == resolved_b
+        or resolved_a in resolved_b.parents
+        or resolved_b in resolved_a.parents
+    )
+
+
+def read_json_mapping(path: Path) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        return None, f"could not read JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, "JSON root is not an object"
+    return data, None
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def copy_file_if_exists(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return True
+
+
+def flush_logging_handlers() -> None:
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+
+def remove_capture_files(clip_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    for candidate in sorted(clip_dir.glob("*.capture.mkv")):
+        try:
+            candidate.unlink()
+            removed.append(candidate)
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def clip_directory_ready_for_archive(
+    clip_dir: Path,
+    expected_camera_count: int,
+    max_clip_size_bytes: int,
+) -> tuple[bool, list[str], int]:
+    issues: list[str] = []
+    json_files = sorted(clip_dir.glob("*.json"))
+    mp4_files = sorted(clip_dir.glob("*.mp4"))
+    timestamp_files = sorted(clip_dir.glob("*.timestamps.csv.gz"))
+    temp_files = sorted(clip_dir.glob("*.capture.mkv"))
+
+    if len(json_files) != expected_camera_count:
+        issues.append(
+            f"expected {expected_camera_count} JSON sidecars, found {len(json_files)}"
+        )
+    if len(mp4_files) != expected_camera_count:
+        issues.append(f"expected {expected_camera_count} MP4 files, found {len(mp4_files)}")
+    if len(timestamp_files) != expected_camera_count:
+        issues.append(
+            f"expected {expected_camera_count} timestamp sidecars, found {len(timestamp_files)}"
+        )
+    if temp_files:
+        issues.append(f"temporary capture MKV files remain: {len(temp_files)}")
+
+    total_files, total_bytes = tree_stats(clip_dir)
+    if total_bytes > max_clip_size_bytes:
+        issues.append(
+            f"clip directory size {bytes_to_gib(total_bytes):.1f} GiB exceeds the cap "
+            f"of {bytes_to_gib(max_clip_size_bytes):.1f} GiB"
+        )
+
+    for json_path in json_files:
+        metadata, error = read_json_mapping(json_path)
+        if error is not None:
+            issues.append(f"{json_path.name}: {error}")
+            continue
+
+        mp4_path = json_path.with_suffix(".mp4")
+        timestamps_path = json_path.with_suffix(".timestamps.csv.gz")
+        if not mp4_path.exists():
+            issues.append(f"{json_path.name}: missing MP4 {mp4_path.name}")
+        elif mp4_path.stat().st_size <= 0:
+            issues.append(f"{json_path.name}: MP4 file is empty")
+        if not timestamps_path.exists():
+            issues.append(f"{json_path.name}: missing timestamps {timestamps_path.name}")
+
+        if metadata.get("success") is not True:
+            issues.append(f"{json_path.name}: success is not true")
+        if metadata.get("grab_failures") not in (0, "0"):
+            issues.append(f"{json_path.name}: grab_failures is {metadata.get('grab_failures')!r}")
+        if metadata.get("mp4_remux_succeeded") is not True:
+            issues.append(
+                f"{json_path.name}: mp4_remux_succeeded is {metadata.get('mp4_remux_succeeded')!r}"
+            )
+
+    return not issues, issues, total_bytes
+
+
+def resolve_executable(configured: str) -> Optional[str]:
+    candidate = Path(configured).expanduser()
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which(configured)
+
+
+def preflight_archive_settings(
+    settings: ArchiveSettings,
+    *,
+    local_output_root: Path,
+    session_dir: Path,
+    project: str,
+    subject: str,
+    session_name: str,
+) -> ArchivePreflightResult:
+    errors: list[str] = []
+    destination_root = settings.destination_root.expanduser()
+    required_mount_point = settings.required_mount_point.expanduser()
+    archive_session_dir = destination_root / project / subject / session_name
+
+    rsync_path = resolve_executable(settings.rsync_executable)
+    if rsync_path is None:
+        errors.append(f"rsync executable was not found: {settings.rsync_executable}")
+
+    required_mount_is_mount = required_mount_point.exists() and os.path.ismount(required_mount_point)
+    if not required_mount_point.exists():
+        errors.append(f"required mount point does not exist: {required_mount_point}")
+    elif not required_mount_is_mount:
+        errors.append(f"required mount point is not a mounted filesystem: {required_mount_point}")
+
+    destination_created = False
+    destination_writable = False
+    destination_free_gb: Optional[float] = None
+    local_free_gb: Optional[float] = None
+    path_conflict = paths_overlap(destination_root, local_output_root)
+
+    if path_conflict:
+        errors.append(
+            f"archive destination {destination_root} conflicts with local output root {local_output_root}"
+        )
+
+    if required_mount_is_mount and not path_conflict:
+        try:
+            destination_root.mkdir(parents=True, exist_ok=True)
+            destination_created = True
+        except Exception as exc:
+            errors.append(f"could not create archive destination root {destination_root}: {exc}")
+
+    if destination_root.exists():
+        try:
+            destination_free_gb = bytes_to_gib(shutil.disk_usage(destination_root).free)
+            if destination_free_gb < settings.min_external_free_gb_before_transfer:
+                errors.append(
+                    "archive destination free space "
+                    f"{destination_free_gb:.1f} GiB is below the minimum "
+                    f"{settings.min_external_free_gb_before_transfer:.1f} GiB"
+                )
+        except Exception as exc:
+            errors.append(f"could not read archive destination disk usage: {exc}")
+
+        probe_path = destination_root / f".archive_write_test_{os.getpid()}_{int(time.time())}"
+        try:
+            with probe_path.open("w", encoding="utf-8") as handle:
+                handle.write("ok\n")
+            probe_path.unlink()
+            destination_writable = True
+        except Exception as exc:
+            errors.append(f"archive destination is not writable: {exc}")
+
+    try:
+        local_free_gb = bytes_to_gib(shutil.disk_usage(session_dir).free)
+        if local_free_gb < settings.min_local_free_gb_before_clip:
+            errors.append(
+                f"local free space {local_free_gb:.1f} GiB is below the minimum "
+                f"{settings.min_local_free_gb_before_clip:.1f} GiB"
+            )
+    except Exception as exc:
+        errors.append(f"could not read local disk usage: {exc}")
+
+    if destination_root.exists() and local_output_root.exists():
+        try:
+            if paths_overlap(destination_root, local_output_root):
+                if destination_root.resolve() == local_output_root.resolve():
+                    errors.append("archive destination root and local output root are the same path")
+        except Exception:
+            pass
+
+    return ArchivePreflightResult(
+        enabled=settings.enabled,
+        ok=not errors,
+        errors=errors,
+        rsync_path=rsync_path,
+        required_mount_point=str(required_mount_point),
+        required_mount_is_mount=required_mount_is_mount,
+        destination_root=str(destination_root),
+        destination_created=destination_created,
+        destination_writable=destination_writable,
+        local_free_gb=local_free_gb,
+        destination_free_gb=destination_free_gb,
+        path_conflict=path_conflict,
+        archive_session_dir=str(archive_session_dir),
+    )
+
+
+@dataclasses.dataclass
+class ArchiveResult:
+    clip_name: str
+    source_path: str
+    destination_path: str
+    success: bool
+    bytes_transferred: Optional[int]
+    started_utc: str
+    completed_utc: Optional[str]
+    rsync_return_code: Optional[int]
+    verification_succeeded: bool
+    local_deleted: bool
+    error: Optional[str]
+
+
+@dataclasses.dataclass
+class _ArchiveRequest:
+    clip_dir: Path
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    result: Optional[ArchiveResult] = None
+
+
+class ArchiveManager:
+    def __init__(
+        self,
+        settings: ArchiveSettings,
+        local_session_dir: Path,
+        project: str,
+        subject: str,
+        session_name: str,
+        stop_event: threading.Event,
+        preflight: ArchivePreflightResult,
+    ) -> None:
+        self.settings = settings
+        self.local_session_dir = local_session_dir
+        self.project = project
+        self.subject = subject
+        self.session_name = session_name
+        self.stop_event = stop_event
+        self.preflight = preflight
+        self.archive_session_dir = Path(settings.destination_root) / project / subject / session_name
+        self.incoming_dir = self.archive_session_dir / ".incoming"
+        self.rsync_path = preflight.rsync_path or resolve_executable(settings.rsync_executable)
+        self.local_transfers_path = local_session_dir / "archive_transfers.jsonl"
+        self.local_summary_path = local_session_dir / "archive_summary.json"
+        self.archive_transfers_path = self.archive_session_dir / "archive_transfers.jsonl"
+        self.archive_summary_path = self.archive_session_dir / "archive_summary.json"
+        self._queue: queue.Queue[Optional[_ArchiveRequest]] = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_main, name="archive-worker", daemon=False)
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+        self._failure = False
+        self._pending_local_clips = 0
+        self._enqueued = 0
+        self._processed = 0
+        self._successful = 0
+        self._failed = 0
+        self._already_complete = 0
+        self._bytes_transferred = 0
+        self._results: list[ArchiveResult] = []
+
+    def start(self) -> None:
+        if not self.settings.enabled or self._started:
+            return
+        if not self.preflight.ok:
+            raise RuntimeError("Archive preflight failed; cannot start archive manager")
+
+        self.archive_session_dir.mkdir(parents=True, exist_ok=True)
+        self.incoming_dir.mkdir(parents=True, exist_ok=True)
+
+        for filename in ("config_used.yaml", "session_manifest.json"):
+            source = self.local_session_dir / filename
+            destination = self.archive_session_dir / filename
+            if not source.exists():
+                raise FileNotFoundError(f"Missing required session file for archive: {source}")
+            shutil.copy2(source, destination)
+
+        self._worker.start()
+        self._started = True
+        LOG.info("Archive session directory: %s", self.archive_session_dir)
+
+    def enqueue_clip(self, clip_dir: Path) -> None:
+        if not self.settings.enabled:
+            return
+        if not self._started:
+            raise RuntimeError("ArchiveManager.start() must be called before enqueue_clip()")
+        if self._closed:
+            raise RuntimeError("ArchiveManager is closed")
+        request = _ArchiveRequest(clip_dir=clip_dir)
+        with self._lock:
+            self._pending_local_clips += 1
+            self._enqueued += 1
+        self._queue.put(request)
+        if not self.settings.background_transfer:
+            request.done.wait()
+            if request.result is not None and not request.result.success:
+                self._mark_failure(request.result.error or "archive transfer failed")
+
+    def failure_detected(self) -> bool:
+        return self._failure
+
+    def mark_failure(self, error: str) -> None:
+        self._mark_failure(error)
+
+    def unarchived_count(self) -> int:
+        with self._lock:
+            return self._pending_local_clips
+
+    def wait_until_idle(self) -> None:
+        if self.settings.enabled and self._started:
+            self._queue.join()
+
+    def close(self) -> None:
+        if not self.settings.enabled or self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+        self._queue.join()
+        if self._worker.is_alive():
+            self._worker.join(timeout=30)
+
+        summary = self._build_summary()
+        atomic_write_json(self.local_summary_path, summary)
+        flush_logging_handlers()
+        self._copy_final_metadata()
+
+    def _copy_final_metadata(self) -> None:
+        for filename in (
+            "config_used.yaml",
+            "session_manifest.json",
+            "session_summary.json",
+            "recorder.log",
+            "archive_transfers.jsonl",
+            "archive_summary.json",
+        ):
+            copy_file_if_exists(self.local_session_dir / filename, self.archive_session_dir / filename)
+
+    def _build_summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.settings.enabled,
+            "preflight": dataclasses.asdict(self.preflight),
+            "archive_session_dir": str(self.archive_session_dir),
+            "queued_clips": self._enqueued,
+            "processed_clips": self._processed,
+            "successful_clips": self._successful,
+            "failed_clips": self._failed,
+            "already_complete_clips": self._already_complete,
+            "bytes_transferred": self._bytes_transferred,
+            "failure_detected": self._failure,
+            "results": [dataclasses.asdict(result) for result in self._results],
+            "completed_utc": utc_now().isoformat(),
+        }
+
+    def _append_transfer_record(self, result: ArchiveResult) -> None:
+        self.local_transfers_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.local_transfers_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dataclasses.asdict(result), default=str))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _mark_failure(self, error: str) -> None:
+        if not self._failure:
+            LOG.error("Archive failure detected: %s", error)
+        self._failure = True
+        if self.settings.stop_before_next_clip_on_transfer_failure:
+            self.stop_event.set()
+
+    def _verify_tree(self, source: Path, destination: Path) -> tuple[bool, str]:
+        source_files, source_bytes = tree_stats(source)
+        dest_files, dest_bytes = tree_stats(destination)
+        if source_files != dest_files:
+            return False, f"file count mismatch: source={source_files} destination={dest_files}"
+        if source_bytes != dest_bytes:
+            return False, f"byte count mismatch: source={source_bytes} destination={dest_bytes}"
+
+        verify_command = [
+            self.rsync_path or "rsync",
+            "-a",
+            "--checksum",
+            "--dry-run",
+            "--itemize-changes",
+            f"{source}/",
+            f"{destination}/",
+        ]
+        verify = subprocess.run(
+            verify_command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if verify.returncode != 0:
+            return False, f"verification rsync exited with code {verify.returncode}"
+        if verify.stdout.strip():
+            return False, "verification rsync reported differences"
+        return True, ""
+
+    def _transfer_clip(self, clip_dir: Path) -> ArchiveResult:
+        started_utc = utc_now().isoformat()
+        clip_name = clip_dir.name
+        final_destination = self.archive_session_dir / clip_name
+        partial_destination = self.incoming_dir / f"{clip_name}.partial"
+        bytes_transferred: Optional[int] = None
+        completed_utc: Optional[str] = None
+        rsync_return_code: Optional[int] = None
+        verification_succeeded = False
+        local_deleted = False
+        error: Optional[str] = None
+        success = False
+
+        try:
+            if not clip_dir.exists():
+                raise FileNotFoundError(f"Source clip directory does not exist: {clip_dir}")
+
+            dest_free_gb = bytes_to_gib(shutil.disk_usage(self.archive_session_dir).free)
+            if dest_free_gb < self.settings.min_external_free_gb_before_transfer:
+                raise RuntimeError(
+                    "archive destination free space "
+                    f"{dest_free_gb:.1f} GiB is below the minimum "
+                    f"{self.settings.min_external_free_gb_before_transfer:.1f} GiB"
+                )
+
+            source_files, source_bytes = tree_stats(clip_dir)
+            bytes_transferred = source_bytes
+
+            if final_destination.exists():
+                verified, reason = self._verify_tree(clip_dir, final_destination)
+                if not verified:
+                    raise RuntimeError(
+                        f"destination already exists but does not match source: {reason}"
+                    )
+                verification_succeeded = True
+                if partial_destination.exists():
+                    LOG.warning("Removing stale partial archive directory %s", partial_destination)
+                    shutil.rmtree(partial_destination, ignore_errors=True)
+                success = True
+                self._already_complete += 1
+                self._successful += 1
+                self._bytes_transferred += bytes_transferred or 0
+            else:
+                partial_destination.parent.mkdir(parents=True, exist_ok=True)
+                if partial_destination.exists():
+                    LOG.warning("Resuming or replacing stale partial archive directory %s", partial_destination)
+                copy_command = [
+                    self.rsync_path or "rsync",
+                    "-a",
+                    "--partial",
+                    f"{clip_dir}/",
+                    f"{partial_destination}/",
+                ]
+                copy = subprocess.run(copy_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+                rsync_return_code = copy.returncode
+                if copy.returncode != 0:
+                    raise RuntimeError(
+                        f"rsync returned {copy.returncode}: {copy.stderr.strip() or 'no stderr output'}"
+                    )
+
+                verified, reason = self._verify_tree(clip_dir, partial_destination)
+                if not verified:
+                    raise RuntimeError(f"verification failed: {reason}")
+                verification_succeeded = True
+
+                if final_destination.exists():
+                    raise RuntimeError(
+                        f"final archive destination appeared during transfer: {final_destination}"
+                    )
+                partial_destination.rename(final_destination)
+                success = True
+                self._successful += 1
+                self._bytes_transferred += bytes_transferred or 0
+
+            if success and self.settings.delete_local_clip_after_verified_transfer:
+                shutil.rmtree(clip_dir)
+                local_deleted = True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._failed += 1
+            self._mark_failure(error)
+            LOG.exception("Archive failed for %s", clip_dir)
+        else:
+            completed_utc = utc_now().isoformat()
+        finally:
+            if success and verification_succeeded and not local_deleted and self.settings.delete_local_clip_after_verified_transfer:
+                try:
+                    shutil.rmtree(clip_dir)
+                    local_deleted = True
+                except Exception as exc:
+                    error = f"Could not delete local clip directory after archive verification: {exc}"
+                    success = False
+                    self._failed += 1
+                    self._mark_failure(error)
+                    LOG.exception("Archive cleanup failed for %s", clip_dir)
+            if success and final_destination.exists() and partial_destination.exists():
+                shutil.rmtree(partial_destination, ignore_errors=True)
+            self._processed += 1
+            if success:
+                self._pending_local_clips = max(0, self._pending_local_clips - 1)
+            result = ArchiveResult(
+                clip_name=clip_name,
+                source_path=str(clip_dir),
+                destination_path=str(final_destination),
+                success=success,
+                bytes_transferred=bytes_transferred,
+                started_utc=started_utc,
+                completed_utc=completed_utc,
+                rsync_return_code=rsync_return_code,
+                verification_succeeded=verification_succeeded,
+                local_deleted=local_deleted,
+                error=error,
+            )
+            self._results.append(result)
+            self._append_transfer_record(result)
+        return result
+
+    def _worker_main(self) -> None:
+        while True:
+            request = self._queue.get()
+            try:
+                if request is None:
+                    return
+                request.result = self._transfer_clip(request.clip_dir)
+            except Exception as exc:
+                result = ArchiveResult(
+                    clip_name=request.clip_dir.name if request is not None else "unknown",
+                    source_path=str(request.clip_dir) if request is not None else "",
+                    destination_path=str(self.archive_session_dir / request.clip_dir.name) if request is not None else "",
+                    success=False,
+                    bytes_transferred=None,
+                    started_utc=utc_now().isoformat(),
+                    completed_utc=None,
+                    rsync_return_code=None,
+                    verification_succeeded=False,
+                    local_deleted=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                if request is not None:
+                    request.result = result
+                self._failed += 1
+                self._mark_failure(result.error or "archive worker failed")
+                self._results.append(result)
+                self._append_transfer_record(result)
+            finally:
+                if request is not None:
+                    request.done.set()
+                self._queue.task_done()
 
 
 def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSettings) -> np.ndarray:
@@ -1004,6 +1668,8 @@ def record_one_camera(
     encoding_cfg: dict[str, Any],
     ready_barrier: threading.Barrier,
     stop_event: threading.Event,
+    storage_root: Path,
+    clip_stop_threshold_bytes: Optional[int],
     result_queue: queue.Queue[ClipResult],
     preview_queue: Optional[queue.Queue[PreviewPacket]],
     preview_settings: RecordingPreviewSettings,
@@ -1045,6 +1711,7 @@ def record_one_camera(
     preview_interval_ns = max(1, round(1e9 / preview_settings.fps))
     next_preview_mono_ns = planned_start_mono_ns
     preview_publish_failed = False
+    last_storage_check_ns = planned_start_mono_ns
 
     metadata: dict[str, Any] = {
         "camera": binding.info,
@@ -1195,6 +1862,35 @@ def record_one_camera(
                             label,
                             exc,
                         )
+
+                if clip_stop_threshold_bytes and host_mono_ns - last_storage_check_ns >= 5_000_000_000:
+                    last_storage_check_ns = host_mono_ns
+                    try:
+                        current_size = temp_path.stat().st_size if temp_path.exists() else 0
+                    except Exception:
+                        current_size = 0
+                    try:
+                        local_free_bytes = shutil.disk_usage(storage_root).free
+                    except Exception:
+                        local_free_bytes = None
+
+                    if current_size >= clip_stop_threshold_bytes:
+                        error_message = (
+                            f"Clip size guard triggered for {label}: "
+                            f"temporary MKV reached {bytes_to_gib(current_size):.1f} GiB, "
+                            f"threshold is {bytes_to_gib(clip_stop_threshold_bytes):.1f} GiB"
+                        )
+                        LOG.error(error_message)
+                        stop_event.set()
+                        break
+                    if local_free_bytes is not None and local_free_bytes < 20 * 1024**3:
+                        error_message = (
+                            f"Local free space on {storage_root} dropped below 20 GiB "
+                            f"while recording {label}"
+                        )
+                        LOG.error(error_message)
+                        stop_event.set()
+                        break
             finally:
                 grab.Release()
 
@@ -1205,7 +1901,7 @@ def record_one_camera(
             timestamp_handle.close()
             timestamp_handle = None
 
-        ffmpeg_return_code, remuxed = writer.close_and_remux()
+        ffmpeg_return_code, remuxed = writer.close_and_remux(keep_temp=True)
         writer = None
         if ffmpeg_return_code != 0:
             raise RuntimeError(f"FFmpeg exited with code {ffmpeg_return_code}")
@@ -1214,6 +1910,8 @@ def record_one_camera(
                 "H.264 capture succeeded, but MP4 remux failed. "
                 f"The recoverable MKV was kept at {temp_path}."
             )
+        if error_message is None and stop_event.is_set():
+            error_message = "Recording stopped before the planned clip end"
 
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
@@ -1458,6 +2156,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     schedule = dict(config.get("schedule") or {})
     clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
     preview_settings = parse_recording_preview_settings(config)
+    archive_settings = parse_archive_settings(config)
     requested_clips = number_of_clips
 
     project = sanitize_token(str(config.get("project", "caterpillar")))
@@ -1485,6 +2184,34 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         preview_settings.max_height,
     )
 
+    archive_preflight: Optional[ArchivePreflightResult] = None
+    if archive_settings.enabled:
+        archive_preflight = preflight_archive_settings(
+            archive_settings,
+            local_output_root=output_root,
+            session_dir=session_dir,
+            project=project,
+            subject=subject,
+            session_name=session_name,
+        )
+        LOG.info(
+            "Archive: destination_root=%s mount_point=%s rsync=%s enabled=%s background_transfer=%s",
+            archive_preflight.destination_root,
+            archive_preflight.required_mount_point,
+            archive_preflight.rsync_path,
+            archive_settings.enabled,
+            archive_settings.background_transfer,
+        )
+        LOG.info(
+            "Archive preflight: ok=%s destination_free_gb=%s local_free_gb=%s archive_session_dir=%s",
+            archive_preflight.ok,
+            f"{archive_preflight.destination_free_gb:.1f}" if archive_preflight.destination_free_gb is not None else "n/a",
+            f"{archive_preflight.local_free_gb:.1f}" if archive_preflight.local_free_gb is not None else "n/a",
+            archive_preflight.archive_session_dir,
+        )
+        for error in archive_preflight.errors:
+            LOG.error("Archive preflight issue: %s", error)
+
     if dry_run:
         shutil.copy2(config_path, session_dir / "config_used.yaml")
         with (session_dir / "dry_run.json").open("w", encoding="utf-8") as handle:
@@ -1497,12 +2224,20 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     "total_duration_s": total_duration_s,
                     "number_of_clips": number_of_clips,
                     "recording_preview": dataclasses.asdict(preview_settings),
+                    "archive": dataclasses.asdict(archive_settings),
+                    "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
                 },
                 handle,
                 indent=2,
             )
         LOG.info("Dry run completed; no cameras were opened.")
+        if archive_preflight is not None and not archive_preflight.ok:
+            return 1
         return 0
+
+    if archive_settings.enabled and (archive_preflight is None or not archive_preflight.ok):
+        LOG.error("Archive preflight failed; refusing to open cameras")
+        return 1
 
     ffmpeg = find_ffmpeg(config.get("ffmpeg"))
     camera_cfgs = config.get("cameras")
@@ -1524,6 +2259,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     any_failure = False
     unexpected_exception: Optional[str] = None
     exit_status = "running"
+    archive_manager: Optional[ArchiveManager] = None
     if preview_settings.enabled:
         preview_active_event.set()
 
@@ -1547,7 +2283,99 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             bindings.append(configure_camera(camera_cfg, device))
 
         write_session_manifest(session_dir, config_path, config, bindings, ffmpeg)
+        if archive_settings.enabled:
+            archive_manager = ArchiveManager(
+                settings=archive_settings,
+                local_session_dir=session_dir,
+                project=project,
+                subject=subject,
+                session_name=session_name,
+                stop_event=stop_event,
+                preflight=archive_preflight or ArchivePreflightResult(
+                    enabled=False,
+                    ok=False,
+                    errors=["archive preflight missing"],
+                    rsync_path=None,
+                    required_mount_point=str(archive_settings.required_mount_point),
+                    required_mount_is_mount=False,
+                    destination_root=str(archive_settings.destination_root),
+                    destination_created=False,
+                    destination_writable=False,
+                    local_free_gb=None,
+                    destination_free_gb=None,
+                    path_conflict=False,
+                    archive_session_dir=str(
+                        archive_settings.destination_root / project / subject / session_name
+                    ),
+                ),
+            )
+            archive_manager.start()
         encoding_cfg = dict(config.get("encoding") or {})
+        clip_stop_threshold_bytes = (
+            int(archive_settings.max_clip_size_gb * 0.95 * 1024**3)
+            if archive_settings.enabled
+            else None
+        )
+        archive_max_clip_size_bytes = (
+            int(archive_settings.max_clip_size_gb * 1024**3)
+            if archive_settings.enabled
+            else None
+        )
+
+        def ensure_ready_for_next_clip(next_clip_index: int) -> Optional[str]:
+            try:
+                local_free_gb = bytes_to_gib(shutil.disk_usage(session_dir).free)
+            except Exception as exc:
+                return f"could not read local disk usage: {exc}"
+            if local_free_gb < archive_settings.min_local_free_gb_before_clip:
+                return (
+                    f"local free space {local_free_gb:.1f} GiB is below the minimum "
+                    f"{archive_settings.min_local_free_gb_before_clip:.1f} GiB"
+                )
+
+            if not archive_settings.enabled or archive_manager is None:
+                return None
+            if archive_manager.failure_detected():
+                return "archive manager already reported a failure"
+
+            deadline = time.monotonic() + 300.0
+            last_progress_log = 0.0
+            while True:
+                if stop_event.is_set():
+                    return "recording stop requested before the next clip"
+                try:
+                    local_free_gb = bytes_to_gib(shutil.disk_usage(session_dir).free)
+                except Exception as exc:
+                    return f"could not read local disk usage: {exc}"
+                if local_free_gb < archive_settings.min_local_free_gb_before_clip:
+                    return (
+                        f"local free space {local_free_gb:.1f} GiB is below the minimum "
+                        f"{archive_settings.min_local_free_gb_before_clip:.1f} GiB"
+                    )
+
+                pending = archive_manager.unarchived_count()
+                if archive_manager.failure_detected():
+                    return "archive manager reported a failure"
+                if pending <= archive_settings.max_unarchived_clips:
+                    return None
+
+                now = time.monotonic()
+                if now - last_progress_log >= 10.0:
+                    LOG.info(
+                        "Waiting for archive worker to catch up before clip %d: pending=%d max=%d",
+                        next_clip_index,
+                        pending,
+                        archive_settings.max_unarchived_clips,
+                    )
+                    last_progress_log = now
+                if archive_manager.failure_detected():
+                    return "archive manager reported a failure while waiting for backlog to clear"
+                if now >= deadline:
+                    return (
+                        "archive backlog did not clear within 5 minutes "
+                        f"(pending={pending}, max={archive_settings.max_unarchived_clips})"
+                    )
+                time.sleep(min(1.0, max(0.1, deadline - now)))
 
         session_start_mono_ns = time.monotonic_ns()
 
@@ -1565,6 +2393,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     break
                 time.sleep(min(remaining_s, 1.0))
             if stop_event.is_set():
+                break
+
+            readiness_error = ensure_ready_for_next_clip(clip_index)
+            if readiness_error is not None:
+                any_failure = True
+                LOG.error("Cannot start clip %d: %s", clip_index, readiness_error)
+                stop_event.set()
                 break
 
             # Give all writer threads one second to create files and start grabbing.
@@ -1602,6 +2437,8 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         "encoding_cfg": encoding_cfg,
                         "ready_barrier": barrier,
                         "stop_event": stop_event,
+                        "storage_root": session_dir,
+                        "clip_stop_threshold_bytes": clip_stop_threshold_bytes,
                         "result_queue": results,
                         "preview_queue": preview_queues.get(binding.label),
                         "preview_settings": preview_settings,
@@ -1647,6 +2484,66 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     len(bindings),
                     len(clip_results),
                 )
+
+            archive_failure = archive_manager.failure_detected() if archive_manager else False
+            clip_total_bytes_before_cleanup = tree_stats(clip_dir)[1]
+
+            if (
+                not any_failure
+                and archive_settings.enabled
+                and archive_max_clip_size_bytes is not None
+                and clip_total_bytes_before_cleanup > archive_max_clip_size_bytes
+            ):
+                any_failure = True
+                LOG.error(
+                    "Clip %d exceeded the configured size cap before cleanup: %.1f GiB > %.1f GiB",
+                    clip_index,
+                    bytes_to_gib(clip_total_bytes_before_cleanup),
+                    bytes_to_gib(archive_max_clip_size_bytes),
+                )
+
+            if not any_failure and not archive_failure:
+                removed_capture_files = remove_capture_files(clip_dir)
+                if removed_capture_files:
+                    LOG.info(
+                        "Removed %d temporary capture file(s) from %s",
+                        len(removed_capture_files),
+                        clip_dir,
+                    )
+                if archive_settings.enabled:
+                    ready, archive_issues, clip_total_bytes_after_cleanup = clip_directory_ready_for_archive(
+                        clip_dir,
+                        len(bindings),
+                        archive_max_clip_size_bytes or int(1e18),
+                    )
+                    if not ready:
+                        any_failure = True
+                        LOG.error(
+                            "Clip %d is not ready for archive: %s",
+                            clip_index,
+                            "; ".join(archive_issues),
+                        )
+                    else:
+                        LOG.info(
+                            "Clip %d ready for archive at %.1f GiB",
+                            clip_index,
+                            bytes_to_gib(clip_total_bytes_after_cleanup),
+                        )
+                        try:
+                            assert archive_manager is not None
+                            archive_manager.enqueue_clip(clip_dir)
+                        except Exception as exc:
+                            any_failure = True
+                            LOG.exception("Failed to enqueue clip %d for archive", clip_index)
+                            if archive_manager is not None:
+                                archive_manager.mark_failure(f"enqueue failed: {exc}")
+                else:
+                    # The local-only workflow still keeps the clip directory tidy.
+                    pass
+            elif archive_failure:
+                any_failure = True
+                LOG.error("Archive manager already reported a failure; not cleaning up clip %d", clip_index)
+
             if any_failure:
                 stop_event.set()
                 break
@@ -1666,6 +2563,14 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         LOG.exception("Unhandled exception during recording")
         stop_event.set()
     finally:
+        if archive_manager is not None:
+            try:
+                archive_manager.wait_until_idle()
+            except Exception as exc:
+                any_failure = True
+                LOG.warning("Could not wait for archive manager to become idle: %s", exc)
+            if archive_manager.failure_detected():
+                any_failure = True
         if exit_status == "running":
             if any_failure:
                 exit_status = "failed"
@@ -1685,6 +2590,11 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             )
         except Exception as exc:
             LOG.warning("Could not write session summary: %s", exc)
+        if archive_manager is not None:
+            try:
+                archive_manager.close()
+            except Exception as exc:
+                LOG.warning("Could not finalize archive manager: %s", exc)
         close_bindings(bindings)
 
     if exit_status == "interrupted":

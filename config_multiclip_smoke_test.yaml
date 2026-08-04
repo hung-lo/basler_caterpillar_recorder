@@ -1,4 +1,4 @@
-# Three-clip end-to-end smoke test for the connected a2A1920-160ucBAS camera.
+# Two-clip end-to-end smoke test for the connected a2A1920-160ucBAS camera.
 # Exercises repeated acquisition, remuxing, scheduling, preview, and metadata.
 
 project: monarch_behavior_multiclip_test
@@ -11,10 +11,13 @@ experiment:
 
 ffmpeg: null
 
+archive:
+  enabled: false
+
 schedule:
   clip_duration_s: 30
   interval_s: 30
-  number_of_clips: 3
+  number_of_clips: 2
 
 encoding:
   codec: libx264
@@ -41,7 +44,7 @@ cameras:
     offset_y: 0
     binning: 1
     pixel_format: auto
-    output_width: 960
+    # output_width: 960
     exposure_us: 5000
     gain: 0
     auto_exposure: false

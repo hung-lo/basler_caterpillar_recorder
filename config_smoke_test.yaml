@@ -1,5 +1,5 @@
-# Ten-second one-camera end-to-end test using the same image settings as the pilot.
-# Run previews first, then use this before starting the long recording.
+# Ten-second one-camera end-to-end test using the same camera and encoding settings
+# as the day-1 config. Run previews first, then use this before starting the long recording.
 
 project: monarch_behavior_smoke_test
 subject: camera_setup
@@ -9,6 +9,9 @@ experiment:
   animal_ids: [M01, M02, M03, M04, M05, M06, M07]
   notes: "Ten-second one-camera acquisition and encoder test."
 ffmpeg: null
+
+archive:
+  enabled: false
 
 schedule:
   clip_duration_s: 10

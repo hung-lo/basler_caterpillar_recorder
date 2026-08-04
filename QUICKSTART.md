@@ -52,6 +52,12 @@ Run the ten-second smoke test:
 python record_basler.py --config config_smoke_test.yaml
 ```
 
+If you want to verify the external-drive archive path, mount `/Volumes/Dr. Rose` first and run:
+
+```bash
+caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
+```
+
 If you want a live monitor window during recording, use the full-FoV day-1 config:
 
 ```bash
@@ -70,6 +76,8 @@ Open the MP4 file and inspect the JSON sidecar. In the JSON confirm:
 - `grab_failures: 0`
 - `measured_receive_fps` close to 5
 - `mp4_remux_succeeded: true`
+
+The archive-enabled configs record locally first, then verify and copy each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` before deleting the local clip directory.
 
 ## Start the pilot
 
