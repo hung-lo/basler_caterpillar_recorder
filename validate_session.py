@@ -243,6 +243,22 @@ def find_leftover_capture_mkvs(session_dir: Path) -> list[Path]:
     return sorted(session_dir.rglob("*.capture.mkv"))
 
 
+def format_path_for_report(path: Path, session_dir: Path) -> str:
+    try:
+        return str(path.relative_to(session_dir))
+    except ValueError:
+        return str(path)
+
+
+def find_clip_directories(root: Path) -> list[Path]:
+    if not root.exists() or not root.is_dir():
+        return []
+    return sorted(
+        [item for item in root.iterdir() if item.is_dir() and item.name.startswith("clip_")],
+        key=lambda path: path.name,
+    )
+
+
 def resolve_clip_camera_artifacts(clip_dir: Path, label: str) -> tuple[Optional[Path], Optional[str], list[str]]:
     stem = sanitize_token(label)
     exact_json = clip_dir / f"{stem}.json"
@@ -432,23 +448,50 @@ def validate_session(session_dir: Path) -> int:
     archive_summary, archive_summary_issues = (
         parse_archive_summary(session_dir) if archive_enabled else (None, [])
     )
+    archive_session_dir: Optional[Path] = None
+    local_clip_dirs = find_clip_directories(session_dir)
+    archived_clip_dirs: list[Path] = []
+    incoming_partial_dirs: list[Path] = []
+    duplicate_clip_names: list[str] = []
 
-    clip_dirs = sorted(
-        [item for item in session_dir.iterdir() if item.is_dir() and item.name.startswith("clip_")],
-        key=lambda path: path.name,
-    )
+    if archive_enabled and archive_summary is not None:
+        archive_session_dir_value = archive_summary.get("archive_session_dir")
+        if isinstance(archive_session_dir_value, str) and archive_session_dir_value.strip():
+            archive_session_dir = Path(archive_session_dir_value).expanduser()
+            if archive_session_dir.exists() and archive_session_dir.is_dir():
+                archived_clip_dirs = find_clip_directories(archive_session_dir)
+                incoming_dir = archive_session_dir / ".incoming"
+                if incoming_dir.exists() and incoming_dir.is_dir():
+                    incoming_partial_dirs = sorted(incoming_dir.glob("*.partial"))
+
+    clip_dirs_by_name: dict[str, Path] = {}
+    for clip_dir in archived_clip_dirs + local_clip_dirs:
+        if clip_dir.name in clip_dirs_by_name:
+            duplicate_clip_names.append(clip_dir.name)
+            continue
+        clip_dirs_by_name[clip_dir.name] = clip_dir
+    clip_dirs = sorted(clip_dirs_by_name.values(), key=lambda path: path.name)
     leftover_mkvs = find_leftover_capture_mkvs(session_dir)
 
     print(f"Session: {session_dir}")
     print(f"Config: {config.get('project')!r} / {config.get('subject')!r}")
-    print(f"Clip dirs: {len(clip_dirs)}")
+    print(f"Local clip dirs: {len(local_clip_dirs)}")
+    if archive_session_dir is not None:
+        print(f"Archive session dir: {archive_session_dir}")
+        print(f"Archived clip dirs: {len(archived_clip_dirs)}")
+        print(f"Archive partial dirs: {len(incoming_partial_dirs)}")
+    print(f"Visible clip dirs: {len(clip_dirs)}")
     print(f"Temp MKVs: {len(leftover_mkvs)}")
+
+    if duplicate_clip_names:
+        problems.append(f"duplicate clip directories found across local/archive views: {sorted(duplicate_clip_names)}")
 
     if number_of_clips is not None and len(clip_dirs) != number_of_clips:
         problems.append(
             f"expected {number_of_clips} clip directories from config_used.yaml, found {len(clip_dirs)}"
         )
 
+    session_succeeded = False
     if summary is not None:
         completed_clips = coerce_int(summary.get("completed_clips"))
         requested_clips = coerce_int(summary.get("requested_clips"))
@@ -496,6 +539,15 @@ def validate_session(session_dir: Path) -> int:
 
         if unexpected_exception not in (None, ""):
             problems.append(f"session_summary.json: unexpected_exception is {unexpected_exception!r}")
+        session_succeeded = (
+            completed_clips is not None
+            and completed_clips == len(clip_dirs)
+            and requested_clips == number_of_clips
+            and stopped_by_signal is False
+            and any_failure is False
+            and exit_status == "success"
+            and unexpected_exception in (None, "")
+        )
     else:
         problems.extend(summary_issues)
 
@@ -556,8 +608,52 @@ def validate_session(session_dir: Path) -> int:
                 problems.append(
                     f"archive_summary.json: results length {len(results)} does not match the {len(clip_dirs)} clip directories found"
                 )
+            else:
+                for index, result in enumerate(results):
+                    if not isinstance(result, dict):
+                        problems.append(f"archive_summary.json: result {index} is not an object")
+                        continue
+                    result_success = coerce_bool(result.get("success"))
+                    verification_succeeded = coerce_bool(result.get("verification_succeeded"))
+                    destination_path_value = result.get("destination_path")
+                    destination_path = (
+                        Path(destination_path_value).expanduser()
+                        if isinstance(destination_path_value, str) and destination_path_value.strip()
+                        else None
+                    )
+                    if session_succeeded and result_success is not True:
+                        problems.append(f"archive_summary.json: result {index} success is {result_success!r}")
+                    if session_succeeded and verification_succeeded is not True:
+                        problems.append(
+                            f"archive_summary.json: result {index} verification_succeeded is {verification_succeeded!r}"
+                        )
+                    if result_success is True and destination_path is not None and not destination_path.is_dir():
+                        problems.append(
+                            f"archive_summary.json: successful transfer missing final visible clip directory {destination_path}"
+                        )
         else:
             problems.extend(archive_summary_issues)
+
+        if archive_session_dir is None:
+            if session_succeeded:
+                problems.append("archive session directory could not be resolved from archive_summary.json")
+        elif not archive_session_dir.exists():
+            if session_succeeded:
+                problems.append(f"archive session directory is missing: {archive_session_dir}")
+            else:
+                warnings.append(f"archive session directory is unavailable: {archive_session_dir}")
+
+        if incoming_partial_dirs:
+            if session_succeeded:
+                problems.append(
+                    "incomplete archive clip remains: "
+                    + ", ".join(str(path) for path in incoming_partial_dirs)
+                )
+            else:
+                warnings.append(
+                    "preserved archive partial directories: "
+                    + ", ".join(str(path) for path in incoming_partial_dirs)
+                )
 
     if leftover_mkvs:
         problems.append(f"found {len(leftover_mkvs)} leftover temporary MKV file(s)")
@@ -589,11 +685,11 @@ def validate_session(session_dir: Path) -> int:
                 with json_path.open("r", encoding="utf-8") as handle:
                     metadata = json.load(handle)
             except Exception as exc:
-                problems.append(f"{json_path.relative_to(session_dir)}: could not read JSON: {exc}")
+                problems.append(f"{format_path_for_report(json_path, session_dir)}: could not read JSON: {exc}")
                 continue
 
             if not isinstance(metadata, dict):
-                problems.append(f"{json_path.relative_to(session_dir)}: JSON root is not an object")
+                problems.append(f"{format_path_for_report(json_path, session_dir)}: JSON root is not an object")
                 continue
 
             requested_settings = metadata.get("requested_settings")
@@ -609,7 +705,7 @@ def validate_session(session_dir: Path) -> int:
                 or ""
             ).strip()
             if not label:
-                problems.append(f"{json_path.relative_to(session_dir)}: missing camera label")
+                problems.append(f"{format_path_for_report(json_path, session_dir)}: missing camera label")
                 continue
             if label in reports_by_label:
                 problems.append(f"{clip_dir.name}: duplicate camera label {label!r}")
@@ -661,7 +757,7 @@ def validate_session(session_dir: Path) -> int:
         for report in reports:
             if report.issues:
                 for issue in report.issues:
-                    problems.append(f"{report.json_path.relative_to(session_dir)}: {issue}")
+                    problems.append(f"{format_path_for_report(report.json_path, session_dir)}: {issue}")
             first = iso_from_ns(report.first_utc_ns) if report.first_utc_ns is not None else "n/a"
             last = iso_from_ns(report.last_utc_ns) if report.last_utc_ns is not None else "n/a"
             observed = f"{report.observed_duration_s:.2f}s" if report.observed_duration_s is not None else "n/a"

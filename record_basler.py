@@ -21,6 +21,7 @@ import csv
 import dataclasses
 import datetime as dt
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -445,6 +446,8 @@ def parse_archive_settings(config: dict[str, Any]) -> ArchiveSettings:
     required_mount_point = Path(str(raw.get("required_mount_point", "/Volumes/Dr. Rose"))).expanduser()
     rsync_executable = str(raw.get("rsync_executable", "/usr/bin/rsync"))
     verification = str(raw.get("verification", "checksum")).strip().lower() or "checksum"
+    if verification not in {"checksum", "sha256"}:
+        raise ValueError("archive.verification must be one of: checksum, sha256")
 
     return ArchiveSettings(
         enabled=bool(raw.get("enabled", False)),
@@ -907,6 +910,140 @@ def tree_stats(path: Path) -> tuple[int, int]:
     return file_count, total_bytes
 
 
+def regular_file_manifest(root: Path) -> dict[str, tuple[int, str]]:
+    """Return relative path -> (size_bytes, sha256_hex) for all regular files."""
+
+    manifest: dict[str, tuple[int, str]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError(f"Archive verification does not permit symlinks: {path}")
+        if not path.is_file():
+            continue
+
+        relative = path.relative_to(root).as_posix()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        manifest[relative] = (path.stat().st_size, digest.hexdigest())
+    return manifest
+
+
+@dataclasses.dataclass(frozen=True)
+class ArchiveVerificationSummary:
+    success: bool
+    error: str
+    source_file_count: int
+    destination_file_count: int
+    source_bytes: int
+    destination_bytes: int
+
+
+def verify_file_trees(source: Path, destination: Path) -> ArchiveVerificationSummary:
+    if not source.exists():
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"source directory is missing: {source}",
+            source_file_count=0,
+            destination_file_count=0,
+            source_bytes=0,
+            destination_bytes=0,
+        )
+    if not source.is_dir():
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"source path is not a directory: {source}",
+            source_file_count=0,
+            destination_file_count=0,
+            source_bytes=0,
+            destination_bytes=0,
+        )
+    if not destination.exists():
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"destination directory is missing: {destination}",
+            source_file_count=0,
+            destination_file_count=0,
+            source_bytes=0,
+            destination_bytes=0,
+        )
+    if not destination.is_dir():
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"destination path is not a directory: {destination}",
+            source_file_count=0,
+            destination_file_count=0,
+            source_bytes=0,
+            destination_bytes=0,
+        )
+
+    source_manifest = regular_file_manifest(source)
+    destination_manifest = regular_file_manifest(destination)
+
+    source_names = set(source_manifest)
+    destination_names = set(destination_manifest)
+    source_bytes = sum(size for size, _hash in source_manifest.values())
+    destination_bytes = sum(size for size, _hash in destination_manifest.values())
+
+    missing = sorted(source_names - destination_names)
+    extra = sorted(destination_names - source_names)
+    if missing:
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"missing destination files: {missing}",
+            source_file_count=len(source_manifest),
+            destination_file_count=len(destination_manifest),
+            source_bytes=source_bytes,
+            destination_bytes=destination_bytes,
+        )
+    if extra:
+        return ArchiveVerificationSummary(
+            success=False,
+            error=f"unexpected destination files: {extra}",
+            source_file_count=len(source_manifest),
+            destination_file_count=len(destination_manifest),
+            source_bytes=source_bytes,
+            destination_bytes=destination_bytes,
+        )
+
+    for relative in sorted(source_names):
+        source_size, source_hash = source_manifest[relative]
+        destination_size, destination_hash = destination_manifest[relative]
+        if source_size != destination_size:
+            return ArchiveVerificationSummary(
+                success=False,
+                error=(
+                    f"size mismatch for {relative}: "
+                    f"source={source_size} destination={destination_size}"
+                ),
+                source_file_count=len(source_manifest),
+                destination_file_count=len(destination_manifest),
+                source_bytes=source_bytes,
+                destination_bytes=destination_bytes,
+            )
+        if source_hash != destination_hash:
+            return ArchiveVerificationSummary(
+                success=False,
+                error=f"SHA-256 mismatch for {relative}",
+                source_file_count=len(source_manifest),
+                destination_file_count=len(destination_manifest),
+                source_bytes=source_bytes,
+                destination_bytes=destination_bytes,
+            )
+
+    return ArchiveVerificationSummary(
+        success=True,
+        error="",
+        source_file_count=len(source_manifest),
+        destination_file_count=len(destination_manifest),
+        source_bytes=source_bytes,
+        destination_bytes=destination_bytes,
+    )
+
+
 def paths_overlap(a: Path, b: Path) -> bool:
     try:
         resolved_a = a.resolve()
@@ -1140,7 +1277,13 @@ class ArchiveResult:
     started_utc: str
     completed_utc: Optional[str]
     rsync_return_code: Optional[int]
+    verification_method: str
+    source_file_count: Optional[int]
+    destination_file_count: Optional[int]
+    source_bytes: Optional[int]
+    destination_bytes: Optional[int]
     verification_succeeded: bool
+    promoted_from_partial: bool
     local_deleted: bool
     error: Optional[str]
 
@@ -1160,7 +1303,7 @@ class ArchiveManager:
         project: str,
         subject: str,
         session_name: str,
-        stop_event: threading.Event,
+        archive_failure_event: threading.Event,
         preflight: ArchivePreflightResult,
     ) -> None:
         self.settings = settings
@@ -1168,7 +1311,7 @@ class ArchiveManager:
         self.project = project
         self.subject = subject
         self.session_name = session_name
-        self.stop_event = stop_event
+        self.archive_failure_event = archive_failure_event
         self.preflight = preflight
         self.archive_session_dir = Path(settings.destination_root) / project / subject / session_name
         self.incoming_dir = self.archive_session_dir / ".incoming"
@@ -1183,6 +1326,7 @@ class ArchiveManager:
         self._started = False
         self._closed = False
         self._failure = False
+        self._failure_message: Optional[str] = None
         self._pending_local_clips = 0
         self._enqueued = 0
         self._processed = 0
@@ -1280,6 +1424,7 @@ class ArchiveManager:
             "already_complete_clips": self._already_complete,
             "bytes_transferred": self._bytes_transferred,
             "failure_detected": self._failure,
+            "failure_message": self._failure_message,
             "results": [dataclasses.asdict(result) for result in self._results],
             "completed_utc": utc_now().isoformat(),
         }
@@ -1296,37 +1441,37 @@ class ArchiveManager:
         if not self._failure:
             LOG.error("Archive failure detected: %s", error)
         self._failure = True
-        if self.settings.stop_before_next_clip_on_transfer_failure:
-            self.stop_event.set()
+        self._failure_message = error
+        self.archive_failure_event.set()
 
-    def _verify_tree(self, source: Path, destination: Path) -> tuple[bool, str]:
-        source_files, source_bytes = tree_stats(source)
-        dest_files, dest_bytes = tree_stats(destination)
-        if source_files != dest_files:
-            return False, f"file count mismatch: source={source_files} destination={dest_files}"
-        if source_bytes != dest_bytes:
-            return False, f"byte count mismatch: source={source_bytes} destination={dest_bytes}"
+    def _verify_tree(self, source: Path, destination: Path) -> ArchiveVerificationSummary:
+        try:
+            summary = verify_file_trees(source, destination)
+        except Exception as exc:
+            return ArchiveVerificationSummary(
+                success=False,
+                error=f"verification raised {type(exc).__name__}: {exc}",
+                source_file_count=0,
+                destination_file_count=0,
+                source_bytes=0,
+                destination_bytes=0,
+            )
 
-        verify_command = [
-            self.rsync_path or "rsync",
-            "-a",
-            "--checksum",
-            "--dry-run",
-            "--itemize-changes",
-            f"{source}/",
-            f"{destination}/",
-        ]
-        verify = subprocess.run(
-            verify_command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if verify.returncode != 0:
-            return False, f"verification rsync exited with code {verify.returncode}"
-        if verify.stdout.strip():
-            return False, "verification rsync reported differences"
-        return True, ""
+        if summary.success:
+            LOG.info(
+                "Verified archive %s: %d files, %d bytes, SHA-256 content match",
+                source.name,
+                summary.source_file_count,
+                summary.source_bytes,
+            )
+        else:
+            LOG.error(
+                "Archive verification failed for %s -> %s: %s",
+                source,
+                destination,
+                summary.error,
+            )
+        return summary
 
     def _transfer_clip(self, clip_dir: Path) -> ArchiveResult:
         started_utc = utc_now().isoformat()
@@ -1336,7 +1481,13 @@ class ArchiveManager:
         bytes_transferred: Optional[int] = None
         completed_utc: Optional[str] = None
         rsync_return_code: Optional[int] = None
+        verification_method = "sha256_manifest"
+        source_file_count: Optional[int] = None
+        destination_file_count: Optional[int] = None
+        source_bytes: Optional[int] = None
+        destination_bytes: Optional[int] = None
         verification_succeeded = False
+        promoted_from_partial = False
         local_deleted = False
         error: Optional[str] = None
         success = False
@@ -1353,14 +1504,18 @@ class ArchiveManager:
                     f"{self.settings.min_external_free_gb_before_transfer:.1f} GiB"
                 )
 
-            source_files, source_bytes = tree_stats(clip_dir)
+            source_file_count, source_bytes = tree_stats(clip_dir)
             bytes_transferred = source_bytes
 
             if final_destination.exists():
-                verified, reason = self._verify_tree(clip_dir, final_destination)
-                if not verified:
+                verification = self._verify_tree(clip_dir, final_destination)
+                source_file_count = verification.source_file_count
+                destination_file_count = verification.destination_file_count
+                source_bytes = verification.source_bytes
+                destination_bytes = verification.destination_bytes
+                if not verification.success:
                     raise RuntimeError(
-                        f"destination already exists but does not match source: {reason}"
+                        f"destination already exists but does not match source: {verification.error}"
                     )
                 verification_succeeded = True
                 if partial_destination.exists():
@@ -1373,34 +1528,73 @@ class ArchiveManager:
             else:
                 partial_destination.parent.mkdir(parents=True, exist_ok=True)
                 if partial_destination.exists():
-                    LOG.warning("Resuming or replacing stale partial archive directory %s", partial_destination)
-                copy_command = [
-                    self.rsync_path or "rsync",
-                    "-a",
-                    "--partial",
-                    f"{clip_dir}/",
-                    f"{partial_destination}/",
-                ]
-                copy = subprocess.run(copy_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-                rsync_return_code = copy.returncode
-                if copy.returncode != 0:
-                    raise RuntimeError(
-                        f"rsync returned {copy.returncode}: {copy.stderr.strip() or 'no stderr output'}"
-                    )
+                    LOG.warning("Checking existing partial archive directory %s", partial_destination)
+                    verification = self._verify_tree(clip_dir, partial_destination)
+                    source_file_count = verification.source_file_count
+                    destination_file_count = verification.destination_file_count
+                    source_bytes = verification.source_bytes
+                    destination_bytes = verification.destination_bytes
+                    if verification.success:
+                        partial_destination.replace(final_destination)
+                        if not final_destination.is_dir():
+                            raise RuntimeError(
+                                f"Archive promotion failed; destination missing: {final_destination}"
+                            )
+                        verification_succeeded = True
+                        promoted_from_partial = True
+                        success = True
+                        self._successful += 1
+                        self._bytes_transferred += bytes_transferred or 0
+                    else:
+                        LOG.warning(
+                            "Existing partial archive does not yet match source; retrying rsync into %s",
+                            partial_destination,
+                        )
 
-                verified, reason = self._verify_tree(clip_dir, partial_destination)
-                if not verified:
-                    raise RuntimeError(f"verification failed: {reason}")
+                if not success:
+                    copy_command = [
+                        self.rsync_path or "rsync",
+                        "-a",
+                        "--partial",
+                        f"{clip_dir}/",
+                        f"{partial_destination}/",
+                    ]
+                    copy = subprocess.run(
+                        copy_command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    rsync_return_code = copy.returncode
+                    if copy.returncode != 0:
+                        raise RuntimeError(
+                            f"rsync returned {copy.returncode}: {copy.stderr.strip() or 'no stderr output'}"
+                        )
+
+                    verification = self._verify_tree(clip_dir, partial_destination)
+                    source_file_count = verification.source_file_count
+                    destination_file_count = verification.destination_file_count
+                    source_bytes = verification.source_bytes
+                    destination_bytes = verification.destination_bytes
+                    if not verification.success:
+                        raise RuntimeError(f"verification failed: {verification.error}")
+
+                    if final_destination.exists():
+                        raise RuntimeError(
+                            f"Final archive destination unexpectedly exists: {final_destination}"
+                        )
+                    partial_destination.replace(final_destination)
+                    if not final_destination.is_dir():
+                        raise RuntimeError(
+                            f"Archive promotion failed; destination missing: {final_destination}"
+                        )
+                    promoted_from_partial = True
+                    success = True
+                    self._successful += 1
+                    self._bytes_transferred += bytes_transferred or 0
+
                 verification_succeeded = True
-
-                if final_destination.exists():
-                    raise RuntimeError(
-                        f"final archive destination appeared during transfer: {final_destination}"
-                    )
-                partial_destination.rename(final_destination)
-                success = True
-                self._successful += 1
-                self._bytes_transferred += bytes_transferred or 0
 
             if success and self.settings.delete_local_clip_after_verified_transfer:
                 shutil.rmtree(clip_dir)
@@ -1437,7 +1631,13 @@ class ArchiveManager:
                 started_utc=started_utc,
                 completed_utc=completed_utc,
                 rsync_return_code=rsync_return_code,
+                verification_method=verification_method,
+                source_file_count=source_file_count,
+                destination_file_count=destination_file_count,
+                source_bytes=source_bytes,
+                destination_bytes=destination_bytes,
                 verification_succeeded=verification_succeeded,
+                promoted_from_partial=promoted_from_partial,
                 local_deleted=local_deleted,
                 error=error,
             )
@@ -1462,7 +1662,13 @@ class ArchiveManager:
                     started_utc=utc_now().isoformat(),
                     completed_utc=None,
                     rsync_return_code=None,
+                    verification_method="sha256_manifest",
+                    source_file_count=None,
+                    destination_file_count=None,
+                    source_bytes=None,
+                    destination_bytes=None,
                     verification_succeeded=False,
+                    promoted_from_partial=False,
                     local_deleted=False,
                     error=f"{type(exc).__name__}: {exc}",
                 )
@@ -2284,10 +2490,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
     used_serials: set[str] = set()
     bindings: list[CameraBinding] = []
-    stop_event = threading.Event()
+    recording_stop_event = threading.Event()
+    archive_failure_event = threading.Event()
     preview_active_event = threading.Event()
     stopped_by_signal = False
     clip_index = 0
+    completed_clips = 0
     any_failure = False
     unexpected_exception: Optional[str] = None
     exit_status = "running"
@@ -2299,7 +2507,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         nonlocal stopped_by_signal
         stopped_by_signal = True
         LOG.warning("Received signal %s; stopping after the current frame", signum)
-        stop_event.set()
+        recording_stop_event.set()
 
     signal.signal(signal.SIGINT, request_stop)
     if hasattr(signal, "SIGTERM"):
@@ -2329,7 +2537,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 project=project,
                 subject=subject,
                 session_name=session_name,
-                stop_event=stop_event,
+                archive_failure_event=archive_failure_event,
                 preflight=archive_preflight or ArchivePreflightResult(
                     enabled=False,
                     ok=False,
@@ -2380,7 +2588,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             deadline = time.monotonic() + 300.0
             last_progress_log = 0.0
             while True:
-                if stop_event.is_set():
+                if recording_stop_event.is_set():
                     return "recording stop requested before the next clip"
                 try:
                     local_free_gb = bytes_to_gib(shutil.disk_usage(session_dir).free)
@@ -2418,7 +2626,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
         session_start_mono_ns = time.monotonic_ns()
 
-        while not stop_event.is_set():
+        while not recording_stop_event.is_set():
             if number_of_clips is not None and clip_index >= number_of_clips:
                 break
             scheduled_offset_s = clip_index * interval_s
@@ -2426,19 +2634,18 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 break
 
             target_start_mono_ns = session_start_mono_ns + round(scheduled_offset_s * 1e9)
-            while not stop_event.is_set():
+            while not recording_stop_event.is_set():
                 remaining_s = (target_start_mono_ns - time.monotonic_ns()) / 1e9
                 if remaining_s <= 0:
                     break
                 time.sleep(min(remaining_s, 1.0))
-            if stop_event.is_set():
+            if recording_stop_event.is_set():
                 break
 
             readiness_error = ensure_ready_for_next_clip(clip_index)
             if readiness_error is not None:
                 any_failure = True
                 LOG.error("Cannot start clip %d: %s", clip_index, readiness_error)
-                stop_event.set()
                 break
 
             # Give all writer threads one second to create files and start grabbing.
@@ -2475,7 +2682,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         "ffmpeg": ffmpeg,
                         "encoding_cfg": encoding_cfg,
                         "ready_barrier": barrier,
-                        "stop_event": stop_event,
+                        "stop_event": recording_stop_event,
                         "storage_root": session_dir,
                         "clip_stop_threshold_bytes": clip_stop_threshold_bytes,
                         "result_queue": results,
@@ -2492,7 +2699,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 barrier.wait(timeout=30)
             except threading.BrokenBarrierError:
                 LOG.error("Camera workers did not become ready in time")
-                stop_event.set()
+                recording_stop_event.set()
 
             monitor_recording_threads(
                 threads=threads,
@@ -2523,6 +2730,11 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     len(bindings),
                     len(clip_results),
                 )
+            clip_finalized_successfully = len(clip_results) == len(bindings) and all(
+                result.success for result in clip_results
+            )
+            if clip_finalized_successfully:
+                completed_clips += 1
 
             archive_failure = archive_manager.failure_detected() if archive_manager else False
             clip_total_bytes_before_cleanup = tree_stats(clip_dir)[1]
@@ -2541,7 +2753,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     bytes_to_gib(archive_max_clip_size_bytes),
                 )
 
-            if not any_failure and not archive_failure:
+            if not any_failure:
                 removed_capture_files = remove_capture_files(clip_dir)
                 if removed_capture_files:
                     LOG.info(
@@ -2549,7 +2761,8 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         len(removed_capture_files),
                         clip_dir,
                     )
-                if archive_settings.enabled:
+
+                if archive_settings.enabled and not archive_failure:
                     ready, archive_issues, clip_total_bytes_after_cleanup = clip_directory_ready_for_archive(
                         clip_dir,
                         len(bindings),
@@ -2576,31 +2789,40 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                             LOG.exception("Failed to enqueue clip %d for archive", clip_index)
                             if archive_manager is not None:
                                 archive_manager.mark_failure(f"enqueue failed: {exc}")
-                else:
-                    # The local-only workflow still keeps the clip directory tidy.
-                    pass
-            elif archive_failure:
+                elif archive_failure:
+                    any_failure = True
+                    LOG.error(
+                        "Archive failure detected. Clip %d finished locally and will not be archived in this run.",
+                        clip_index,
+                    )
+
+            if (
+                archive_failure_event.is_set()
+                and archive_settings.stop_before_next_clip_on_transfer_failure
+            ):
                 any_failure = True
-                LOG.error("Archive manager already reported a failure; not cleaning up clip %d", clip_index)
+                LOG.error(
+                    "Archive failure detected. The active clip has finished; no additional clip will be started. Local data is preserved."
+                )
+                break
 
             if any_failure:
-                stop_event.set()
                 break
 
             clip_index += 1
 
-        LOG.info("Recording finished after %d completed clip(s)", clip_index)
+        LOG.info("Recording finished after %d completed clip(s)", completed_clips)
     except KeyboardInterrupt:
         stopped_by_signal = True
         exit_status = "interrupted"
         LOG.warning("KeyboardInterrupt received; stopping recording")
-        stop_event.set()
+        recording_stop_event.set()
     except Exception as exc:
         any_failure = True
         unexpected_exception = repr(exc)
         exit_status = "exception"
         LOG.exception("Unhandled exception during recording")
-        stop_event.set()
+        recording_stop_event.set()
     finally:
         if archive_manager is not None:
             try:
@@ -2620,7 +2842,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         try:
             write_session_summary(
                 session_dir=session_dir,
-                completed_clips=clip_index,
+                completed_clips=completed_clips,
                 requested_clips=requested_clips,
                 stopped_by_signal=stopped_by_signal,
                 any_failure=any_failure,
