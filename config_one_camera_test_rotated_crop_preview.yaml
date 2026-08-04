@@ -39,9 +39,9 @@ cameras:
 
     # Native sensor crop: x = 240..1679, y = 0..1199.
     # The script aligns these values to the camera's valid increments if needed.
-    width: 1440
-    height: 1200
-    offset_x: 300
+    width: 1920 #1920 is full
+    height: 1200 #1200 is full
+    offset_x: 0
     offset_y: 0
 
     binning: 1
@@ -50,7 +50,7 @@ cameras:
     # No output_width/output_height: preserve native ROI pixels. After rotate: 1200 x 1440.
     output_width: 960 
     # Leave output_height absent to preserve aspect ratio automatically.
-    exposure_us: 4000
+    exposure_us: 5000
     gain: 0
     auto_exposure: false
     auto_gain: false
