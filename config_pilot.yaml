@@ -43,7 +43,7 @@ cameras:
     offset_y: 0
     binning: 1
     pixel_format: auto
-    output_width: 960
+    # output_width: 960
     exposure_us: 5000
     gain: 0
     auto_exposure: false

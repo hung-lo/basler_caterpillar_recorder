@@ -795,9 +795,11 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     if not settings.show_status:
         return display
 
-    font = cv2.FONT_HERSHEY_DUPLEX
-    controls_font_scale = 0.42
-    controls_text = "q hide | s snapshot"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    status_font_scale = 0.48
+    controls_font_scale = 0.34
+    text_thickness = 1
+    controls_text = "q hide  |  s snapshot"
     fps_text = (
         f"{packet.measured_receive_fps:.2f} fps"
         if packet.measured_receive_fps is not None
@@ -816,11 +818,11 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         controls_text,
         font,
         controls_font_scale,
-        1,
+        text_thickness,
     )
 
     overlay = display.copy()
-    panel_height = 78
+    panel_height = 72
     cv2.rectangle(
         overlay,
         (0, 0),
@@ -830,19 +832,21 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     )
     cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
 
-    y = 26
+    first_line_y = 24
+    line_spacing = 22
+    y = first_line_y
     for line in lines:
         cv2.putText(
             display,
             line,
             (12, y),
             font,
-            0.55,
+            status_font_scale,
             (255, 255, 255),
-            1,
+            text_thickness,
             cv2.LINE_AA,
         )
-        y += 24
+        y += line_spacing
 
     controls_x = max(12, display.shape[1] - controls_width - 12)
     cv2.putText(
@@ -852,14 +856,14 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         font,
         controls_font_scale,
         (235, 235, 235),
-        1,
+        text_thickness,
         cv2.LINE_AA,
     )
 
     bar_left = 12
-    bar_top = 60
+    bar_top = 57
     bar_width = max(60, display.shape[1] - 24)
-    bar_height = 8
+    bar_height = 7
     cv2.rectangle(
         display,
         (bar_left, bar_top),
