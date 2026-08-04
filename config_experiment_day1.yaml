@@ -1,5 +1,5 @@
 # Production day-1 config for the connected a2A1920-160ucBAS camera.
-# Approximately centered native sensor crop on the 1920 x 1200 sensor.
+# Full native 1920 x 1200 sensor FoV, rotated 90 degrees CCW.
 
 project: monarch_behavior_pilot
 subject: cohort_C01-C04_day1
@@ -7,7 +7,7 @@ output_root: ./recordings
 
 experiment:
   animal_ids: [C01, C02, C03, C04]
-  notes: "One-camera monarch caterpillar pilot. Native 1440 x 1200 sensor ROI, rotated 90 degrees counter-clockwise and downsampled to approximately 960 x 1152."
+  notes: "One-camera monarch caterpillar pilot. Full 1920 x 1200 sensor FoV, rotated 90 degrees counter-clockwise and downsampled to approximately 960 x 1536."
 
 ffmpeg: null
 
@@ -30,23 +30,22 @@ recording_preview:
   show_status: true
 
 cameras:
-  - label: arena_C01-C04
+  - label: camera1
     animal_ids: [C01, C02, C03, C04]
     model: a2A1920-160ucBAS
     serial: "40604036"
     fps: 5
 
-    # Approximately centered native sensor crop; the script aligns the ROI to
-    # the camera's valid increments if needed.
-    width: 1440
+    # Full native sensor field of view.
+    width: 1920
     height: 1200
-    offset_x: 300
+    offset_x: 0
     offset_y: 0
 
     binning: 1
     pixel_format: auto
 
-    # Software downscaling after rotation; preserves the rotated aspect ratio.
+    # Software downscaling after rotation; preserves the full FoV.
     output_width: 960
     exposure_us: 4000
     gain: 0

@@ -2,11 +2,9 @@
 
 ## Physical setup
 
-- Put one larva per labeled enclosure; use IDs M01-M07 outside the enclosure, not marks on the body.
-- Arrange M01-M04 in a fixed 2 x 2 grid under the acA4024 camera.
-- Arrange M05-M07 in a fixed 2 x 2 grid under the a2A1920 camera; use the empty fourth position for a scale and neutral reference patch.
-- Mount both cameras overhead, lock focus/aperture, use diffuse visible illumination during the normal light phase, and keep the computer on AC power.
-- Connect each camera directly to USB 3. Use separate host controllers if available. Record to a local SSD and disable system sleep.
+- Put one larva per labeled enclosure; use IDs outside the enclosure, not marks on the body.
+- Mount the camera overhead, lock focus/aperture, use diffuse visible illumination during the normal light phase, and keep the computer on AC power.
+- Connect the camera directly to USB 3 if possible. Record to a local SSD and disable system sleep.
 
 ## Software
 
@@ -34,47 +32,39 @@ python -m pip install -r requirements.txt
 
 ## Camera test
 
+List connected cameras:
+
 ```bash
 python record_basler.py --list-cameras
 ```
 
-Copy the printed serial numbers into both YAML files. Then preview each camera:
+Preview the current camera:
 
 ```bash
-python record_basler.py --config config_pilot.yaml --preview arena_A_M01-M04
-python record_basler.py --config config_pilot.yaml --preview arena_B_M05-M07
+python record_basler.py --config config_pilot.yaml --preview camera1
 ```
 
 Adjust focus first, then illumination/exposure. Aim for no clipped white areas and minimal gain. The smallest larva should be roughly 80-100 pixels long or larger in the saved frame.
 
-Run a ten-second two-camera test:
+Run the ten-second smoke test:
 
 ```bash
 python record_basler.py --config config_smoke_test.yaml
 ```
 
-On macOS, keep the machine on power, leave the lid open, and use `caffeinate -i` for unattended runs so the display can sleep without the system idling out:
+If you want a live monitor window during recording, use the full-FoV day-1 config:
 
 ```bash
-caffeinate -i python record_basler.py --config config_smoke_test.yaml
+python record_basler.py --config config_experiment_day1.yaml
 ```
 
-If you want a live monitor window during recording, use the example one-camera preview config:
+On macOS, keep the machine on power, leave the lid open, and use `caffeinate -i` for unattended runs:
 
 ```bash
-python record_basler.py --config config_one_camera_test_rotated_preview.yaml
+caffeinate -i python record_basler.py --config config_experiment_day1.yaml
 ```
 
-To test a centered native crop on that same camera before committing to it:
-
-```bash
-python record_basler.py \
-  --config config_one_camera_test_rotated_crop_preview.yaml \
-  --preview arena_B_M05-M07
-python record_basler.py --config config_one_camera_test_rotated_crop_preview.yaml
-```
-
-Open both MP4 files. In each JSON sidecar confirm:
+Open the MP4 file and inspect the JSON sidecar. In the JSON confirm:
 
 - `success: true`
 - `grab_failures: 0`

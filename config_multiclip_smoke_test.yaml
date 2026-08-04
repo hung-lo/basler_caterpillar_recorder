@@ -30,23 +30,17 @@ recording_preview:
   show_status: true
 
 cameras:
-  - label: arena_C01-C04
+  - label: camera1
     animal_ids: [C01, C02, C03, C04]
     model: a2A1920-160ucBAS
     serial: "40604036"
     fps: 5
-
-    # Approximately centered native sensor crop; the script aligns the ROI to
-    # the camera's valid increments if needed.
-    width: 1440
+    width: 1920
     height: 1200
-    offset_x: 300
+    offset_x: 0
     offset_y: 0
-
     binning: 1
     pixel_format: auto
-
-    # Software downscaling after rotation; preserves the rotated aspect ratio.
     output_width: 960
     exposure_us: 4000
     gain: 0
