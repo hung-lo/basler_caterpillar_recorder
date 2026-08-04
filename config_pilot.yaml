@@ -7,7 +7,7 @@ subject: cohort_pilot01
 output_root: ./recordings
 
 experiment:
-  animal_ids: [M01, M02, M03, M04, M05, M06, M07]
+  animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
   outcome_definition: successful_adult_eclosion
   notes: "Pilot: fixed individual enclosures under one full-FoV camera; edit IDs before recording."
 
@@ -33,7 +33,7 @@ cameras:
   # Full native sensor field of view at 5 fps, rotated 90 degrees CCW and
   # downscaled after rotation to keep file sizes practical.
   - label: camera1
-    animal_ids: [M01, M02, M03, M04, M05, M06, M07]
+    animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]
     model: a2A1920-160ucBAS
     serial: "40604036"
     fps: 5
