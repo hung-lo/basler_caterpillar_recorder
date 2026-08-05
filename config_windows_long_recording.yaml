@@ -15,7 +15,7 @@
 #      and confirm archive validation passes.
 
 project: monarch_behavior_windows
-subject: cohort_C01-C08
+subject: cohort_C01-C08_10fps
 
 # Record each active clip to the internal SSD first.
 # Path.expanduser() converts ~ to the current Windows user profile.
@@ -70,7 +70,7 @@ schedule:
   # 30 clips x 10 minutes = approximately 5 hours.
   clip_duration_s: 600
   interval_s: 600
-  number_of_clips: 30
+  number_of_clips: 6
 
 encoding:
   codec: libx264
@@ -111,7 +111,7 @@ cameras:
     # Uncomment for a smaller approximately 960 x 1536 video:
     # output_width: 960
 
-    exposure_us: 5000
+    exposure_us: 6000
     gain: 0
     auto_exposure: false
     auto_gain: false
