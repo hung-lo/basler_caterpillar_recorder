@@ -78,11 +78,16 @@ encoding:
   crf: 25
   gop_seconds: 2
 
+preview:
+  max_width: 600
+  max_height: 640
+  show_status: true
+
 recording_preview:
   enabled: true
   fps: 1
   max_width: 600
-  max_height: 720
+  max_height: 640
   show_status: true
 
 cameras:

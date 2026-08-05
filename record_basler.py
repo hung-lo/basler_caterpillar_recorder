@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterable, Optional
 
 import cv2
@@ -501,21 +501,38 @@ def parse_archive_settings(config: dict[str, Any]) -> ArchiveSettings:
     )
 
 
-def resize_frame_to_fit(frame: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
-    """Return a display copy that fits inside the requested bounding box."""
+def resize_to_fit(
+    frame: np.ndarray,
+    *,
+    max_width: int,
+    max_height: int,
+    allow_upscale: bool = False,
+) -> np.ndarray:
+    """Resize a frame to fit completely inside the requested bounding box."""
+
+    if max_width <= 0:
+        raise ValueError("preview max_width must be positive")
+    if max_height <= 0:
+        raise ValueError("preview max_height must be positive")
 
     height, width = frame.shape[:2]
-    scale = min(1.0, max_width / width, max_height / height)
-    if scale < 1.0:
-        target_width = max(2, round(width * scale))
-        target_height = max(2, round(height * scale))
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Cannot resize an empty frame with shape {frame.shape}")
+
+    scale = min(max_width / width, max_height / height)
+    if not allow_upscale:
+        scale = min(scale, 1.0)
+
+    if scale >= 1.0:
+        resized = frame
+    else:
+        target_width = max(1, int(round(width * scale)))
+        target_height = max(1, int(round(height * scale)))
         resized = cv2.resize(
             frame,
             (target_width, target_height),
             interpolation=cv2.INTER_AREA,
         )
-    else:
-        resized = frame
 
     # The pylon-converted array may refer to reusable grab-buffer memory. The
     # queue must therefore own an independent copy before the grab is released.
@@ -1106,13 +1123,39 @@ def read_json_mapping(path: Path) -> tuple[Optional[dict[str, Any]], Optional[st
     return data, None
 
 
-def atomic_write_json(path: Path, payload: Any) -> None:
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    with temp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, default=str)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+def json_default(value: Any) -> Any:
+    """Convert explicitly supported objects at JSON boundaries."""
+
+    if isinstance(value, PurePath):
+        return str(value)
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def write_json(path: Path, payload: Any) -> None:
+    """Atomically write a complete JSON metadata file."""
+
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(
+                payload,
+                handle,
+                indent=2,
+                default=json_default,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def copy_file_if_exists(source: Path, destination: Path) -> bool:
@@ -1550,7 +1593,7 @@ class ArchiveManager:
                 raise RuntimeError("Archive worker did not stop within 30 seconds")
 
         summary = self._build_summary()
-        atomic_write_json(self.local_summary_path, summary)
+        write_json(self.local_summary_path, summary)
 
     def copy_final_metadata(self) -> None:
         if not self.settings.enabled:
@@ -1655,7 +1698,13 @@ class ArchiveManager:
     def _append_transfer_record(self, result: ArchiveResult) -> None:
         self.local_transfers_path.parent.mkdir(parents=True, exist_ok=True)
         with self.local_transfers_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(dataclasses.asdict(result), default=str))
+            handle.write(
+                json.dumps(
+                    dataclasses.asdict(result),
+                    separators=(",", ":"),
+                    default=json_default,
+                )
+            )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -2015,6 +2064,39 @@ def destroy_preview_windows(window_names: Iterable[str]) -> None:
         pass
 
 
+def draw_preview_status(
+    preview: np.ndarray,
+    *,
+    label: str,
+    receive_fps: float,
+) -> None:
+    _height, width = preview.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45 if width < 600 else 0.55
+    thickness = 1
+
+    cv2.putText(
+        preview,
+        f"{label} | {receive_fps:.1f} fps",
+        (10, 20),
+        font,
+        font_scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        preview,
+        "q quit | s snapshot | p settings",
+        (10, 40),
+        font,
+        font_scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def monitor_recording_threads(
     threads: list[threading.Thread],
     preview_queues: dict[str, queue.Queue[PreviewPacket]],
@@ -2283,10 +2365,10 @@ def record_one_camera(
                             measured_preview_fps = (frame_count - 1) / (
                                 (host_mono_ns - first_host_mono_ns) / 1e9
                             )
-                        monitor_frame = resize_frame_to_fit(
+                        monitor_frame = resize_to_fit(
                             frame,
-                            preview_settings.max_width,
-                            preview_settings.max_height,
+                            max_width=preview_settings.max_width,
+                            max_height=preview_settings.max_height,
                         )
                         put_latest_preview(
                             preview_queue,
@@ -2424,8 +2506,7 @@ def record_one_camera(
                 "completed_utc": utc_now().isoformat(),
             }
         )
-        with metadata_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2, default=str)
+        write_json(metadata_path, metadata)
 
         result_queue.put(
             ClipResult(
@@ -2451,11 +2532,29 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
     used: set[str] = set()
     device = match_device(selected[0], devices, used)
     binding = configure_camera(selected[0], device)
+    preview_raw = config.get("preview")
+    if preview_raw is None:
+        preview_raw = config.get("recording_preview", {})
+    if preview_raw is None:
+        preview_raw = {}
+    if not isinstance(preview_raw, dict):
+        raise ValueError("config.preview must be a mapping/object")
+    preview_max_width = int(preview_raw.get("max_width", 600))
+    preview_max_height = int(preview_raw.get("max_height", 640))
+    preview_show_status = bool(preview_raw.get("show_status", True))
+    if preview_max_width <= 0:
+        raise ValueError("preview.max_width must be positive")
+    if preview_max_height <= 0:
+        raise ValueError("preview.max_height must be positive")
+
     window = f"Basler preview - {binding.label} (q quit, s snapshot, p print settings)"
     snapshot_count = 0
+    logged_preview_size = False
+    resized_window = False
     try:
         camera = binding.camera
         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         last_time = time.monotonic()
         displayed_fps = 0.0
         while camera.IsGrabbing():
@@ -2468,25 +2567,32 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
                 instantaneous = 1.0 / max(now - last_time, 1e-9)
                 displayed_fps = 0.9 * displayed_fps + 0.1 * instantaneous if displayed_fps else instantaneous
                 last_time = now
-                preview = frame
-                max_width = 1400
-                if preview.shape[1] > max_width:
-                    scale = max_width / preview.shape[1]
-                    preview = cv2.resize(
-                        preview,
-                        (round(preview.shape[1] * scale), round(preview.shape[0] * scale)),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                cv2.putText(
-                    preview,
-                    f"{binding.label} | receive {displayed_fps:.1f} fps | q quit | s snapshot | p settings",
-                    (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
+                preview = resize_to_fit(
+                    frame,
+                    max_width=preview_max_width,
+                    max_height=preview_max_height,
                 )
+                if preview_show_status:
+                    draw_preview_status(
+                        preview,
+                        label=binding.label,
+                        receive_fps=displayed_fps,
+                    )
+                if not logged_preview_size:
+                    LOG.info(
+                        "Preview display size for %s: source=%dx%d display=%dx%d limits=%dx%d",
+                        binding.label,
+                        frame.shape[1],
+                        frame.shape[0],
+                        preview.shape[1],
+                        preview.shape[0],
+                        preview_max_width,
+                        preview_max_height,
+                    )
+                    logged_preview_size = True
+                if not resized_window:
+                    cv2.resizeWindow(window, preview.shape[1], preview.shape[0])
+                    resized_window = True
                 cv2.imshow(window, preview)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -2582,8 +2688,7 @@ def write_session_manifest(
             for binding in bindings
         ],
     }
-    with (session_dir / "session_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, default=str)
+    write_json(session_dir / "session_manifest.json", manifest)
     shutil.copy2(config_path, session_dir / "config_used.yaml")
 
 
@@ -2605,13 +2710,7 @@ def write_session_summary(
         "exit_status": exit_status,
         "unexpected_exception": unexpected_exception,
     }
-    summary_path = session_dir / "session_summary.json"
-    temp_path = summary_path.with_suffix(".json.tmp")
-    with temp_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, default=str)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, summary_path)
+    write_json(session_dir / "session_summary.json", summary)
 
 
 def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
@@ -2683,23 +2782,21 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
     if dry_run:
         shutil.copy2(config_path, session_dir / "config_used.yaml")
-        with (session_dir / "dry_run.json").open("w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "project": project,
-                    "subject": subject,
-                    "clip_duration_s": clip_duration_s,
-                    "interval_s": interval_s,
-                    "total_duration_s": total_duration_s,
-                    "number_of_clips": number_of_clips,
-                    "system": dataclasses.asdict(system_settings),
-                    "recording_preview": dataclasses.asdict(preview_settings),
-                    "archive": dataclasses.asdict(archive_settings),
-                    "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
-                },
-                handle,
-                indent=2,
-            )
+        write_json(
+            session_dir / "dry_run.json",
+            {
+                "project": project,
+                "subject": subject,
+                "clip_duration_s": clip_duration_s,
+                "interval_s": interval_s,
+                "total_duration_s": total_duration_s,
+                "number_of_clips": number_of_clips,
+                "system": dataclasses.asdict(system_settings),
+                "recording_preview": dataclasses.asdict(preview_settings),
+                "archive": dataclasses.asdict(archive_settings),
+                "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
+            },
+        )
         LOG.info("Dry run completed; no cameras were opened.")
         if archive_preflight is not None and not archive_preflight.ok:
             return 1
