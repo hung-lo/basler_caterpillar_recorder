@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 recordings/
 recordings_test/
+config_local*.yaml
 *.png
 *.log
 .DS_Store

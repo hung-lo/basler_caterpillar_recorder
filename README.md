@@ -1,83 +1,110 @@
-# Basler caterpillar recorder: one-camera fast-start
+# Basler caterpillar recorder
 
-This repository is set up for the currently connected Basler camera:
+This repository documents and drives the current one-camera recording workflow for the Basler `a2A1920-160ucBAS` camera with serial `40604036` and YAML label `camera1`.
 
-- model: `a2A1920-160ucBAS`
-- serial: `40604036`
-- label used in YAML: `camera1`
+The recorder supports:
 
-The main recording configs in this repo target that camera and use the same 90-degree counter-clockwise rotation. The repo also includes Windows-specific sample configs:
+- setup preview that does not record;
+- lightweight recording preview with clip/session progress;
+- terminal `STATUS` heartbeats while waiting and recording;
+- local-first clip writing;
+- verified archive transfer with `.incoming/*.partial` promotion;
+- `rsync` on macOS/Linux and `robocopy` on Windows;
+- SHA-256 verification before local clip deletion;
+- built-in sleep prevention for unattended runs.
 
-- `config_pilot.yaml`: 24-hour pilot, full sensor FoV, archive enabled.
-- `config_experiment_day1.yaml`: day-1 production config, preview enabled, archive enabled, downsampled to about `960 x 1536`.
-- `config_smoke_test.yaml`: ten-second smoke test, archive disabled.
-- `config_multiclip_smoke_test.yaml`: two-clip preview smoke test, full sensor FoV, archive disabled.
-- `config_archive_smoke_test.yaml`: three-clip archive integration test with preview and external-drive transfer.
-- `config_windows_test.yaml`: short Windows smoke test; update the model and serial if your Windows camera differs.
-- `config_windows_long_recording.yaml`: five-hour Windows long-run example for `a2A1920-160ucBAS` serial `40604036`, with built-in sleep prevention and `robocopy` archive transfer.
+If you use a different camera, copy a YAML template and update the model, serial, frame size, and rotation before recording.
 
-## On-disk layout
+## At a glance
 
-Sessions now use a compact one-second timestamp at the session level, and each clip directory keeps only the clip index and clock time. Camera files use only the camera label.
+- `record_basler.py` is the main CLI for listing cameras, previewing, dry runs, and scheduled recording.
+- `validate_session.py` checks clip structure, JSON sidecars, timing, and archive state.
+- `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
+- `config_smoke_test.yaml` is a short local test.
+- `config_multiclip_smoke_test.yaml` is a short repeated-clip test.
+- `config_archive_smoke_test.yaml` is a three-clip archive test.
+- `config_windows_test.yaml` is a Windows-local test template.
+- `config_windows_long_recording.yaml` is a long-run template, not a fixed-duration promise.
+- `config_pilot.yaml` is the main pilot template.
+- `QUICKSTART.md` is the short daily checklist after setup is already complete.
+
+The tracked YAML files are templates. Copy one to a local file such as `config_local_macos.yaml` or `config_local_windows.yaml` before you edit it. Git ignores `config_local*.yaml`.
+
+## New computer workflow
+
+1. Install Basler pylon, FFmpeg, Git, and `uv`.
+2. Clone this repository.
+3. Create the repository `.venv`.
+4. Confirm the camera appears in pylon Viewer.
+5. Run `--list-cameras`.
+6. Copy a YAML template to a local config.
+7. Run `--dry-run`.
+8. Run `--preview camera1`.
+9. Run a short local recording test.
+10. Run a three-clip archive smoke test.
+11. Validate the session.
+12. Only then start the long unattended run.
+
+Do not begin with the long-run template on a new computer.
+
+## Hardware and system setup
+
+Keep the computer on AC power, leave the lid open unless the OS is explicitly configured otherwise, and connect the camera directly to USB 3 when possible. Avoid USB hubs if you can.
+
+### Camera
+
+Install Basler pylon and confirm the camera is visible in pylon Viewer before you record anything.
+
+For the main camera, the expected values are:
 
 ```text
-recordings/
-  monarch_behavior_pilot/
-    cohort_pilot01/
-      20260804_101405/
-        config_used.yaml
-        session_manifest.json
-        session_summary.json
-        recorder.log
-        clip_0000_101406/
-          camera1.mp4
-          camera1.timestamps.csv.gz
-          camera1.json
-          camera1.capture.mkv
-          camera1.ffmpeg.log
-          camera1.remux.log
-          monitor_snapshots/
+model:  a2A1920-160ucBAS
+serial: 40604036
+label:  camera1
 ```
 
-Exact subsecond timing stays in the JSON metadata and the timestamp CSV. The same shortened hierarchy is copied to the configured archive destination when archive mode is enabled.
+### Recording computer
 
-## Repository files
+- Keep enough free space on the internal recording disk.
+- Mount the external archive drive before archive-enabled runs.
+- Do not mix Conda/Anaconda with the repository `.venv` unless you have a specific reason to do so.
 
-- `record_basler.py`: recorder CLI for listing cameras, live preview, dry runs, and scheduled recording.
-- `config_pilot.yaml`: the long one-camera pilot configuration for `./recordings`.
-- `config_experiment_day1.yaml`: the day-1 production config with preview enabled.
-- `config_smoke_test.yaml`: a ten-second one-camera smoke test for `./recordings_test`.
-- `config_multiclip_smoke_test.yaml`: a two-clip pre-experiment smoke test with preview enabled.
-- `config_archive_smoke_test.yaml`: a three-clip archive smoke test with preview enabled.
-- `config_windows_test.yaml`: a one-clip Windows smoke test template.
-- `config_windows_long_recording.yaml`: a Windows five-hour archive-enabled long-run config.
-- `validate_session.py`: session validator for clip structure, timing, summary state, and leftover temporary files.
-- `QUICKSTART.md`: a short setup-and-run checklist.
-- `requirements.txt`: Python dependencies for the recorder.
+## Install software
 
-If you swap cameras, update the serial value in the YAML files before recording.
-
-## Setup
-
-Install Basler pylon and FFmpeg, then create a virtual environment:
+Use `uv` with the existing `requirements.txt` workflow:
 
 ```bash
-python3 -m venv .venv
+uv python install 3.12
+uv venv --python 3.12
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 On Windows PowerShell:
 
 ```powershell
-py -m venv .venv
+uv python install 3.12
+uv venv --python 3.12
 .venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
-## Camera test
+If PowerShell blocks activation, run:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Verify the install with:
+
+```bash
+python --version
+python -c "import pypylon; print('pypylon OK')"
+python -c "import cv2; print('OpenCV', cv2.__version__)"
+ffmpeg -version
+```
+
+## Confirm the camera
 
 List connected cameras:
 
@@ -85,23 +112,182 @@ List connected cameras:
 python record_basler.py --list-cameras
 ```
 
-Preview the active camera:
+If the serial differs, update your copied YAML before you continue.
 
-```bash
-python record_basler.py --config config_pilot.yaml --preview camera1
+If no camera appears:
+
+1. Confirm it appears in pylon Viewer.
+2. Reconnect the USB cable.
+3. Try a direct USB 3 port.
+4. Close any app already using the camera.
+5. Run `--list-cameras` again.
+
+## Create a run-specific config
+
+Copy a template first.
+
+Windows:
+
+```powershell
+Copy-Item config_windows_long_recording.yaml config_local_windows.yaml
 ```
 
-Preview controls:
+macOS:
 
-- `q` or Escape: quit
-- `s`: save a full processed snapshot
-- `p`: print current exposure, gain, acquisition rate, and resulting rate
+```bash
+cp config_pilot.yaml config_local_macos.yaml
+```
 
-For setup only, `auto_exposure: true` and `auto_gain: true` can help find a usable range. For the real run, use manual exposure and gain so brightness stays stable.
+Before every experiment, review:
 
-### Preview while recording
+```yaml
+project:
+subject:
 
-You can optionally show a lightweight monitor window during recording by adding:
+experiment:
+  animal_ids:
+  notes:
+
+output_root:
+
+schedule:
+  clip_duration_s:
+  interval_s:
+  number_of_clips:
+  # or total_duration_h:
+
+cameras:
+  - model:
+    serial:
+    fps:
+    width:
+    height:
+    exposure_us:
+    gain:
+    rotate:
+
+archive:
+  enabled:
+  destination_root:
+  required_mount_point:
+```
+
+For the main camera, the current full-field config uses:
+
+```yaml
+model: a2A1920-160ucBAS
+serial: "40604036"
+fps: 5
+width: 1920
+height: 1200
+offset_x: 0
+offset_y: 0
+rotate: 270
+```
+
+`rotate: 270` means 90 degrees counter-clockwise.
+
+## Schedule meaning
+
+Use the values in the YAML to understand the planned span.
+
+When a schedule is limited by `number_of_clips`, the nominal span is:
+
+```text
+(N - 1) * interval + clip duration
+```
+
+When `clip_duration_s` equals `interval_s`, the run is near-continuous with a small clip-boundary overhead.
+
+Do not treat the long-run template as an exact-duration promise. Inspect `clip_duration_s`, `interval_s`, `number_of_clips`, and `total_duration_h` in the copied config you actually plan to use.
+
+## Check archive settings
+
+Example Windows archive config:
+
+```yaml
+archive:
+  enabled: true
+  backend: auto
+  destination_root: "D:/Hung_MBL"
+  required_mount_point: "D:/"
+```
+
+Use forward slashes in Windows YAML paths.
+
+`backend: auto` selects `robocopy` on Windows.
+
+Example macOS archive config:
+
+```yaml
+archive:
+  enabled: true
+  backend: auto
+  destination_root: "/Volumes/Dr. Rose/Hung_MBL"
+  required_mount_point: "/Volumes/Dr. Rose"
+```
+
+`backend: auto` selects `rsync` on macOS/Linux.
+
+Archive transfer is local-first:
+
+1. record the clip locally;
+2. copy it to `.incoming/<clip>.partial`;
+3. compare file names, sizes, and SHA-256 hashes;
+4. promote the verified partial directory to the final visible clip directory;
+5. delete the local clip only after verification passes.
+
+If transfer fails, the local clip is preserved. Do not manually delete `.incoming/*.partial` until you have inspected the failure.
+
+## Dry run
+
+A dry run checks config, schedule, paths, archive backend, mount point, executables, and free space without opening the camera.
+
+Windows:
+
+```powershell
+python record_basler.py --config config_local_windows.yaml --dry-run
+```
+
+macOS:
+
+```bash
+python record_basler.py --config config_local_macos.yaml --dry-run
+```
+
+Do not continue if the dry run reports a failure.
+
+## Setup preview
+
+Windows:
+
+```powershell
+python record_basler.py --config config_local_windows.yaml --preview camera1
+```
+
+macOS:
+
+```bash
+python record_basler.py --config config_local_macos.yaml --preview camera1
+```
+
+`--preview` is preview-only and does not record.
+
+Setup-preview controls:
+
+```text
+q or Escape   close preview
+s             save a full processed snapshot
+p             print camera settings
+```
+
+Confirm the full field of view, focus, brightness, rotation, and reflection control before you proceed.
+
+Preview sizing is independent of saved-video resolution. Reducing the preview width or height does not downsample the recorded MP4.
+
+## Recording preview during acquisition
+
+If you want a lightweight monitor window during recording, add:
 
 ```yaml
 recording_preview:
@@ -112,117 +298,110 @@ recording_preview:
   show_status: true
 ```
 
-This preview is display-only. The full transformed frame still goes to FFmpeg. During recording, `q` or Escape hides the preview without stopping acquisition, `s` saves the latest low-resolution monitor frame into the clip directory, and `Ctrl+C` still stops the recording cleanly.
+During recording:
 
-The preview-enabled example configs in this repo are:
+- the preview is display-only;
+- the preview shows clip and session progress;
+- the terminal prints periodic `STATUS` heartbeats;
+- `q` hides the recording preview without stopping acquisition;
+- `s` saves the latest low-resolution monitor frame into the clip directory;
+- `Ctrl+C` stops the recording cleanly.
+
+The preview-enabled example configs are:
 
 - `config_experiment_day1.yaml`
 - `config_multiclip_smoke_test.yaml`
 - `config_archive_smoke_test.yaml`
 
-## Pre-experiment multi-clip test
+## Run a local recording test
 
-Use this before the long pilot to confirm repeated clip creation, remuxing, preview, and session validation:
+On a new computer, first disable archive in your copied config:
 
-```bash
-python record_basler.py --list-cameras
-
-python record_basler.py \
-  --config config_multiclip_smoke_test.yaml \
-  --dry-run
-
-caffeinate -i python record_basler.py \
-  --config config_multiclip_smoke_test.yaml
+```yaml
+archive:
+  enabled: false
 ```
 
-After the run, validate the generated session:
+Use a short schedule:
 
-```bash
-python validate_session.py recordings_test/monarch_behavior_multiclip_test/cohort_C01-C04/SESSION_DIRECTORY
+```yaml
+schedule:
+  clip_duration_s: 10
+  interval_s: 10
+  number_of_clips: 1
 ```
 
-Notes:
-
-- `--preview camera1` is preview-only and does not record
-- `recording_preview.enabled: true` shows the lightweight monitor while actual recording is running
-- set `system.prevent_sleep_during_recording: true` to let the recorder manage sleep prevention on macOS and Windows
-- `caffeinate -i` still works on macOS if you prefer to keep sleep prevention outside the YAML
-- keep the MacBook plugged in with the lid open
-- near-continuous finite clips have a brief boundary gap
-
-## Archive workflow
-
-The archive-enabled configs record locally first, then copy each finished clip directory into a generated `.incoming/*.partial` directory, verify the copy with a Python SHA-256 manifest, promote the partial directory to the final visible clip directory, and only then delete the local clip. `backend: auto` selects `rsync` on macOS/Linux and `robocopy` on Windows.
-
-The recorder keeps the local session metadata, writes transfer ledgers, verifies the external copy, and deletes each local clip directory only after verification succeeds. If the external drive is missing or the archive backlog grows too large, the recorder stops before starting another clip.
-
-Before using an archive config, mount the drive and check that the local SSD still has plenty of free space. The built-in safety defaults are a 50 GB hard clip cap and a 120 GB minimum free-space gate before each new clip. On Windows, keep the archive destination inside the mounted drive root, for example `required_mount_point: "D:/"` and `destination_root: "D:/Hung_MBL"`.
-
-Run the archive smoke test with:
-
-```bash
-caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
-```
-
-For the Windows five-hour example:
+Run the short test:
 
 ```powershell
-python record_basler.py --config config_windows_long_recording.yaml --dry-run
-python record_basler.py --config config_windows_long_recording.yaml
+python record_basler.py --config config_local_windows.yaml
 ```
 
-## Record and validate
-
-Validate paths and schedule without opening cameras:
+or:
 
 ```bash
-python record_basler.py --config config_pilot.yaml --dry-run
+python record_basler.py --config config_local_macos.yaml
 ```
 
-Run the ten-second smoke test:
+Confirm the session contains the expected clip directory, MP4, timestamps, JSON metadata, and log files.
 
-```bash
-python record_basler.py --config config_smoke_test.yaml
-```
+## Run the archive smoke test
 
-Run the archive smoke test once the external drive is mounted:
+With the archive drive mounted, run:
 
 ```bash
 caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
 ```
 
-Run the full-FoV day-1 config:
+On macOS, `caffeinate -i` is still useful if you want sleep prevention outside the YAML.
+
+Validate the generated session:
 
 ```bash
-python record_basler.py --config config_experiment_day1.yaml
+python validate_session.py SESSION_PATH
 ```
 
-On macOS, prevent idle sleep during recording with either `system.prevent_sleep_during_recording: true` in the YAML or `caffeinate -i` outside the recorder. Keep the MacBook on power, leave the lid open, and disable automatic sleep on the power adapter when possible. For preview-enabled runs, use:
+Replace `SESSION_PATH` with the actual session directory you want to check.
+
+Example macOS command to find the newest session and validate it:
 
 ```bash
-caffeinate -i python record_basler.py --config config_experiment_day1.yaml
+SESSION_PATH=$(find recordings -name session_summary.json -print0 | xargs -0 -n1 dirname | sort | tail -n 1)
+python validate_session.py "$SESSION_PATH"
 ```
 
-Open the MP4 file and inspect the JSON sidecar. Confirm that `success` is true, `grab_failures` is zero, `measured_receive_fps` is close to the requested rate, and `mp4_remux_succeeded` is true. Then start the pilot:
+Example Windows PowerShell command:
+
+```powershell
+$session = Get-ChildItem recordings -Recurse -Filter session_summary.json | Sort-Object LastWriteTime | Select-Object -Last 1
+if ($session) { $session = Split-Path $session.FullName -Parent }
+python validate_session.py $session
+```
+
+`PASS` should be a prerequisite before you rely on unattended long runs on a new setup.
+
+## Start a long run
+
+The long-run template is meant to be reviewed and copied locally before use. Do not assume its duration is still the same after you edit it.
+
+Windows example:
+
+```powershell
+python record_basler.py --config config_local_windows.yaml --dry-run
+python record_basler.py --config config_local_windows.yaml
+```
+
+macOS example:
 
 ```bash
-python record_basler.py --config config_pilot.yaml
+python record_basler.py --config config_local_macos.yaml --dry-run
+caffeinate -i python record_basler.py --config config_local_macos.yaml
 ```
 
-For long macOS runs, you can still prefer:
-
-```bash
-caffeinate -i python record_basler.py --config config_pilot.yaml
-```
-
-Stop cleanly with `Ctrl+C`.
-
-Connect the camera directly to a USB 3 port when possible. If frames are incomplete or skipped, shorten or replace the cable, or reduce frame rate/throughput.
-
-The pilot config records 30-minute clips for 24 hours. Equal clip duration and interval produce near-continuous recording. There is a short boundary gap while a clip closes and the next writer starts.
+For unattended recording, keep the machine on power, leave the lid open if needed, and stop cleanly with `Ctrl+C`.
 
 ## Storage check before the long run
 
-Compression depends strongly on leaf texture, sensor noise, and movement, so do not rely on a fixed estimate. After the smoke test, run a 10- or 30-minute test and extrapolate from the resulting file sizes.
+Do not rely on a fixed compression estimate. Run a short test first, inspect the MP4 size, and extrapolate from what you actually recorded.
 
-The archive workflow already stages clips locally and moves them to the external drive after verification, so the main thing to protect is the internal SSD used for active recording. Keep well above the 120 GB free-space threshold before each clip and mount the archive drive before starting a long run.
+The archive workflow keeps active clips on the local SSD only until verification succeeds, so protect the internal recording disk and mount the external archive drive before you begin.

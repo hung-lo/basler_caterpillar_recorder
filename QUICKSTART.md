@@ -1,121 +1,73 @@
-# Tomorrow-start checklist
+# Daily Checklist
 
-## Physical setup
+For first-time setup, start with [README.md](./README.md). This file is only the repeatable daily workflow after the environment is already installed.
 
-- Put one larva per labeled enclosure; use IDs outside the enclosure, not marks on the body.
-- Mount the camera overhead, lock focus/aperture, use diffuse visible illumination during the normal light phase, and keep the computer on AC power.
-- Connect the camera directly to USB 3 if possible. Record to a local SSD and disable system sleep, or set `system.prevent_sleep_during_recording: true` in the YAML.
+## Before you start
 
-## Software
+- Make sure the camera is visible in pylon Viewer.
+- Make sure the archive drive is mounted if you are using archive mode.
+- Keep the computer on AC power.
+- Use `config_local_windows.yaml` or `config_local_macos.yaml`, not the tracked templates.
 
-1. Install the Basler pylon Software Suite.
-2. Install FFmpeg and verify `ffmpeg -version` works.
-3. In this folder, create a virtual environment and install `requirements.txt`.
-
-macOS:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+## Reactivate the environment
 
 Windows PowerShell:
 
 ```powershell
-py -m venv .venv
+cd $HOME\Documents\GitHub\basler_caterpillar_recorder
 .venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
 ```
 
-## Camera test
+macOS:
 
-List connected cameras:
+```bash
+cd ~/Documents/GitHub/basler_caterpillar_recorder
+source .venv/bin/activate
+```
+
+## Daily workflow
+
+1. Copy a template to a local config if needed.
+2. Run a dry run.
+3. Run `--preview camera1`.
+4. Run a short local test.
+5. Run the three-clip archive smoke test.
+6. Validate the session.
+7. Start the unattended run only after validation passes.
+
+Example commands:
 
 ```bash
 python record_basler.py --list-cameras
-```
-
-Preview the current camera:
-
-```bash
-python record_basler.py --config config_pilot.yaml --preview camera1
-```
-
-Adjust focus first, then illumination/exposure. Aim for no clipped white areas and minimal gain. The smallest larva should be roughly 80-100 pixels long or larger in the saved frame.
-
-Run the ten-second smoke test:
-
-```bash
+python record_basler.py --config config_local_macos.yaml --dry-run
+python record_basler.py --config config_local_macos.yaml --preview camera1
 python record_basler.py --config config_smoke_test.yaml
-```
-
-If you want to verify the external-drive archive path, mount `/Volumes/Dr. Rose` first and run:
-
-```bash
 caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
+python validate_session.py SESSION_PATH
 ```
 
-If you want a live monitor window during recording, use the full-FoV day-1 config:
-
-```bash
-python record_basler.py --config config_experiment_day1.yaml
-```
-
-On macOS, keep the machine on power, leave the lid open, and use `caffeinate -i` for unattended runs:
-
-```bash
-caffeinate -i python record_basler.py --config config_experiment_day1.yaml
-```
-
-Open the MP4 file and inspect the JSON sidecar. In the JSON confirm:
-
-- `success: true`
-- `grab_failures: 0`
-- `measured_receive_fps` close to 5
-- `mp4_remux_succeeded: true`
-
-The archive-enabled configs record locally first, then verify and copy each finished clip directory to `/Volumes/Dr. Rose/Hung_MBL` before deleting the local clip directory.
-
-On Windows, the recorder can also manage sleep prevention and archive transfer itself. The long-run sample config is `config_windows_long_recording.yaml`, which uses:
-
-- `system.prevent_sleep_during_recording: true`
-- `archive.backend: auto`
-- `destination_root: "D:/Hung_MBL"`
-- `required_mount_point: "D:/"`
-
-Validate it before opening the camera:
+Windows example:
 
 ```powershell
-python record_basler.py --config config_windows_long_recording.yaml --dry-run
+python record_basler.py --config config_local_windows.yaml --dry-run
+python record_basler.py --config config_local_windows.yaml --preview camera1
+python record_basler.py --config config_smoke_test.yaml
+python record_basler.py --config config_archive_smoke_test.yaml
+python validate_session.py SESSION_PATH
 ```
 
-The short on-disk naming scheme is:
+## Stop controls
 
-```text
-20260804_101405/
-  clip_0000_101406/
-    camera1.mp4
-    camera1.timestamps.csv.gz
-    camera1.json
-```
+- `q` hides the recording preview without stopping acquisition.
+- `Ctrl+C` stops the recording cleanly.
 
-## Start the pilot
+## Final pre-run checklist
 
-Edit `project`, `subject`, `animal_ids`, and the schedule in `config_pilot.yaml`, then run:
-
-```bash
-caffeinate -i python record_basler.py --config config_pilot.yaml
-```
-
-The default is near-continuous 5-fps recording in 30-minute MP4 clips for 24 hours. Stop cleanly with `Ctrl+C`.
-
-For the Windows five-hour example, run:
-
-```powershell
-python record_basler.py --config config_windows_long_recording.yaml
-```
-
-Before leaving it unattended, run at least 10-30 minutes and extrapolate daily storage from the actual MP4 sizes. Check the first several JSON files for dropped frames.
+- Dry run passed.
+- Preview looked correct.
+- Short local test passed.
+- Three-clip archive test passed if archive mode is enabled.
+- `python validate_session.py SESSION_PATH` returned `PASS`.
+- Archive drive is mounted.
+- Laptop is on power.
+- You are using the copied local config, not a tracked template.
