@@ -373,6 +373,11 @@ class SystemSettings:
 
 
 @dataclasses.dataclass(frozen=True)
+class StatusSettings:
+    terminal_interval_s: float = 60.0
+
+
+@dataclasses.dataclass(frozen=True)
 class ArchiveSettings:
     enabled: bool = False
     backend: str = "auto"
@@ -420,11 +425,15 @@ class ArchivePreflightResult:
 class PreviewPacket:
     label: str
     clip_index: int
+    total_clips: int
     frame_index: int
     frame: np.ndarray
     host_monotonic_ns: int
     elapsed_s: float
     planned_duration_s: float
+    session_elapsed_s: float
+    planned_session_duration_s: float
+    planned_finish_utc: dt.datetime
     measured_receive_fps: Optional[float]
 
 
@@ -436,6 +445,19 @@ def parse_system_settings(config: dict[str, Any]) -> SystemSettings:
     return SystemSettings(
         prevent_sleep_during_recording=bool(raw.get("prevent_sleep_during_recording", False)),
     )
+
+
+def parse_status_settings(config: dict[str, Any]) -> StatusSettings:
+    raw = config.get("status") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("status must be a mapping/object")
+
+    settings = StatusSettings(
+        terminal_interval_s=float(raw.get("terminal_interval_s", 60.0)),
+    )
+    if settings.terminal_interval_s < 0:
+        raise ValueError("status.terminal_interval_s must be >= 0")
+    return settings
 
 
 def parse_recording_preview_settings(config: dict[str, Any]) -> RecordingPreviewSettings:
@@ -1965,23 +1987,37 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         return display
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    status_font_scale = 0.48
+    status_font_scale = 0.40 if display.shape[1] < 500 else 0.48
     controls_font_scale = 0.34
     text_thickness = 1
-    controls_text = "q hide  |  s snapshot"
+    controls_text = "q hide | s snapshot"
     fps_text = (
         f"{packet.measured_receive_fps:.2f} fps"
         if packet.measured_receive_fps is not None
         else "starting"
     )
-    elapsed_text = format_clock_duration(packet.elapsed_s)
-    total_text = format_clock_duration(packet.planned_duration_s)
-    progress = 0.0
+    clip_number = packet.clip_index + 1
+    clip_elapsed_text = format_clock_duration(packet.elapsed_s)
+    clip_total_text = format_clock_duration(packet.planned_duration_s)
+    session_elapsed_text = format_clock_duration(packet.session_elapsed_s)
+    session_total_text = format_clock_duration(packet.planned_session_duration_s)
+    remaining_s = max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
+    remaining_text = format_clock_duration(remaining_s)
+    finish_text = format_local_finish_time(packet.planned_finish_utc)
+    clip_progress = 0.0
     if packet.planned_duration_s > 0:
-        progress = max(0.0, min(1.0, packet.elapsed_s / packet.planned_duration_s))
+        clip_progress = max(0.0, min(1.0, packet.elapsed_s / packet.planned_duration_s))
+    session_progress = 0.0
+    if packet.planned_session_duration_s > 0:
+        session_progress = max(
+            0.0,
+            min(1.0, packet.session_elapsed_s / packet.planned_session_duration_s),
+        )
     lines = [
-        f"REC | {packet.label} | clip {packet.clip_index:04d}",
-        f"{elapsed_text} / {total_text} | frame {packet.frame_index + 1} | {fps_text}",
+        f"REC {packet.label} | clip {clip_number}/{packet.total_clips}",
+        f"clip {clip_elapsed_text}/{clip_total_text} | {fps_text}",
+        f"session {session_elapsed_text}/{session_total_text}",
+        f"remaining ~{remaining_text} | finish ~{finish_text}",
     ]
     (controls_width, _), _ = cv2.getTextSize(
         controls_text,
@@ -1991,7 +2027,7 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     )
 
     overlay = display.copy()
-    panel_height = 72
+    panel_height = 116
     cv2.rectangle(
         overlay,
         (0, 0),
@@ -2001,8 +2037,8 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     )
     cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
 
-    first_line_y = 24
-    line_spacing = 22
+    first_line_y = 20
+    line_spacing = 21
     y = first_line_y
     for line in lines:
         cv2.putText(
@@ -2021,7 +2057,7 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     cv2.putText(
         display,
         controls_text,
-        (controls_x, 24),
+        (controls_x, panel_height - 14),
         font,
         controls_font_scale,
         (235, 235, 235),
@@ -2030,9 +2066,21 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
     )
 
     bar_left = 12
-    bar_top = 57
+    bar_top = 92
     bar_width = max(60, display.shape[1] - 24)
-    bar_height = 7
+    bar_height = 6
+    gap = 10
+
+    cv2.putText(
+        display,
+        "clip",
+        (bar_left, bar_top - 4),
+        font,
+        0.28,
+        (225, 225, 225),
+        1,
+        cv2.LINE_AA,
+    )
     cv2.rectangle(
         display,
         (bar_left, bar_top),
@@ -2040,13 +2088,41 @@ def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSett
         (82, 82, 82),
         -1,
     )
-    filled_width = int(round(bar_width * progress))
+    filled_width = int(round(bar_width * clip_progress))
     if filled_width > 0:
         cv2.rectangle(
             display,
             (bar_left, bar_top),
             (bar_left + filled_width, bar_top + bar_height),
             (90, 190, 255),
+            -1,
+        )
+
+    session_bar_top = bar_top + bar_height + gap
+    cv2.putText(
+        display,
+        "all",
+        (bar_left, session_bar_top - 4),
+        font,
+        0.28,
+        (225, 225, 225),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        display,
+        (bar_left, session_bar_top),
+        (bar_left + bar_width, session_bar_top + bar_height),
+        (82, 82, 82),
+        -1,
+    )
+    session_filled_width = int(round(bar_width * session_progress))
+    if session_filled_width > 0:
+        cv2.rectangle(
+            display,
+            (bar_left, session_bar_top),
+            (bar_left + session_filled_width, session_bar_top + bar_height),
+            (100, 220, 140),
             -1,
         )
     return display
@@ -2097,23 +2173,63 @@ def draw_preview_status(
     )
 
 
+def log_recording_heartbeat(
+    *,
+    clip_index: int,
+    total_clips: int,
+    planned_start_mono_ns: int,
+    planned_stop_mono_ns: int,
+    session_start_mono_ns: int,
+    planned_session_duration_s: float,
+    planned_finish_utc: dt.datetime,
+) -> None:
+    now_mono_ns = time.monotonic_ns()
+    clip_total_s = (planned_stop_mono_ns - planned_start_mono_ns) / 1e9
+    clip_elapsed_s = max(
+        0.0,
+        min(
+            clip_total_s,
+            (now_mono_ns - planned_start_mono_ns) / 1e9,
+        ),
+    )
+    session_elapsed_s = max(0.0, (now_mono_ns - session_start_mono_ns) / 1e9)
+    remaining_s = max(0.0, planned_session_duration_s - session_elapsed_s)
+
+    LOG.info(
+        "STATUS | recording active | clip %d/%d | clip %s/%s | session %s/%s | remaining ~%s | finish ~%s local",
+        clip_index + 1,
+        total_clips,
+        format_clock_duration(clip_elapsed_s),
+        format_clock_duration(clip_total_s),
+        format_clock_duration(session_elapsed_s),
+        format_clock_duration(planned_session_duration_s),
+        format_clock_duration(remaining_s),
+        format_local_finish_time(planned_finish_utc),
+    )
+
+
 def monitor_recording_threads(
     threads: list[threading.Thread],
     preview_queues: dict[str, queue.Queue[PreviewPacket]],
     preview_settings: RecordingPreviewSettings,
     preview_active_event: threading.Event,
     clip_dir: Path,
+    *,
+    clip_index: int,
+    total_clips: int,
+    planned_start_mono_ns: int,
+    planned_stop_mono_ns: int,
+    session_start_mono_ns: int,
+    planned_session_duration_s: float,
+    planned_finish_utc: dt.datetime,
+    terminal_interval_s: float,
 ) -> None:
     """Keep recording windows responsive while camera workers acquire frames."""
-
-    if not preview_active_event.is_set() or not preview_queues:
-        for thread in threads:
-            thread.join()
-        return
 
     latest: dict[str, PreviewPacket] = {}
     window_names: set[str] = set()
     snapshot_count = 0
+    next_terminal_status_mono = time.monotonic()
 
     try:
         while any(thread.is_alive() for thread in threads):
@@ -2128,6 +2244,19 @@ def monitor_recording_threads(
                 if newest is not None:
                     latest[label] = newest
                     updated_labels.add(label)
+
+            now_mono = time.monotonic()
+            if terminal_interval_s > 0 and now_mono >= next_terminal_status_mono:
+                log_recording_heartbeat(
+                    clip_index=clip_index,
+                    total_clips=total_clips,
+                    planned_start_mono_ns=planned_start_mono_ns,
+                    planned_stop_mono_ns=planned_stop_mono_ns,
+                    session_start_mono_ns=session_start_mono_ns,
+                    planned_session_duration_s=planned_session_duration_s,
+                    planned_finish_utc=planned_finish_utc,
+                )
+                next_terminal_status_mono = now_mono + terminal_interval_s
 
             key = -1
             if preview_active_event.is_set() and (latest or window_names):
@@ -2198,9 +2327,13 @@ def create_preview_frame(binding: CameraBinding, timeout_ms: int = 3000) -> np.n
 def record_one_camera(
     binding: CameraBinding,
     clip_index: int,
+    total_clips: int,
     clip_start_utc: dt.datetime,
     planned_start_mono_ns: int,
     planned_stop_mono_ns: int,
+    session_start_mono_ns: int,
+    planned_session_duration_s: float,
+    planned_finish_utc: dt.datetime,
     clip_dir: Path,
     ffmpeg: str,
     encoding_cfg: dict[str, Any],
@@ -2375,11 +2508,15 @@ def record_one_camera(
                             PreviewPacket(
                                 label=label,
                                 clip_index=clip_index,
+                                total_clips=total_clips,
                                 frame_index=frame_count - 1,
                                 frame=monitor_frame,
                                 host_monotonic_ns=host_mono_ns,
                                 elapsed_s=max(0.0, (host_mono_ns - planned_start_mono_ns) / 1e9),
                                 planned_duration_s=(planned_stop_mono_ns - planned_start_mono_ns) / 1e9,
+                                session_elapsed_s=max(0.0, (host_mono_ns - session_start_mono_ns) / 1e9),
+                                planned_session_duration_s=planned_session_duration_s,
+                                planned_finish_utc=planned_finish_utc,
                                 measured_receive_fps=measured_preview_fps,
                             ),
                         )
@@ -2651,6 +2788,55 @@ def validate_schedule(schedule: dict[str, Any]) -> tuple[float, float, Optional[
     return clip_duration_s, interval_s, total_duration_s, number_of_clips
 
 
+def expected_clip_count(
+    *,
+    interval_s: float,
+    total_duration_s: Optional[float],
+    number_of_clips: Optional[int],
+) -> int:
+    """Return the effective number of clips allowed by the configured schedule."""
+
+    limits: list[int] = []
+    if number_of_clips is not None:
+        limits.append(number_of_clips)
+    if total_duration_s is not None:
+        limits.append(max(1, math.ceil(total_duration_s / interval_s)))
+    if not limits:
+        raise ValueError("At least one schedule limit is required")
+    return min(limits)
+
+
+def planned_session_span_s(
+    *,
+    clip_count: int,
+    clip_duration_s: float,
+    interval_s: float,
+) -> float:
+    """Return the planned session wall-clock span from first start to final planned end."""
+
+    if clip_count <= 0:
+        return 0.0
+    return ((clip_count - 1) * interval_s) + clip_duration_s
+
+
+def format_local_finish_time(
+    finish_utc: dt.datetime,
+    *,
+    now_utc: Optional[dt.datetime] = None,
+) -> str:
+    """Format an approximate finish time in the computer's local timezone."""
+
+    if finish_utc.tzinfo is None:
+        raise ValueError("finish_utc must be timezone-aware")
+
+    reference_utc = now_utc or utc_now()
+    local_finish = finish_utc.astimezone()
+    local_now = reference_utc.astimezone()
+    if local_finish.date() == local_now.date():
+        return local_finish.strftime("%H:%M")
+    return local_finish.strftime("%Y-%m-%d %H:%M")
+
+
 def write_session_manifest(
     session_dir: Path,
     config_path: Path,
@@ -2658,6 +2844,7 @@ def write_session_manifest(
     bindings: list[CameraBinding],
     ffmpeg: str,
     *,
+    recording_plan: Optional[dict[str, Any]] = None,
     session_name: str,
     session_start_utc: dt.datetime,
 ) -> None:
@@ -2688,6 +2875,8 @@ def write_session_manifest(
             for binding in bindings
         ],
     }
+    if recording_plan is not None:
+        manifest["recording_plan"] = recording_plan
     write_json(session_dir / "session_manifest.json", manifest)
     shutil.copy2(config_path, session_dir / "config_used.yaml")
 
@@ -2696,6 +2885,7 @@ def write_session_summary(
     session_dir: Path,
     completed_clips: int,
     requested_clips: Optional[int],
+    planned_session_span_s: Optional[float],
     stopped_by_signal: bool,
     any_failure: bool,
     unexpected_exception: Optional[str],
@@ -2704,6 +2894,7 @@ def write_session_summary(
     summary = {
         "completed_clips": completed_clips,
         "requested_clips": requested_clips,
+        "planned_session_span_s": planned_session_span_s,
         "stopped_by_signal": stopped_by_signal,
         "any_failure": any_failure,
         "finished_utc": utc_now().isoformat(),
@@ -2717,9 +2908,30 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     schedule = dict(config.get("schedule") or {})
     clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
     system_settings = parse_system_settings(config)
+    status_settings = parse_status_settings(config)
     preview_settings = parse_recording_preview_settings(config)
     archive_settings = parse_archive_settings(config)
-    requested_clips = number_of_clips
+    total_clips = expected_clip_count(
+        interval_s=interval_s,
+        total_duration_s=total_duration_s,
+        number_of_clips=number_of_clips,
+    )
+    planned_session_duration_s = planned_session_span_s(
+        clip_count=total_clips,
+        clip_duration_s=clip_duration_s,
+        interval_s=interval_s,
+    )
+    schedule_start_utc = utc_now()
+    planned_finish_utc = schedule_start_utc + dt.timedelta(seconds=planned_session_duration_s)
+    recording_plan = {
+        "expected_clips": total_clips,
+        "clip_duration_s": clip_duration_s,
+        "interval_s": interval_s,
+        "planned_session_span_s": planned_session_duration_s,
+        "schedule_start_utc": schedule_start_utc.isoformat(),
+        "planned_finish_utc": planned_finish_utc.isoformat(),
+    }
+    requested_clips = total_clips
 
     project = sanitize_token(str(config.get("project", "caterpillar")))
     subject = sanitize_token(str(config.get("subject", "cohort")))
@@ -2748,6 +2960,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     LOG.info(
         "System: prevent_sleep_during_recording=%s",
         system_settings.prevent_sleep_during_recording,
+    )
+    LOG.info(
+        "Recording plan: clips=%d planned_span=%s planned_finish_local=%s",
+        total_clips,
+        format_clock_duration(planned_session_duration_s),
+        format_local_finish_time(planned_finish_utc, now_utc=schedule_start_utc),
     )
 
     archive_preflight: Optional[ArchivePreflightResult] = None
@@ -2791,10 +3009,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 "interval_s": interval_s,
                 "total_duration_s": total_duration_s,
                 "number_of_clips": number_of_clips,
+                "status": dataclasses.asdict(status_settings),
                 "system": dataclasses.asdict(system_settings),
                 "recording_preview": dataclasses.asdict(preview_settings),
                 "archive": dataclasses.asdict(archive_settings),
                 "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
+                "recording_plan": recording_plan,
             },
         )
         LOG.info("Dry run completed; no cameras were opened.")
@@ -2857,6 +3077,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 config,
                 bindings,
                 ffmpeg,
+                recording_plan=recording_plan,
                 session_name=session_name,
                 session_start_utc=session_start_utc,
             )
@@ -2966,10 +3187,31 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     break
 
                 target_start_mono_ns = session_start_mono_ns + round(scheduled_offset_s * 1e9)
+                next_wait_status_mono = time.monotonic()
                 while not recording_stop_event.is_set():
                     remaining_s = (target_start_mono_ns - time.monotonic_ns()) / 1e9
                     if remaining_s <= 0:
                         break
+                    now_mono = time.monotonic()
+                    if (
+                        status_settings.terminal_interval_s > 0
+                        and now_mono >= next_wait_status_mono
+                        and remaining_s > 2.0
+                    ):
+                        session_elapsed_s = max(
+                            0.0,
+                            (time.monotonic_ns() - session_start_mono_ns) / 1e9,
+                        )
+                        LOG.info(
+                            "STATUS | waiting for clip %d/%d | starts in %s | session %s/%s | finish ~%s local",
+                            clip_index + 1,
+                            total_clips,
+                            format_clock_duration(remaining_s),
+                            format_clock_duration(session_elapsed_s),
+                            format_clock_duration(planned_session_duration_s),
+                            format_local_finish_time(planned_finish_utc),
+                        )
+                        next_wait_status_mono = now_mono + status_settings.terminal_interval_s
                     time.sleep(min(remaining_s, 1.0))
                 if recording_stop_event.is_set():
                     break
@@ -3007,9 +3249,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         kwargs={
                             "binding": binding,
                             "clip_index": clip_index,
+                            "total_clips": total_clips,
                             "clip_start_utc": clip_start_utc,
                             "planned_start_mono_ns": planned_start_mono_ns,
                             "planned_stop_mono_ns": planned_stop_mono_ns,
+                            "session_start_mono_ns": session_start_mono_ns,
+                            "planned_session_duration_s": planned_session_duration_s,
+                            "planned_finish_utc": planned_finish_utc,
                             "clip_dir": clip_dir,
                             "ffmpeg": ffmpeg,
                             "encoding_cfg": encoding_cfg,
@@ -3039,6 +3285,14 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     preview_settings=preview_settings,
                     preview_active_event=preview_active_event,
                     clip_dir=clip_dir,
+                    clip_index=clip_index,
+                    total_clips=total_clips,
+                    planned_start_mono_ns=planned_start_mono_ns,
+                    planned_stop_mono_ns=planned_stop_mono_ns,
+                    session_start_mono_ns=session_start_mono_ns,
+                    planned_session_duration_s=planned_session_duration_s,
+                    planned_finish_utc=planned_finish_utc,
+                    terminal_interval_s=status_settings.terminal_interval_s,
                 )
 
                 clip_results: list[ClipResult] = []
@@ -3179,6 +3433,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 session_dir=session_dir,
                 completed_clips=completed_clips,
                 requested_clips=requested_clips,
+                planned_session_span_s=planned_session_duration_s,
                 stopped_by_signal=stopped_by_signal,
                 any_failure=any_failure,
                 unexpected_exception=unexpected_exception,

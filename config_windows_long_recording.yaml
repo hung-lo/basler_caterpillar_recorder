@@ -32,6 +32,9 @@ ffmpeg: null
 system:
   prevent_sleep_during_recording: true
 
+status:
+  terminal_interval_s: 60
+
 archive:
   enabled: true
 

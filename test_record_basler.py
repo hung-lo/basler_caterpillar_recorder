@@ -245,5 +245,55 @@ class PreviewResizeTests(unittest.TestCase):
         self.assertEqual(resized.shape[:2], (375, 600))
 
 
+class RecordingPlanTests(unittest.TestCase):
+    def test_expected_clip_count_uses_number_of_clips(self) -> None:
+        self.assertEqual(
+            record_basler.expected_clip_count(
+                interval_s=600,
+                total_duration_s=None,
+                number_of_clips=30,
+            ),
+            30,
+        )
+
+    def test_expected_clip_count_uses_total_duration(self) -> None:
+        self.assertEqual(
+            record_basler.expected_clip_count(
+                interval_s=600,
+                total_duration_s=5 * 3600,
+                number_of_clips=None,
+            ),
+            30,
+        )
+
+    def test_expected_clip_count_uses_earlier_limit(self) -> None:
+        self.assertEqual(
+            record_basler.expected_clip_count(
+                interval_s=600,
+                total_duration_s=5 * 3600,
+                number_of_clips=20,
+            ),
+            20,
+        )
+
+    def test_planned_session_span(self) -> None:
+        self.assertEqual(
+            record_basler.planned_session_span_s(
+                clip_count=30,
+                clip_duration_s=600,
+                interval_s=600,
+            ),
+            18000.0,
+        )
+
+    def test_format_local_finish_time_same_day(self) -> None:
+        now = dt.datetime(2026, 8, 5, 12, 0, tzinfo=dt.timezone.utc)
+        finish = dt.datetime(2026, 8, 5, 17, 16, tzinfo=dt.timezone.utc)
+        self.assertEqual(
+            record_basler.format_local_finish_time(finish, now_utc=now),
+            finish.astimezone().strftime("%H:%M"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
