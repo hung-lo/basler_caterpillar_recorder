@@ -15,7 +15,7 @@
 #      and confirm archive validation passes.
 
 project: monarch_behavior_windows
-subject: cohort_C01-C08_10fps
+subject: cohort_C01-C08_1hr_test
 
 # Record each active clip to the internal SSD first.
 # Path.expanduser() converts ~ to the current Windows user profile.
