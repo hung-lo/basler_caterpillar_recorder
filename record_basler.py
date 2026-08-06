@@ -2001,7 +2001,7 @@ def draw_preview_status(
     preview: np.ndarray,
     *,
     label: str,
-    receive_fps: float,
+    receive_fps_text: str,
 ) -> None:
     _height, width = preview.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -2010,7 +2010,7 @@ def draw_preview_status(
 
     cv2.putText(
         preview,
-        f"{label} | {receive_fps:.1f} fps",
+        f"{label} | {receive_fps_text}",
         (10, 20),
         font,
         font_scale,
@@ -2028,6 +2028,23 @@ def draw_preview_status(
         thickness,
         cv2.LINE_AA,
     )
+
+
+def update_setup_preview_fps(
+    *,
+    now: float,
+    fps_window_start: Optional[float],
+    fps_window_frames: int,
+    displayed_fps: Optional[float],
+) -> tuple[Optional[float], Optional[float], int]:
+    if fps_window_start is None or now < fps_window_start or now - fps_window_start > 5.0:
+        return None, now, 1
+
+    fps_window_frames += 1
+    elapsed = now - fps_window_start
+    if elapsed >= 1.0:
+        return (fps_window_frames - 1) / elapsed, now, 1
+    return displayed_fps, fps_window_start, fps_window_frames
 
 
 def log_recording_heartbeat(
@@ -2549,8 +2566,9 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
         camera = binding.camera
         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        last_time = time.monotonic()
-        displayed_fps = 0.0
+        fps_window_start: Optional[float] = None
+        fps_window_frames = 0
+        displayed_fps: Optional[float] = None
         while camera.IsGrabbing():
             grab = camera.RetrieveResult(3000, pylon.TimeoutHandling_ThrowException)
             try:
@@ -2558,9 +2576,13 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
                     continue
                 frame = apply_frame_transform(binding.converter.Convert(grab).GetArray(), binding.requested)
                 now = time.monotonic()
-                instantaneous = 1.0 / max(now - last_time, 1e-9)
-                displayed_fps = 0.9 * displayed_fps + 0.1 * instantaneous if displayed_fps else instantaneous
-                last_time = now
+                displayed_fps, fps_window_start, fps_window_frames = update_setup_preview_fps(
+                    now=now,
+                    fps_window_start=fps_window_start,
+                    fps_window_frames=fps_window_frames,
+                    displayed_fps=displayed_fps,
+                )
+                fps_text = "measuring..." if displayed_fps is None else f"{displayed_fps:.1f} fps"
                 preview = resize_to_fit(
                     frame,
                     max_width=preview_max_width,
@@ -2570,7 +2592,7 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
                     draw_preview_status(
                         preview,
                         label=binding.label,
-                        receive_fps=displayed_fps,
+                        receive_fps_text=fps_text,
                     )
                 if not logged_preview_size:
                     LOG.info(

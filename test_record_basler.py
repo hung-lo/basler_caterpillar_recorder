@@ -276,6 +276,49 @@ class PreviewResizeTests(unittest.TestCase):
         self.assertEqual(resized.shape[:2], (375, 600))
 
 
+class SetupPreviewFpsTests(unittest.TestCase):
+    def test_setup_preview_fps_uses_a_window_and_recovers_after_pause(self) -> None:
+        displayed_fps, start, frames = record_basler.update_setup_preview_fps(
+            now=100.0,
+            fps_window_start=None,
+            fps_window_frames=0,
+            displayed_fps=None,
+        )
+        self.assertIsNone(displayed_fps)
+        self.assertEqual(start, 100.0)
+        self.assertEqual(frames, 1)
+
+        displayed_fps, start, frames = record_basler.update_setup_preview_fps(
+            now=100.4,
+            fps_window_start=start,
+            fps_window_frames=frames,
+            displayed_fps=displayed_fps,
+        )
+        self.assertIsNone(displayed_fps)
+        self.assertEqual(start, 100.0)
+        self.assertEqual(frames, 2)
+
+        displayed_fps, start, frames = record_basler.update_setup_preview_fps(
+            now=101.2,
+            fps_window_start=start,
+            fps_window_frames=frames,
+            displayed_fps=displayed_fps,
+        )
+        self.assertAlmostEqual(displayed_fps or 0.0, 1.7, places=1)
+        self.assertEqual(start, 101.2)
+        self.assertEqual(frames, 1)
+
+        displayed_fps, start, frames = record_basler.update_setup_preview_fps(
+            now=107.0,
+            fps_window_start=start,
+            fps_window_frames=frames,
+            displayed_fps=displayed_fps,
+        )
+        self.assertIsNone(displayed_fps)
+        self.assertEqual(start, 107.0)
+        self.assertEqual(frames, 1)
+
+
 class RecordingPreviewSettingsTests(unittest.TestCase):
     def test_default_layout_is_card_panel(self) -> None:
         settings = record_basler.parse_recording_preview_settings({})
