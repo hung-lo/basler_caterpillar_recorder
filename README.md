@@ -2,6 +2,8 @@
 
 This repository documents and drives the current one-camera recording workflow for the Basler `a2A1920-160ucBAS` camera with serial `40604036` and YAML label `camera1`.
 
+<img src="docs/images/recording_preview.png" alt="Recording preview window" width="760">
+
 The recorder supports:
 
 - setup preview that does not record;
@@ -371,7 +373,7 @@ recording_preview:
 
 The `card_panel` layout keeps the camera image unobstructed while showing clip and session progress, measured receive FPS, current exposure, estimated finish time, and recording status.
 
-![Recording preview window](docs/images/recording_preview.png)
+<img src="docs/images/recording_preview.png" alt="Recording preview window" width="760">
 
 During recording:
 
