@@ -162,6 +162,27 @@ def format_clock_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def format_preview_exposure(
+    exposure_us: Optional[float],
+    *,
+    auto_exposure: bool,
+    upper_us: Optional[float],
+) -> tuple[str, bool]:
+    if exposure_us is None:
+        return ("AUTO EXP --" if auto_exposure else "EXP --", False)
+
+    ms = exposure_us / 1000.0
+    near_limit = (
+        auto_exposure
+        and upper_us is not None
+        and upper_us > 0
+        and exposure_us >= 0.95 * upper_us
+    )
+    prefix = "AUTO EXP" if auto_exposure else "EXP"
+    suffix = "  MAX" if near_limit else ""
+    return f"{prefix} {ms:.1f} ms{suffix}", near_limit
+
+
 def sanitize_token(value: str) -> str:
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
     cleaned = "".join(ch if ch in allowed else "-" for ch in value.strip())
@@ -400,6 +421,14 @@ def read_setting(camera: Any, name: str) -> Any:
     return node_value(get_node(camera, name))
 
 
+def read_first_available_setting(camera: Any, names: Iterable[str]) -> Any:
+    for name in names:
+        value = read_setting(camera, name)
+        if value is not None:
+            return value
+    return None
+
+
 def enable_chunk_timestamp(camera: Any) -> bool:
     ok, _ = try_set(camera, "ChunkModeActive", True)
     if not ok:
@@ -547,6 +576,9 @@ class PreviewPacket:
     planned_session_duration_s: float
     planned_finish_utc: dt.datetime
     measured_receive_fps: Optional[float]
+    exposure_us: Optional[float] = None
+    auto_exposure: bool = False
+    auto_exposure_upper_us: Optional[float] = None
 
 
 def parse_system_settings(config: dict[str, Any]) -> SystemSettings:
@@ -2517,7 +2549,16 @@ def record_one_camera(
     label = binding.label
     camera = binding.camera
     requested_fps = float(binding.requested.get("fps", binding.fps))
-    actual_fps = float(binding.actual_settings.get("AcquisitionFrameRate") or requested_fps)
+    actual_fps_value = binding.actual_settings.get("AcquisitionFrameRate")
+    if actual_fps_value is None:
+        actual_fps_value = requested_fps
+    actual_fps = float(actual_fps_value)
+    requested_auto_exposure = bool(binding.requested.get("auto_exposure", False))
+    requested_auto_exposure_upper_us = (
+        float(binding.requested["auto_exposure_upper_us"])
+        if binding.requested.get("auto_exposure_upper_us") is not None
+        else None
+    )
     file_stem = sanitize_token(label)
     final_path = clip_dir / f"{file_stem}.mp4"
     temp_path = clip_dir / f"{file_stem}.capture.mkv"
@@ -2671,6 +2712,7 @@ def record_one_camera(
                 ):
                     try:
                         measured_preview_fps = None
+                        current_exposure_us: Optional[float] = None
                         if (
                             first_host_mono_ns is not None
                             and host_mono_ns > first_host_mono_ns
@@ -2679,6 +2721,15 @@ def record_one_camera(
                             measured_preview_fps = (frame_count - 1) / (
                                 (host_mono_ns - first_host_mono_ns) / 1e9
                             )
+                        try:
+                            current_exposure_us = read_first_available_setting(
+                                camera,
+                                ("ExposureTime", "ExposureTimeAbs"),
+                            )
+                            if current_exposure_us is not None:
+                                current_exposure_us = float(current_exposure_us)
+                        except Exception:
+                            current_exposure_us = None
                         monitor_frame = resize_to_fit(
                             frame,
                             max_width=preview_settings.max_width,
@@ -2699,6 +2750,9 @@ def record_one_camera(
                                 planned_session_duration_s=planned_session_duration_s,
                                 planned_finish_utc=planned_finish_utc,
                                 measured_receive_fps=measured_preview_fps,
+                                exposure_us=current_exposure_us,
+                                auto_exposure=requested_auto_exposure,
+                                auto_exposure_upper_us=requested_auto_exposure_upper_us,
                             ),
                         )
                         next_preview_mono_ns = host_mono_ns + preview_interval_ns
@@ -2950,17 +3004,26 @@ def preview_camera(config: dict[str, Any], label: str) -> int:
                     cv2.imwrite(str(path), frame)
                     LOG.info("Saved %s", path)
                 if key == ord("p"):
+                    exposure_value = read_first_available_setting(
+                        binding.camera,
+                        ("ExposureTime", "ExposureTimeAbs"),
+                    )
+                    gain_value = read_first_available_setting(binding.camera, ("Gain", "GainRaw"))
+                    fps_value = read_first_available_setting(
+                        binding.camera,
+                        ("AcquisitionFrameRate", "AcquisitionFrameRateAbs"),
+                    )
+                    resulting_fps_value = read_first_available_setting(
+                        binding.camera,
+                        ("ResultingFrameRate", "ResultingFrameRateAbs"),
+                    )
                     LOG.info(
                         "%s current settings: exposure_us=%r gain=%r fps=%r resulting_fps=%r",
                         binding.label,
-                        read_setting(binding.camera, "ExposureTime")
-                        or read_setting(binding.camera, "ExposureTimeAbs"),
-                        read_setting(binding.camera, "Gain")
-                        or read_setting(binding.camera, "GainRaw"),
-                        read_setting(binding.camera, "AcquisitionFrameRate")
-                        or read_setting(binding.camera, "AcquisitionFrameRateAbs"),
-                        read_setting(binding.camera, "ResultingFrameRate")
-                        or read_setting(binding.camera, "ResultingFrameRateAbs"),
+                        exposure_value,
+                        gain_value,
+                        fps_value,
+                        resulting_fps_value,
                     )
             finally:
                 grab.Release()
@@ -3360,13 +3423,26 @@ def _measure_recording_card_height(card_width: int, *, mode: str) -> int:
     status_height = _preview_text_line_height("RECORDING" if mode == "full" else "REC", scale=small_scale, font=font)
     clip_height = _preview_text_line_height("00:00 / 00:00", scale=value_scale, font=font)
     fps_height = _preview_text_line_height("0.00 fps", scale=small_scale, font=font)
+    exposure_height = _preview_text_line_height("AUTO EXP 180.0 ms  MAX", scale=small_scale, font=font)
     bar_height = 7
     top_pad = 16
     between_status_and_clip = 10
     between_clip_and_fps = 10
     bottom_pad = 13
     if mode == "full":
-        return top_pad + status_height + between_status_and_clip + clip_height + between_clip_and_fps + fps_height + 10 + bar_height + bottom_pad
+        return (
+            top_pad
+            + status_height
+            + between_status_and_clip
+            + clip_height
+            + between_clip_and_fps
+            + fps_height
+            + 4
+            + exposure_height
+            + 10
+            + bar_height
+            + bottom_pad
+        )
     return top_pad + status_height + between_status_and_clip + clip_height + 10 + bar_height + bottom_pad
 
 
@@ -3463,7 +3539,7 @@ def _calculate_card_panel_layout(
     session_compact_required = _measure_session_card_height(card_width, mode="compact")
     session_min_required = _measure_session_card_height(card_width, mode="minimal")
 
-    recording_card_height = min(118, max(108, int(round(image_height * 0.17))))
+    recording_card_height = min(132, max(120, int(round(image_height * 0.19))))
     recording_card_height = min(recording_card_height, max(0, available_panel_height))
     recording_card_height = max(recording_min_required, recording_card_height)
     recording_card_height = min(recording_card_height, max(0, available_panel_height))
@@ -3779,6 +3855,11 @@ def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
         if packet.measured_receive_fps is not None
         else "Starting"
     )
+    exposure_text, exposure_near_limit = format_preview_exposure(
+        packet.exposure_us,
+        auto_exposure=packet.auto_exposure,
+        upper_us=packet.auto_exposure_upper_us,
+    )
     if recording_mode != "minimal":
         fps_y = clip_value_y + clip_value_height + 10
         put_text(
@@ -3787,6 +3868,14 @@ def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
             fps_y,
             scale=small_scale,
             color=PREVIEW_SECONDARY_TEXT,
+        )
+        exposure_y = fps_y + _preview_text_line_height(fps_text, scale=small_scale, font=font) + 4
+        put_text(
+            exposure_text,
+            recording_x + inner_pad,
+            exposure_y,
+            scale=small_scale,
+            color=PREVIEW_AMBER if exposure_near_limit else PREVIEW_SECONDARY_TEXT,
         )
     clip_progress = 0.0
     if packet.planned_duration_s > 0:

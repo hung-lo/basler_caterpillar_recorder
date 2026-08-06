@@ -196,7 +196,7 @@ auto_exposure: true
 auto_exposure_mode: continuous
 auto_exposure_lower_us: 6000
 auto_exposure_upper_us: 180000
-auto_target_brightness: 0.59
+auto_target_brightness: 0.70
 auto_exposure_roi: full
 auto_gain: false
 ```
@@ -207,7 +207,7 @@ Keep these warnings in mind:
 - Keep `auto_gain: false` and `gain: 0` for this experiment.
 - `auto_exposure_upper_us` must stay below the frame period.
 - At 5 Hz, use `180000 us`, not the full `200000 us`.
-- `auto_target_brightness: 0.59` is an initial match to the reference image, not an exact guarantee.
+- `auto_target_brightness: 0.70` is the current empirically tuned target for the MBL dish/leaf scene, not an exact guarantee.
 - Run a blocked-light test before unattended recording.
 
 ## Schedule meaning
@@ -366,6 +366,12 @@ recording_preview:
   show_status: true
   layout: card_panel
 ```
+
+### Recording window
+
+The `card_panel` layout keeps the camera image unobstructed while showing clip and session progress, measured receive FPS, current exposure, estimated finish time, and recording status.
+
+![Recording preview window](docs/images/recording_preview.png)
 
 During recording:
 

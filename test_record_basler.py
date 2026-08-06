@@ -31,6 +31,9 @@ def make_preview_packet(
     planned_session_duration_s: float = 180.0,
     planned_finish_utc: dt.datetime | None = None,
     measured_receive_fps: float | None = 5.0,
+    exposure_us: float | None = None,
+    auto_exposure: bool = False,
+    auto_exposure_upper_us: float | None = None,
 ) -> record_basler.PreviewPacket:
     return record_basler.PreviewPacket(
         label=label,
@@ -46,6 +49,9 @@ def make_preview_packet(
         planned_finish_utc=planned_finish_utc
         or dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
         measured_receive_fps=measured_receive_fps,
+        exposure_us=exposure_us,
+        auto_exposure=auto_exposure,
+        auto_exposure_upper_us=auto_exposure_upper_us,
     )
 
 
@@ -588,6 +594,62 @@ class AutoExposureSettingsTests(unittest.TestCase):
         self.assertEqual(settings.mode_value, "Continuous")
 
 
+class PreviewExposureFormattingTests(unittest.TestCase):
+    def test_formats_manual_exposure_ms(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            6000,
+            auto_exposure=False,
+            upper_us=None,
+        )
+        self.assertEqual(text, "EXP 6.0 ms")
+        self.assertFalse(near_limit)
+
+    def test_formats_auto_exposure_ms(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            63400,
+            auto_exposure=True,
+            upper_us=180000,
+        )
+        self.assertEqual(text, "AUTO EXP 63.4 ms")
+        self.assertFalse(near_limit)
+
+    def test_marks_max_at_upper_limit(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            180000,
+            auto_exposure=True,
+            upper_us=180000,
+        )
+        self.assertEqual(text, "AUTO EXP 180.0 ms  MAX")
+        self.assertTrue(near_limit)
+
+    def test_marks_max_at_ninety_five_percent(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            171000,
+            auto_exposure=True,
+            upper_us=180000,
+        )
+        self.assertEqual(text, "AUTO EXP 171.0 ms  MAX")
+        self.assertTrue(near_limit)
+
+    def test_does_not_mark_max_below_threshold(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            160000,
+            auto_exposure=True,
+            upper_us=180000,
+        )
+        self.assertEqual(text, "AUTO EXP 160.0 ms")
+        self.assertFalse(near_limit)
+
+    def test_formats_missing_exposure_without_crashing(self) -> None:
+        text, near_limit = record_basler.format_preview_exposure(
+            None,
+            auto_exposure=True,
+            upper_us=180000,
+        )
+        self.assertEqual(text, "AUTO EXP --")
+        self.assertFalse(near_limit)
+
+
 class ConfigureCameraAutoExposureTests(unittest.TestCase):
     def test_modern_auto_exposure_nodes_are_configured_in_order(self) -> None:
         binding, log = configure_fake_camera(
@@ -951,6 +1013,18 @@ class RecordingPreviewTests(unittest.TestCase):
         preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
         np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
         self.assertFalse(np.array_equal(preview, frame))
+
+    def test_card_panel_handles_missing_exposure_without_error(self) -> None:
+        frame = np.zeros((720, 450, 3), dtype=np.uint8)
+        packet = make_preview_packet(
+            frame,
+            exposure_us=None,
+            auto_exposure=True,
+            auto_exposure_upper_us=180000.0,
+        )
+
+        preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
 
 
 class RecordingPlanTests(unittest.TestCase):
