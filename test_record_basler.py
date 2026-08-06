@@ -246,6 +246,14 @@ class PreviewResizeTests(unittest.TestCase):
 
 
 class RecordingPreviewTests(unittest.TestCase):
+    def test_card_panel_layout_stays_out_of_footer_and_compacts_when_needed(self) -> None:
+        layout = record_basler._calculate_card_panel_layout(260, 180, 42)
+
+        self.assertEqual(layout.footer_y, 180)
+        self.assertTrue(layout.compact_mode)
+        self.assertLessEqual(layout.recording_card[1] + layout.recording_card[3], 180 - 12)
+        self.assertLessEqual(layout.session_card[1] + layout.session_card[3], 180 - 12)
+
     def test_card_panel_adds_panel_and_preserves_camera_frame(self) -> None:
         frame = np.zeros((375, 600, 3), dtype=np.uint8)
         packet = record_basler.PreviewPacket(

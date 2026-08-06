@@ -2707,6 +2707,17 @@ PREVIEW_GREEN = (115, 210, 82)
 PREVIEW_AMBER = (77, 180, 240)
 
 
+@dataclasses.dataclass(frozen=True)
+class PreviewCardPanelLayout:
+    panel_x: int
+    panel_width: int
+    footer_y: int
+    footer_height: int
+    recording_card: tuple[int, int, int, int]
+    session_card: tuple[int, int, int, int]
+    compact_mode: bool
+
+
 def clamp_progress(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -2925,6 +2936,172 @@ def _ellipsize_preview_text(
     return best
 
 
+def _preview_card_scales(card_width: int, *, compact: bool) -> tuple[float, float, float]:
+    if card_width < 180:
+        if compact:
+            return 0.32, 0.34, 0.40
+        return 0.34, 0.36, 0.42
+    if compact:
+        return 0.34, 0.36, 0.42
+    return 0.38, 0.40, 0.46
+
+
+def _preview_text_line_height(
+    text: str,
+    *,
+    scale: float,
+    thickness: int = 1,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> int:
+    return _text_size(text, scale=scale, thickness=thickness, font=font)[1]
+
+
+def _preview_block_height(
+    lines: list[str],
+    *,
+    scale: float,
+    thickness: int = 1,
+    line_gap: int = 2,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> int:
+    if not lines:
+        return 0
+    height = 0
+    for index, line in enumerate(lines):
+        if index:
+            height += line_gap
+        height += _preview_text_line_height(line, scale=scale, thickness=thickness, font=font)
+    return height
+
+
+def _measure_preview_group_height(
+    title: str,
+    value_lines: list[str],
+    *,
+    title_scale: float,
+    value_scale: float,
+    compact: bool,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> int:
+    title_height = _preview_text_line_height(title, scale=title_scale, font=font)
+    value_height = _preview_block_height(value_lines, scale=value_scale, font=font)
+    if compact:
+        return title_height + 3 + value_height + 5
+    return title_height + 4 + value_height + 6
+
+
+def _measure_session_card_height(card_width: int, *, compact: bool) -> int:
+    label_scale, small_scale, value_scale = _preview_card_scales(card_width, compact=compact)
+    separator_gap = 12
+    block_gap = 8
+    current_height = 14
+
+    current_height += _measure_preview_group_height(
+        "SESSION",
+        ["00:00 / 00:00"],
+        title_scale=label_scale,
+        value_scale=value_scale,
+        compact=compact,
+    )
+    current_height += 7 + 10
+    current_height += separator_gap
+
+    current_height += _measure_preview_group_height(
+        "REMAINING",
+        ["00:00:00"],
+        title_scale=label_scale,
+        value_scale=value_scale,
+        compact=compact,
+    )
+    current_height += separator_gap
+
+    finish_lines = ["2026-08-06", "06:59"] if not compact else ["2026-08-06 06:59"]
+    current_height += _measure_preview_group_height(
+        "EST. FINISH",
+        finish_lines,
+        title_scale=label_scale,
+        value_scale=value_scale,
+        compact=compact,
+    )
+    current_height += separator_gap
+
+    current_height += _measure_preview_group_height(
+        "CLIP",
+        ["1 / 14"],
+        title_scale=label_scale,
+        value_scale=value_scale,
+        compact=compact,
+    )
+    if not compact:
+        current_height += separator_gap
+        current_height += _measure_preview_group_height(
+            "CAMERA",
+            ["camera1"],
+            title_scale=label_scale,
+            value_scale=value_scale,
+            compact=compact,
+        )
+
+    return current_height + block_gap
+
+
+def _calculate_card_panel_layout(
+    image_width: int,
+    image_height: int,
+    footer_height: int,
+) -> PreviewCardPanelLayout:
+    panel_width = int(round(image_width * 0.42))
+    panel_width = max(176, min(panel_width, 216))
+    panel_x = image_width
+    outer_padding = 12
+    gap = 10
+    panel_top = outer_padding
+    panel_bottom = image_height - outer_padding
+    available_panel_height = max(0, panel_bottom - panel_top)
+    card_x = panel_x + outer_padding
+    card_width = max(0, panel_width - (2 * outer_padding))
+
+    recording_card_height = min(118, max(108, int(round(image_height * 0.17))))
+    recording_card_height = min(recording_card_height, max(0, available_panel_height))
+    session_card_height = max(0, available_panel_height - gap - recording_card_height)
+
+    compact_required = _measure_session_card_height(card_width, compact=True)
+    full_required = _measure_session_card_height(card_width, compact=False)
+    compact_mode = False
+
+    if session_card_height >= full_required:
+        compact_mode = False
+    elif session_card_height >= compact_required:
+        compact_mode = True
+    else:
+        recording_card_height = max(72, available_panel_height - gap - compact_required)
+        recording_card_height = min(recording_card_height, max(0, available_panel_height))
+        session_card_height = max(0, available_panel_height - gap - recording_card_height)
+        compact_mode = True
+
+    recording_card = (
+        card_x,
+        panel_top,
+        card_width,
+        recording_card_height,
+    )
+    session_card = (
+        card_x,
+        panel_top + recording_card_height + gap,
+        card_width,
+        session_card_height,
+    )
+    return PreviewCardPanelLayout(
+        panel_x=panel_x,
+        panel_width=panel_width,
+        footer_y=image_height,
+        footer_height=footer_height,
+        recording_card=recording_card,
+        session_card=session_card,
+        compact_mode=compact_mode,
+    )
+
+
 def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSettings) -> np.ndarray:
     """Create a display-only copy with the configured recording status layout."""
 
@@ -3084,245 +3261,243 @@ def _draw_recording_preview_legacy(packet: PreviewPacket) -> np.ndarray:
 def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
     frame = packet.frame
     image_h, image_w = frame.shape[:2]
-
-    panel_width = int(round(image_w * 0.42))
-    panel_width = max(176, min(panel_width, 216))
     footer_height = 42 if image_w >= 360 else 38
+    layout = _calculate_card_panel_layout(image_w, image_h, footer_height)
+
     canvas_height = image_h + footer_height
-    canvas_width = image_w + panel_width
+    canvas_width = image_w + layout.panel_width
     canvas = np.full((canvas_height, canvas_width, 3), PREVIEW_PANEL_BACKGROUND, dtype=np.uint8)
     canvas[:image_h, :image_w] = frame
-    canvas[image_h:, :] = PREVIEW_FOOTER_BACKGROUND
-    cv2.line(canvas, (0, image_h), (canvas_width - 1, image_h), PREVIEW_CARD_BORDER, 1)
+    canvas[layout.footer_y:, :] = PREVIEW_FOOTER_BACKGROUND
+    cv2.line(canvas, (0, layout.footer_y), (canvas_width - 1, layout.footer_y), PREVIEW_CARD_BORDER, 1)
 
-    outer_padding = 12
-    gap = 10
-    radius = 9
-    card_x = image_w + outer_padding
-    card_width = max(0, panel_width - (2 * outer_padding))
-    panel_top = outer_padding
-    panel_bottom = image_h - footer_height - outer_padding
-    available_panel_height = max(0, panel_bottom - panel_top)
+    recording_x, recording_y, recording_w, recording_h = layout.recording_card
+    session_x, session_y, session_w, session_h = layout.session_card
+    outer_radius = 9
+    if recording_w > 0 and recording_h > 0:
+        _draw_filled_rounded_rect(
+            canvas,
+            x=recording_x,
+            y=recording_y,
+            width=recording_w,
+            height=recording_h,
+            radius=outer_radius,
+            fill_color=PREVIEW_CARD_FILL,
+            border_color=PREVIEW_CARD_BORDER,
+            border_width=1,
+        )
+    if session_w > 0 and session_h > 0:
+        _draw_filled_rounded_rect(
+            canvas,
+            x=session_x,
+            y=session_y,
+            width=session_w,
+            height=session_h,
+            radius=outer_radius,
+            fill_color=PREVIEW_CARD_FILL,
+            border_color=PREVIEW_CARD_BORDER,
+            border_width=1,
+        )
 
-    if card_width > 0 and available_panel_height > 0:
-        if available_panel_height <= 72:
-            card1_h = available_panel_height
-            card2_h = 0
-        else:
-            target_card1_h = min(104, max(88, int(round(image_h * 0.18))))
-            min_card2_h = 96
-            max_card1_h = max(72, available_panel_height - gap - min_card2_h)
-            card1_h = min(target_card1_h, max_card1_h, available_panel_height - gap)
-            card1_h = max(72, min(card1_h, available_panel_height - gap))
-            card2_h = max(0, available_panel_height - gap - card1_h)
-            if card2_h < 80 and available_panel_height >= 160:
-                card2_h = 80
-                card1_h = max(72, available_panel_height - gap - card2_h)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    compact = layout.compact_mode
+    label_scale, small_scale, value_scale = _preview_card_scales(recording_w, compact=compact)
+    large_scale = 0.52 if compact else 0.58
+    inner_pad = 13
 
-        if card1_h > 0:
-            _draw_filled_rounded_rect(
-                canvas,
-                x=card_x,
-                y=panel_top,
-                width=card_width,
-                height=card1_h,
-                radius=radius,
-                fill_color=PREVIEW_CARD_FILL,
-                border_color=PREVIEW_CARD_BORDER,
-                border_width=1,
-            )
-        card2_y = panel_top + card1_h + gap
-        if card2_h > 0:
-            _draw_filled_rounded_rect(
-                canvas,
-                x=card_x,
-                y=card2_y,
-                width=card_width,
-                height=card2_h,
-                radius=radius,
-                fill_color=PREVIEW_CARD_FILL,
-                border_color=PREVIEW_CARD_BORDER,
-                border_width=1,
-            )
+    def put_text(
+        text: str,
+        x: int,
+        y: int,
+        *,
+        scale: float,
+        color: tuple[int, int, int],
+        thickness: int = 1,
+    ) -> tuple[int, int, int]:
+        text_width, text_height, baseline = _text_size(
+            text,
+            scale=scale,
+            thickness=thickness,
+            font=font,
+        )
+        _put_preview_text(
+            canvas,
+            text,
+            (x, y + text_height),
+            scale=scale,
+            color=color,
+            thickness=thickness,
+            font=font,
+        )
+        return text_width, text_height, baseline
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        label_scale = 0.34 if card_width < 180 else 0.38
-        small_scale = 0.36 if card_width < 180 else 0.40
-        value_scale = 0.40 if card_width < 180 else 0.46
-        large_scale = 0.52 if card_width < 180 else 0.58
-        inner_pad = 13
+    # Recording card.
+    status_label = "RECORDING" if packet.measured_receive_fps is not None else "STARTING"
+    status_color = PREVIEW_RED if packet.measured_receive_fps is not None else PREVIEW_AMBER
+    status_row_y = recording_y + 16
+    cv2.circle(canvas, (recording_x + inner_pad + 5, status_row_y + 6), 5, status_color, -1)
+    put_text(
+        status_label,
+        recording_x + inner_pad + 16,
+        status_row_y,
+        scale=small_scale,
+        color=PREVIEW_PRIMARY_TEXT,
+    )
 
-        def draw_text_top_left(
-            text: str,
-            x: int,
-            y: int,
+    clip_elapsed_text = format_clock_duration(packet.elapsed_s)
+    clip_total_text = format_clock_duration(packet.planned_duration_s)
+    clip_value_text = f"{clip_elapsed_text} / {clip_total_text}"
+    clip_value_y = recording_y + 42
+    _clip_value_width, clip_value_height, _ = put_text(
+        clip_value_text,
+        recording_x + inner_pad,
+        clip_value_y,
+        scale=large_scale,
+        color=PREVIEW_PRIMARY_TEXT,
+    )
+    fps_text = (
+        f"{packet.measured_receive_fps:.2f} fps"
+        if packet.measured_receive_fps is not None
+        else "Starting"
+    )
+    fps_y = clip_value_y + clip_value_height + 10
+    put_text(
+        fps_text,
+        recording_x + inner_pad,
+        fps_y,
+        scale=small_scale,
+        color=PREVIEW_SECONDARY_TEXT,
+    )
+    clip_progress = 0.0
+    if packet.planned_duration_s > 0:
+        clip_progress = clamp_progress(packet.elapsed_s / packet.planned_duration_s)
+    bar_height = 7
+    bar_width = max(0, recording_w - (2 * inner_pad))
+    bar_y = recording_y + recording_h - inner_pad - bar_height
+    if bar_width > 0:
+        _draw_preview_progress_bar(
+            canvas,
+            x=recording_x + inner_pad,
+            y=bar_y,
+            width=bar_width,
+            height=bar_height,
+            progress=clip_progress,
+            track_color=PREVIEW_TRACK,
+            fill_color=PREVIEW_PURPLE,
+        )
+
+    # Session card.
+    if session_w > 0 and session_h > 0:
+        group_x = session_x + inner_pad
+        group_w = max(0, session_w - (2 * inner_pad))
+        current_y = session_y + 14
+
+        def draw_separator(y: int) -> None:
+            cv2.line(canvas, (group_x, y), (group_x + group_w, y), PREVIEW_CARD_BORDER, 1)
+
+        def draw_section(
+            title: str,
+            lines: list[str],
             *,
-            scale: float,
-            color: tuple[int, int, int],
-            thickness: int = 1,
-        ) -> tuple[int, int, int]:
-            text_width, text_height, baseline = _text_size(
-                text,
-                scale=scale,
-                thickness=thickness,
-                font=font,
-            )
-            _put_preview_text(
-                canvas,
-                text,
-                (x, y + text_height),
-                scale=scale,
-                color=color,
-                thickness=thickness,
-                font=font,
-            )
-            return text_width, text_height, baseline
-
-        # Card 1: recording status and clip progress.
-        status_label = "STARTING" if packet.measured_receive_fps is None else "RECORDING"
-        status_color = PREVIEW_AMBER if packet.measured_receive_fps is None else PREVIEW_RED
-        status_row_y = panel_top + 18
-        cv2.circle(canvas, (card_x + inner_pad + 5, status_row_y + 6), 5, status_color, -1)
-        draw_text_top_left(
-            status_label,
-            card_x + inner_pad + 16,
-            status_row_y,
-            scale=small_scale,
-            color=PREVIEW_PRIMARY_TEXT,
-        )
-
-        clip_elapsed_text = format_clock_duration(packet.elapsed_s)
-        clip_total_text = format_clock_duration(packet.planned_duration_s)
-        clip_value_text = f"{clip_elapsed_text} / {clip_total_text}"
-        clip_value_y = panel_top + 44
-        clip_value_width, clip_value_height, _ = draw_text_top_left(
-            clip_value_text,
-            card_x + inner_pad,
-            clip_value_y,
-            scale=large_scale,
-            color=PREVIEW_PRIMARY_TEXT,
-        )
-
-        fps_text = (
-            f"{packet.measured_receive_fps:.2f} fps"
-            if packet.measured_receive_fps is not None
-            else "Starting"
-        )
-        fps_y = clip_value_y + clip_value_height + 10
-        draw_text_top_left(
-            fps_text,
-            card_x + inner_pad,
-            fps_y,
-            scale=small_scale,
-            color=PREVIEW_SECONDARY_TEXT,
-        )
-
-        clip_progress = 0.0
-        if packet.planned_duration_s > 0:
-            clip_progress = clamp_progress(packet.elapsed_s / packet.planned_duration_s)
-        bar_height = 7
-        bar_width = max(0, card_width - (2 * inner_pad))
-        bar_y = panel_top + card1_h - inner_pad - bar_height
-        if bar_width > 0:
-            draw_text_top_left(
-                "CLIP",
-                card_x + inner_pad,
-                max(panel_top + 12, bar_y - 10),
-                scale=0.30,
+            title_scale: float,
+            value_scale_local: float,
+            after_gap: int,
+        ) -> None:
+            nonlocal current_y
+            title_h = _preview_text_line_height(title, scale=title_scale, font=font)
+            put_text(
+                title,
+                group_x,
+                current_y,
+                scale=title_scale,
                 color=PREVIEW_SECONDARY_TEXT,
             )
-            _draw_preview_progress_bar(
-                canvas,
-                x=card_x + inner_pad,
-                y=bar_y,
-                width=bar_width,
-                height=bar_height,
-                progress=clip_progress,
-                track_color=PREVIEW_TRACK,
-                fill_color=PREVIEW_PURPLE,
-            )
-
-        # Card 2: session details.
-        card2_y = panel_top + card1_h + gap
-        if card2_h > 0:
-            group_x = card_x + inner_pad
-            group_w = max(0, card_width - (2 * inner_pad))
-            current_y = card2_y + 14
-
-            def draw_separator(y: int) -> None:
-                cv2.line(canvas, (group_x, y), (group_x + group_w, y), PREVIEW_CARD_BORDER, 1)
-
-            def draw_group(
-                title: str,
-                value: str,
-                *,
-                scale: float = value_scale,
-                color: tuple[int, int, int] = PREVIEW_PRIMARY_TEXT,
-                value_lines: int = 1,
-            ) -> None:
-                nonlocal current_y
-                draw_text_top_left(
-                    title,
+            current_y += title_h + 4
+            for index, line in enumerate(lines):
+                line_h = _preview_text_line_height(line, scale=value_scale_local, font=font)
+                put_text(
+                    line,
                     group_x,
                     current_y,
-                    scale=label_scale,
-                    color=PREVIEW_SECONDARY_TEXT,
+                    scale=value_scale_local,
+                    color=PREVIEW_PRIMARY_TEXT,
                 )
-                current_y += _text_size(title, scale=label_scale, thickness=1, font=font)[1] + 4
-                lines = value.split("\n") if value_lines > 1 else [value]
-                for line in lines:
-                    draw_text_top_left(
-                        line,
-                        group_x,
-                        current_y,
-                        scale=scale,
-                        color=color,
-                    )
-                    current_y += _text_size(line, scale=scale, thickness=1, font=font)[1] + 2
-                current_y += 4
+                current_y += line_h
+                if index < len(lines) - 1:
+                    current_y += 2
+            current_y += after_gap
 
-            session_elapsed_text = format_clock_duration(packet.session_elapsed_s)
-            session_total_text = format_clock_duration(packet.planned_session_duration_s)
-            session_value_text = f"{session_elapsed_text} / {session_total_text}"
-            draw_group("SESSION", session_value_text)
-            session_progress = 0.0
-            if packet.planned_session_duration_s > 0:
-                session_progress = clamp_progress(
-                    packet.session_elapsed_s / packet.planned_session_duration_s
-                )
-            _draw_preview_progress_bar(
-                canvas,
-                x=group_x,
-                y=current_y,
-                width=group_w,
-                height=7,
-                progress=session_progress,
-                track_color=PREVIEW_TRACK,
-                fill_color=PREVIEW_GREEN,
+        session_value_text = (
+            f"{format_clock_duration(packet.session_elapsed_s)} / "
+            f"{format_clock_duration(packet.planned_session_duration_s)}"
+        )
+        draw_section(
+            "SESSION",
+            [session_value_text],
+            title_scale=label_scale,
+            value_scale_local=value_scale,
+            after_gap=4,
+        )
+        session_progress = 0.0
+        if packet.planned_session_duration_s > 0:
+            session_progress = clamp_progress(
+                packet.session_elapsed_s / packet.planned_session_duration_s
             )
-            current_y += 7 + 10
+        _draw_preview_progress_bar(
+            canvas,
+            x=group_x,
+            y=current_y,
+            width=group_w,
+            height=7,
+            progress=session_progress,
+            track_color=PREVIEW_TRACK,
+            fill_color=PREVIEW_PURPLE,
+        )
+        current_y += 7 + 10
+        draw_separator(current_y)
+        current_y += 12
+
+        remaining_text = format_clock_duration(
+            max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
+        )
+        draw_section(
+            "REMAINING",
+            [remaining_text],
+            title_scale=label_scale,
+            value_scale_local=value_scale,
+            after_gap=4,
+        )
+        draw_separator(current_y)
+        current_y += 12
+
+        finish_text = format_local_finish_time(packet.planned_finish_utc)
+        if compact:
+            finish_lines = [finish_text]
+        elif " " in finish_text:
+            finish_lines = finish_text.rsplit(" ", 1)
+        else:
+            finish_lines = [finish_text]
+        draw_section(
+            "EST. FINISH",
+            finish_lines,
+            title_scale=label_scale,
+            value_scale_local=value_scale,
+            after_gap=4,
+        )
+        draw_separator(current_y)
+        current_y += 12
+
+        clip_display = f"{packet.clip_index + 1} / {packet.total_clips}"
+        draw_section(
+            "CLIP",
+            [clip_display],
+            title_scale=label_scale,
+            value_scale_local=value_scale,
+            after_gap=4,
+        )
+        if not compact:
             draw_separator(current_y)
             current_y += 12
-
-            remaining_s = max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
-            draw_group("REMAINING", format_clock_duration(remaining_s))
-            draw_separator(current_y)
-            current_y += 12
-
-            finish_text = format_local_finish_time(packet.planned_finish_utc)
-            if " " in finish_text:
-                finish_date_text, finish_time_text = finish_text.rsplit(" ", 1)
-                draw_group("EST. FINISH", f"{finish_date_text}\n{finish_time_text}", value_lines=2)
-            else:
-                draw_group("EST. FINISH", finish_text)
-            draw_separator(current_y)
-            current_y += 12
-
-            clip_display = f"{packet.clip_index + 1} / {packet.total_clips}"
-            draw_group("CLIP", clip_display)
-            draw_separator(current_y)
-            current_y += 12
-
             camera_label = _ellipsize_preview_text(
                 packet.label,
                 max_width=group_w,
@@ -3330,30 +3505,35 @@ def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
                 font_scale=value_scale,
                 thickness=1,
             )
-            draw_group("CAMERA", camera_label)
+            draw_section(
+                "CAMERA",
+                [camera_label],
+                title_scale=label_scale,
+                value_scale_local=value_scale,
+                after_gap=4,
+            )
 
-    footer_y = image_h
     footer_status_text = "Recording active" if packet.measured_receive_fps is not None else "Starting"
-    footer_status_color = PREVIEW_RED if packet.measured_receive_fps is not None else PREVIEW_AMBER
+    footer_status_color = PREVIEW_GREEN if packet.measured_receive_fps is not None else PREVIEW_AMBER
     footer_text_scale = 0.34 if image_w < 480 else 0.38
     footer_secondary_scale = 0.30 if image_w < 480 else 0.34
-    cv2.circle(canvas, (16, footer_y + 14), 5, footer_status_color, -1)
+    cv2.circle(canvas, (16, layout.footer_y + 14), 5, footer_status_color, -1)
     _put_preview_text(
         canvas,
         footer_status_text,
-        (28, footer_y + 20),
+        (28, layout.footer_y + 20),
         scale=footer_text_scale,
         color=PREVIEW_PRIMARY_TEXT,
     )
 
     snapshot_text = "S snapshot"
     hide_text = "Q hide"
-    snapshot_width, snapshot_height, _ = _text_size(
+    snapshot_width, _snapshot_height, _ = _text_size(
         snapshot_text,
         scale=footer_secondary_scale,
         thickness=1,
     )
-    hide_width, hide_height, _ = _text_size(
+    hide_width, _hide_height, _ = _text_size(
         hide_text,
         scale=footer_secondary_scale,
         thickness=1,
@@ -3363,14 +3543,14 @@ def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
     _put_preview_text(
         canvas,
         snapshot_text,
-        (snapshot_x, footer_y + 20),
+        (snapshot_x, layout.footer_y + 20),
         scale=footer_secondary_scale,
         color=PREVIEW_SECONDARY_TEXT,
     )
     _put_preview_text(
         canvas,
         hide_text,
-        (hide_x, footer_y + 20),
+        (hide_x, layout.footer_y + 20),
         scale=footer_secondary_scale,
         color=PREVIEW_SECONDARY_TEXT,
     )
