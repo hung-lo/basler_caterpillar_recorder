@@ -365,6 +365,7 @@ class RecordingPreviewSettings:
     max_width: int = 640
     max_height: int = 720
     show_status: bool = True
+    layout: str = "card_panel"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -465,12 +466,17 @@ def parse_recording_preview_settings(config: dict[str, Any]) -> RecordingPreview
     if not isinstance(raw, dict):
         raise ValueError("recording_preview must be a mapping/object")
 
+    layout = str(raw.get("layout", "card_panel")).strip().lower() or "card_panel"
+    if layout not in {"card_panel", "legacy_overlay"}:
+        raise ValueError("recording_preview.layout must be one of: card_panel, legacy_overlay")
+
     settings = RecordingPreviewSettings(
         enabled=bool(raw.get("enabled", False)),
         fps=float(raw.get("fps", 1.0)),
         max_width=int(raw.get("max_width", 640)),
         max_height=int(raw.get("max_height", 720)),
         show_status=bool(raw.get("show_status", True)),
+        layout=layout,
     )
     if settings.fps <= 0:
         raise ValueError("recording_preview.fps must be positive")
@@ -1979,155 +1985,6 @@ class ArchiveManager:
                 self._queue.task_done()
 
 
-def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSettings) -> np.ndarray:
-    """Create a display-only copy with a compact recording status overlay."""
-
-    display = packet.frame.copy()
-    if not settings.show_status:
-        return display
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    status_font_scale = 0.40 if display.shape[1] < 500 else 0.48
-    controls_font_scale = 0.34
-    text_thickness = 1
-    controls_text = "q hide | s snapshot"
-    fps_text = (
-        f"{packet.measured_receive_fps:.2f} fps"
-        if packet.measured_receive_fps is not None
-        else "starting"
-    )
-    clip_number = packet.clip_index + 1
-    clip_elapsed_text = format_clock_duration(packet.elapsed_s)
-    clip_total_text = format_clock_duration(packet.planned_duration_s)
-    session_elapsed_text = format_clock_duration(packet.session_elapsed_s)
-    session_total_text = format_clock_duration(packet.planned_session_duration_s)
-    remaining_s = max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
-    remaining_text = format_clock_duration(remaining_s)
-    finish_text = format_local_finish_time(packet.planned_finish_utc)
-    clip_progress = 0.0
-    if packet.planned_duration_s > 0:
-        clip_progress = max(0.0, min(1.0, packet.elapsed_s / packet.planned_duration_s))
-    session_progress = 0.0
-    if packet.planned_session_duration_s > 0:
-        session_progress = max(
-            0.0,
-            min(1.0, packet.session_elapsed_s / packet.planned_session_duration_s),
-        )
-    lines = [
-        f"REC {packet.label} | clip {clip_number}/{packet.total_clips}",
-        f"clip {clip_elapsed_text}/{clip_total_text} | {fps_text}",
-        f"session {session_elapsed_text}/{session_total_text}",
-        f"remaining ~{remaining_text} | finish ~{finish_text}",
-    ]
-    (controls_width, _), _ = cv2.getTextSize(
-        controls_text,
-        font,
-        controls_font_scale,
-        text_thickness,
-    )
-
-    overlay = display.copy()
-    panel_height = 116
-    cv2.rectangle(
-        overlay,
-        (0, 0),
-        (display.shape[1], panel_height),
-        (24, 24, 24),
-        -1,
-    )
-    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
-
-    first_line_y = 20
-    line_spacing = 21
-    y = first_line_y
-    for line in lines:
-        cv2.putText(
-            display,
-            line,
-            (12, y),
-            font,
-            status_font_scale,
-            (255, 255, 255),
-            text_thickness,
-            cv2.LINE_AA,
-        )
-        y += line_spacing
-
-    controls_x = max(12, display.shape[1] - controls_width - 12)
-    cv2.putText(
-        display,
-        controls_text,
-        (controls_x, panel_height - 14),
-        font,
-        controls_font_scale,
-        (235, 235, 235),
-        text_thickness,
-        cv2.LINE_AA,
-    )
-
-    bar_left = 12
-    bar_top = 92
-    bar_width = max(60, display.shape[1] - 24)
-    bar_height = 6
-    gap = 10
-
-    cv2.putText(
-        display,
-        "clip",
-        (bar_left, bar_top - 4),
-        font,
-        0.28,
-        (225, 225, 225),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.rectangle(
-        display,
-        (bar_left, bar_top),
-        (bar_left + bar_width, bar_top + bar_height),
-        (82, 82, 82),
-        -1,
-    )
-    filled_width = int(round(bar_width * clip_progress))
-    if filled_width > 0:
-        cv2.rectangle(
-            display,
-            (bar_left, bar_top),
-            (bar_left + filled_width, bar_top + bar_height),
-            (90, 190, 255),
-            -1,
-        )
-
-    session_bar_top = bar_top + bar_height + gap
-    cv2.putText(
-        display,
-        "all",
-        (bar_left, session_bar_top - 4),
-        font,
-        0.28,
-        (225, 225, 225),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.rectangle(
-        display,
-        (bar_left, session_bar_top),
-        (bar_left + bar_width, session_bar_top + bar_height),
-        (82, 82, 82),
-        -1,
-    )
-    session_filled_width = int(round(bar_width * session_progress))
-    if session_filled_width > 0:
-        cv2.rectangle(
-            display,
-            (bar_left, session_bar_top),
-            (bar_left + session_filled_width, session_bar_top + bar_height),
-            (100, 220, 140),
-            -1,
-        )
-    return display
-
-
 def destroy_preview_windows(window_names: Iterable[str]) -> None:
     for window_name in window_names:
         try:
@@ -2835,6 +2692,690 @@ def format_local_finish_time(
     if local_finish.date() == local_now.date():
         return local_finish.strftime("%H:%M")
     return local_finish.strftime("%Y-%m-%d %H:%M")
+
+
+PREVIEW_PANEL_BACKGROUND = (42, 27, 24)
+PREVIEW_FOOTER_BACKGROUND = (56, 36, 32)
+PREVIEW_CARD_FILL = (71, 48, 43)
+PREVIEW_CARD_BORDER = (106, 79, 72)
+PREVIEW_PRIMARY_TEXT = (250, 246, 244)
+PREVIEW_SECONDARY_TEXT = (198, 180, 173)
+PREVIEW_PURPLE = (255, 108, 155)
+PREVIEW_TRACK = (97, 74, 68)
+PREVIEW_RED = (94, 77, 255)
+PREVIEW_GREEN = (115, 210, 82)
+PREVIEW_AMBER = (77, 180, 240)
+
+
+def clamp_progress(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _text_size(
+    text: str,
+    *,
+    scale: float,
+    thickness: int,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> tuple[int, int, int]:
+    (width, height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    return width, height, baseline
+
+
+def _put_preview_text(
+    image: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    *,
+    scale: float,
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> None:
+    cv2.putText(image, text, origin, font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _draw_solid_rounded_rect(
+    image: np.ndarray,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    radius: int,
+    color: tuple[int, int, int],
+) -> None:
+    if width <= 0 or height <= 0:
+        return
+
+    image_h, image_w = image.shape[:2]
+    if image_w <= 0 or image_h <= 0:
+        return
+
+    x = max(0, min(x, image_w - 1))
+    y = max(0, min(y, image_h - 1))
+    width = min(width, image_w - x)
+    height = min(height, image_h - y)
+    if width <= 0 or height <= 0:
+        return
+
+    radius = max(0, min(radius, width // 2, height // 2))
+    x2 = x + width - 1
+    y2 = y + height - 1
+
+    if radius == 0:
+        cv2.rectangle(image, (x, y), (x2, y2), color, -1)
+        return
+
+    cv2.rectangle(image, (x + radius, y), (x2 - radius, y2), color, -1)
+    cv2.rectangle(image, (x, y + radius), (x2, y2 - radius), color, -1)
+    cv2.circle(image, (x + radius, y + radius), radius, color, -1)
+    cv2.circle(image, (x2 - radius, y + radius), radius, color, -1)
+    cv2.circle(image, (x + radius, y2 - radius), radius, color, -1)
+    cv2.circle(image, (x2 - radius, y2 - radius), radius, color, -1)
+
+
+def _draw_filled_rounded_rect(
+    image: np.ndarray,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    radius: int,
+    fill_color: tuple[int, int, int],
+    border_color: Optional[tuple[int, int, int]] = None,
+    border_width: int = 1,
+) -> None:
+    if border_color is not None and border_width > 0:
+        _draw_solid_rounded_rect(
+            image,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            radius=radius,
+            color=border_color,
+        )
+        inset_x = x + border_width
+        inset_y = y + border_width
+        inset_width = width - (2 * border_width)
+        inset_height = height - (2 * border_width)
+        if inset_width <= 0 or inset_height <= 0:
+            return
+        _draw_solid_rounded_rect(
+            image,
+            x=inset_x,
+            y=inset_y,
+            width=inset_width,
+            height=inset_height,
+            radius=max(0, radius - border_width),
+            color=fill_color,
+        )
+        return
+
+    _draw_solid_rounded_rect(
+        image,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        radius=radius,
+        color=fill_color,
+    )
+
+
+def _draw_preview_progress_bar(
+    image: np.ndarray,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    progress: float,
+    track_color: tuple[int, int, int],
+    fill_color: tuple[int, int, int],
+    border_color: Optional[tuple[int, int, int]] = None,
+) -> None:
+    if width <= 0 or height <= 0:
+        return
+
+    progress = clamp_progress(progress)
+    radius = max(0, min(height // 2, width // 2))
+    _draw_filled_rounded_rect(
+        image,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        radius=radius,
+        fill_color=track_color,
+        border_color=border_color,
+        border_width=1 if border_color is not None else 0,
+    )
+
+    inner_x = x + (1 if border_color is not None else 0)
+    inner_y = y + (1 if border_color is not None else 0)
+    inner_width = width - (2 if border_color is not None else 0)
+    inner_height = height - (2 if border_color is not None else 0)
+    if inner_width <= 0 or inner_height <= 0:
+        return
+
+    fill_width = int(round(inner_width * progress))
+    if fill_width <= 0:
+        return
+    _draw_solid_rounded_rect(
+        image,
+        x=inner_x,
+        y=inner_y,
+        width=fill_width,
+        height=inner_height,
+        radius=max(0, min(inner_height // 2, fill_width // 2)),
+        color=fill_color,
+    )
+
+
+def _ellipsize_preview_text(
+    text: str,
+    *,
+    max_width: int,
+    font: int,
+    font_scale: float,
+    thickness: int,
+) -> str:
+    if max_width <= 0:
+        return ""
+
+    text_width, _text_height, _baseline = _text_size(
+        text,
+        scale=font_scale,
+        thickness=thickness,
+        font=font,
+    )
+    if text_width <= max_width:
+        return text
+
+    ellipsis = "..."
+    ellipsis_width, _ellipsis_height, _ellipsis_baseline = _text_size(
+        ellipsis,
+        scale=font_scale,
+        thickness=thickness,
+        font=font,
+    )
+    if ellipsis_width > max_width:
+        return ""
+
+    low = 0
+    high = len(text)
+    best = ellipsis
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid].rstrip() + ellipsis
+        candidate_width, _candidate_height, _candidate_baseline = _text_size(
+            candidate,
+            scale=font_scale,
+            thickness=thickness,
+            font=font,
+        )
+        if candidate_width <= max_width:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def draw_recording_preview(packet: PreviewPacket, settings: RecordingPreviewSettings) -> np.ndarray:
+    """Create a display-only copy with the configured recording status layout."""
+
+    if not settings.show_status:
+        return packet.frame.copy()
+
+    if settings.layout == "legacy_overlay":
+        return _draw_recording_preview_legacy(packet)
+
+    return _draw_recording_preview_card_panel(packet)
+
+
+def _draw_recording_preview_legacy(packet: PreviewPacket) -> np.ndarray:
+    display = packet.frame.copy()
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    status_font_scale = 0.40 if display.shape[1] < 500 else 0.48
+    controls_font_scale = 0.34
+    text_thickness = 1
+    controls_text = "q hide | s snapshot"
+    fps_text = (
+        f"{packet.measured_receive_fps:.2f} fps"
+        if packet.measured_receive_fps is not None
+        else "starting"
+    )
+    clip_number = packet.clip_index + 1
+    clip_elapsed_text = format_clock_duration(packet.elapsed_s)
+    clip_total_text = format_clock_duration(packet.planned_duration_s)
+    session_elapsed_text = format_clock_duration(packet.session_elapsed_s)
+    session_total_text = format_clock_duration(packet.planned_session_duration_s)
+    remaining_s = max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
+    remaining_text = format_clock_duration(remaining_s)
+    finish_text = format_local_finish_time(packet.planned_finish_utc)
+    clip_progress = 0.0
+    if packet.planned_duration_s > 0:
+        clip_progress = clamp_progress(packet.elapsed_s / packet.planned_duration_s)
+    session_progress = 0.0
+    if packet.planned_session_duration_s > 0:
+        session_progress = clamp_progress(
+            packet.session_elapsed_s / packet.planned_session_duration_s
+        )
+    lines = [
+        f"REC {packet.label} | clip {clip_number}/{packet.total_clips}",
+        f"clip {clip_elapsed_text}/{clip_total_text} | {fps_text}",
+        f"session {session_elapsed_text}/{session_total_text}",
+        f"remaining ~{remaining_text} | finish ~{finish_text}",
+    ]
+    (controls_width, _), _ = cv2.getTextSize(
+        controls_text,
+        font,
+        controls_font_scale,
+        text_thickness,
+    )
+
+    overlay = display.copy()
+    panel_height = 116
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (display.shape[1], panel_height),
+        (24, 24, 24),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+
+    first_line_y = 20
+    line_spacing = 21
+    y = first_line_y
+    for line in lines:
+        cv2.putText(
+            display,
+            line,
+            (12, y),
+            font,
+            status_font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
+        y += line_spacing
+
+    controls_x = max(12, display.shape[1] - controls_width - 12)
+    cv2.putText(
+        display,
+        controls_text,
+        (controls_x, panel_height - 14),
+        font,
+        controls_font_scale,
+        (235, 235, 235),
+        text_thickness,
+        cv2.LINE_AA,
+    )
+
+    bar_left = 12
+    bar_top = 92
+    bar_width = max(60, display.shape[1] - 24)
+    bar_height = 6
+    gap = 10
+
+    cv2.putText(
+        display,
+        "clip",
+        (bar_left, bar_top - 4),
+        font,
+        0.28,
+        (225, 225, 225),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        display,
+        (bar_left, bar_top),
+        (bar_left + bar_width, bar_top + bar_height),
+        (82, 82, 82),
+        -1,
+    )
+    filled_width = int(round(bar_width * clip_progress))
+    if filled_width > 0:
+        cv2.rectangle(
+            display,
+            (bar_left, bar_top),
+            (bar_left + filled_width, bar_top + bar_height),
+            (90, 190, 255),
+            -1,
+        )
+
+    session_bar_top = bar_top + bar_height + gap
+    cv2.putText(
+        display,
+        "all",
+        (bar_left, session_bar_top - 4),
+        font,
+        0.28,
+        (225, 225, 225),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        display,
+        (bar_left, session_bar_top),
+        (bar_left + bar_width, session_bar_top + bar_height),
+        (82, 82, 82),
+        -1,
+    )
+    session_filled_width = int(round(bar_width * session_progress))
+    if session_filled_width > 0:
+        cv2.rectangle(
+            display,
+            (bar_left, session_bar_top),
+            (bar_left + session_filled_width, session_bar_top + bar_height),
+            (100, 220, 140),
+            -1,
+        )
+    return display
+
+
+def _draw_recording_preview_card_panel(packet: PreviewPacket) -> np.ndarray:
+    frame = packet.frame
+    image_h, image_w = frame.shape[:2]
+
+    panel_width = int(round(image_w * 0.42))
+    panel_width = max(176, min(panel_width, 216))
+    footer_height = 42 if image_w >= 360 else 38
+    canvas_height = image_h + footer_height
+    canvas_width = image_w + panel_width
+    canvas = np.full((canvas_height, canvas_width, 3), PREVIEW_PANEL_BACKGROUND, dtype=np.uint8)
+    canvas[:image_h, :image_w] = frame
+    canvas[image_h:, :] = PREVIEW_FOOTER_BACKGROUND
+    cv2.line(canvas, (0, image_h), (canvas_width - 1, image_h), PREVIEW_CARD_BORDER, 1)
+
+    outer_padding = 12
+    gap = 10
+    radius = 9
+    card_x = image_w + outer_padding
+    card_width = max(0, panel_width - (2 * outer_padding))
+    panel_top = outer_padding
+    panel_bottom = image_h - footer_height - outer_padding
+    available_panel_height = max(0, panel_bottom - panel_top)
+
+    if card_width > 0 and available_panel_height > 0:
+        if available_panel_height <= 72:
+            card1_h = available_panel_height
+            card2_h = 0
+        else:
+            target_card1_h = min(104, max(88, int(round(image_h * 0.18))))
+            min_card2_h = 96
+            max_card1_h = max(72, available_panel_height - gap - min_card2_h)
+            card1_h = min(target_card1_h, max_card1_h, available_panel_height - gap)
+            card1_h = max(72, min(card1_h, available_panel_height - gap))
+            card2_h = max(0, available_panel_height - gap - card1_h)
+            if card2_h < 80 and available_panel_height >= 160:
+                card2_h = 80
+                card1_h = max(72, available_panel_height - gap - card2_h)
+
+        if card1_h > 0:
+            _draw_filled_rounded_rect(
+                canvas,
+                x=card_x,
+                y=panel_top,
+                width=card_width,
+                height=card1_h,
+                radius=radius,
+                fill_color=PREVIEW_CARD_FILL,
+                border_color=PREVIEW_CARD_BORDER,
+                border_width=1,
+            )
+        card2_y = panel_top + card1_h + gap
+        if card2_h > 0:
+            _draw_filled_rounded_rect(
+                canvas,
+                x=card_x,
+                y=card2_y,
+                width=card_width,
+                height=card2_h,
+                radius=radius,
+                fill_color=PREVIEW_CARD_FILL,
+                border_color=PREVIEW_CARD_BORDER,
+                border_width=1,
+            )
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label_scale = 0.34 if card_width < 180 else 0.38
+        small_scale = 0.36 if card_width < 180 else 0.40
+        value_scale = 0.40 if card_width < 180 else 0.46
+        large_scale = 0.52 if card_width < 180 else 0.58
+        inner_pad = 13
+
+        def draw_text_top_left(
+            text: str,
+            x: int,
+            y: int,
+            *,
+            scale: float,
+            color: tuple[int, int, int],
+            thickness: int = 1,
+        ) -> tuple[int, int, int]:
+            text_width, text_height, baseline = _text_size(
+                text,
+                scale=scale,
+                thickness=thickness,
+                font=font,
+            )
+            _put_preview_text(
+                canvas,
+                text,
+                (x, y + text_height),
+                scale=scale,
+                color=color,
+                thickness=thickness,
+                font=font,
+            )
+            return text_width, text_height, baseline
+
+        # Card 1: recording status and clip progress.
+        status_label = "STARTING" if packet.measured_receive_fps is None else "RECORDING"
+        status_color = PREVIEW_AMBER if packet.measured_receive_fps is None else PREVIEW_RED
+        status_row_y = panel_top + 18
+        cv2.circle(canvas, (card_x + inner_pad + 5, status_row_y + 6), 5, status_color, -1)
+        draw_text_top_left(
+            status_label,
+            card_x + inner_pad + 16,
+            status_row_y,
+            scale=small_scale,
+            color=PREVIEW_PRIMARY_TEXT,
+        )
+
+        clip_elapsed_text = format_clock_duration(packet.elapsed_s)
+        clip_total_text = format_clock_duration(packet.planned_duration_s)
+        clip_value_text = f"{clip_elapsed_text} / {clip_total_text}"
+        clip_value_y = panel_top + 44
+        clip_value_width, clip_value_height, _ = draw_text_top_left(
+            clip_value_text,
+            card_x + inner_pad,
+            clip_value_y,
+            scale=large_scale,
+            color=PREVIEW_PRIMARY_TEXT,
+        )
+
+        fps_text = (
+            f"{packet.measured_receive_fps:.2f} fps"
+            if packet.measured_receive_fps is not None
+            else "Starting"
+        )
+        fps_y = clip_value_y + clip_value_height + 10
+        draw_text_top_left(
+            fps_text,
+            card_x + inner_pad,
+            fps_y,
+            scale=small_scale,
+            color=PREVIEW_SECONDARY_TEXT,
+        )
+
+        clip_progress = 0.0
+        if packet.planned_duration_s > 0:
+            clip_progress = clamp_progress(packet.elapsed_s / packet.planned_duration_s)
+        bar_height = 7
+        bar_width = max(0, card_width - (2 * inner_pad))
+        bar_y = panel_top + card1_h - inner_pad - bar_height
+        if bar_width > 0:
+            draw_text_top_left(
+                "CLIP",
+                card_x + inner_pad,
+                max(panel_top + 12, bar_y - 10),
+                scale=0.30,
+                color=PREVIEW_SECONDARY_TEXT,
+            )
+            _draw_preview_progress_bar(
+                canvas,
+                x=card_x + inner_pad,
+                y=bar_y,
+                width=bar_width,
+                height=bar_height,
+                progress=clip_progress,
+                track_color=PREVIEW_TRACK,
+                fill_color=PREVIEW_PURPLE,
+            )
+
+        # Card 2: session details.
+        card2_y = panel_top + card1_h + gap
+        if card2_h > 0:
+            group_x = card_x + inner_pad
+            group_w = max(0, card_width - (2 * inner_pad))
+            current_y = card2_y + 14
+
+            def draw_separator(y: int) -> None:
+                cv2.line(canvas, (group_x, y), (group_x + group_w, y), PREVIEW_CARD_BORDER, 1)
+
+            def draw_group(
+                title: str,
+                value: str,
+                *,
+                scale: float = value_scale,
+                color: tuple[int, int, int] = PREVIEW_PRIMARY_TEXT,
+                value_lines: int = 1,
+            ) -> None:
+                nonlocal current_y
+                draw_text_top_left(
+                    title,
+                    group_x,
+                    current_y,
+                    scale=label_scale,
+                    color=PREVIEW_SECONDARY_TEXT,
+                )
+                current_y += _text_size(title, scale=label_scale, thickness=1, font=font)[1] + 4
+                lines = value.split("\n") if value_lines > 1 else [value]
+                for line in lines:
+                    draw_text_top_left(
+                        line,
+                        group_x,
+                        current_y,
+                        scale=scale,
+                        color=color,
+                    )
+                    current_y += _text_size(line, scale=scale, thickness=1, font=font)[1] + 2
+                current_y += 4
+
+            session_elapsed_text = format_clock_duration(packet.session_elapsed_s)
+            session_total_text = format_clock_duration(packet.planned_session_duration_s)
+            session_value_text = f"{session_elapsed_text} / {session_total_text}"
+            draw_group("SESSION", session_value_text)
+            session_progress = 0.0
+            if packet.planned_session_duration_s > 0:
+                session_progress = clamp_progress(
+                    packet.session_elapsed_s / packet.planned_session_duration_s
+                )
+            _draw_preview_progress_bar(
+                canvas,
+                x=group_x,
+                y=current_y,
+                width=group_w,
+                height=7,
+                progress=session_progress,
+                track_color=PREVIEW_TRACK,
+                fill_color=PREVIEW_GREEN,
+            )
+            current_y += 7 + 10
+            draw_separator(current_y)
+            current_y += 12
+
+            remaining_s = max(0.0, packet.planned_session_duration_s - packet.session_elapsed_s)
+            draw_group("REMAINING", format_clock_duration(remaining_s))
+            draw_separator(current_y)
+            current_y += 12
+
+            finish_text = format_local_finish_time(packet.planned_finish_utc)
+            if " " in finish_text:
+                finish_date_text, finish_time_text = finish_text.rsplit(" ", 1)
+                draw_group("EST. FINISH", f"{finish_date_text}\n{finish_time_text}", value_lines=2)
+            else:
+                draw_group("EST. FINISH", finish_text)
+            draw_separator(current_y)
+            current_y += 12
+
+            clip_display = f"{packet.clip_index + 1} / {packet.total_clips}"
+            draw_group("CLIP", clip_display)
+            draw_separator(current_y)
+            current_y += 12
+
+            camera_label = _ellipsize_preview_text(
+                packet.label,
+                max_width=group_w,
+                font=font,
+                font_scale=value_scale,
+                thickness=1,
+            )
+            draw_group("CAMERA", camera_label)
+
+    footer_y = image_h
+    footer_status_text = "Recording active" if packet.measured_receive_fps is not None else "Starting"
+    footer_status_color = PREVIEW_RED if packet.measured_receive_fps is not None else PREVIEW_AMBER
+    footer_text_scale = 0.34 if image_w < 480 else 0.38
+    footer_secondary_scale = 0.30 if image_w < 480 else 0.34
+    cv2.circle(canvas, (16, footer_y + 14), 5, footer_status_color, -1)
+    _put_preview_text(
+        canvas,
+        footer_status_text,
+        (28, footer_y + 20),
+        scale=footer_text_scale,
+        color=PREVIEW_PRIMARY_TEXT,
+    )
+
+    snapshot_text = "S snapshot"
+    hide_text = "Q hide"
+    snapshot_width, snapshot_height, _ = _text_size(
+        snapshot_text,
+        scale=footer_secondary_scale,
+        thickness=1,
+    )
+    hide_width, hide_height, _ = _text_size(
+        hide_text,
+        scale=footer_secondary_scale,
+        thickness=1,
+    )
+    snapshot_x = canvas_width - 14 - snapshot_width
+    hide_x = snapshot_x - 18 - hide_width
+    _put_preview_text(
+        canvas,
+        snapshot_text,
+        (snapshot_x, footer_y + 20),
+        scale=footer_secondary_scale,
+        color=PREVIEW_SECONDARY_TEXT,
+    )
+    _put_preview_text(
+        canvas,
+        hide_text,
+        (hide_x, footer_y + 20),
+        scale=footer_secondary_scale,
+        color=PREVIEW_SECONDARY_TEXT,
+    )
+
+    return canvas
 
 
 def write_session_manifest(

@@ -245,6 +245,58 @@ class PreviewResizeTests(unittest.TestCase):
         self.assertEqual(resized.shape[:2], (375, 600))
 
 
+class RecordingPreviewTests(unittest.TestCase):
+    def test_card_panel_adds_panel_and_preserves_camera_frame(self) -> None:
+        frame = np.zeros((375, 600, 3), dtype=np.uint8)
+        packet = record_basler.PreviewPacket(
+            label="camera1",
+            clip_index=0,
+            total_clips=3,
+            frame_index=42,
+            frame=frame,
+            host_monotonic_ns=123456789,
+            elapsed_s=12.5,
+            planned_duration_s=60.0,
+            session_elapsed_s=12.5,
+            planned_session_duration_s=180.0,
+            planned_finish_utc=dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
+            measured_receive_fps=5.0,
+        )
+
+        preview = record_basler.draw_recording_preview(
+            packet,
+            record_basler.RecordingPreviewSettings(),
+        )
+
+        self.assertEqual(preview.shape, (417, 816, 3))
+        np.testing.assert_array_equal(preview[:375, :600], frame)
+
+    def test_legacy_overlay_keeps_original_shape(self) -> None:
+        frame = np.zeros((120, 220, 3), dtype=np.uint8)
+        packet = record_basler.PreviewPacket(
+            label="camera1",
+            clip_index=0,
+            total_clips=1,
+            frame_index=0,
+            frame=frame,
+            host_monotonic_ns=123456789,
+            elapsed_s=0.0,
+            planned_duration_s=10.0,
+            session_elapsed_s=0.0,
+            planned_session_duration_s=10.0,
+            planned_finish_utc=dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
+            measured_receive_fps=None,
+        )
+
+        preview = record_basler.draw_recording_preview(
+            packet,
+            record_basler.RecordingPreviewSettings(layout="legacy_overlay"),
+        )
+
+        self.assertEqual(preview.shape, frame.shape)
+        self.assertFalse(np.array_equal(preview, frame))
+
+
 class RecordingPlanTests(unittest.TestCase):
     def test_expected_clip_count_uses_number_of_clips(self) -> None:
         self.assertEqual(
