@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import logging
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,7 @@ from unittest import mock
 import numpy as np
 
 import record_basler
+import validate_session
 
 
 def make_preview_packet(
@@ -250,6 +252,77 @@ class JsonSerializationTests(unittest.TestCase):
                 PureWindowsPath("D:/Hung_MBL"),
             )
             self.assertFalse((path.parent / f".{path.name}.tmp").exists())
+
+
+class TimeFormattingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixed_eastern = dt.timezone(dt.timedelta(hours=-4))
+        self.utc_value = dt.datetime(2026, 8, 4, 14, 53, 1, 254000, tzinfo=dt.timezone.utc)
+
+    def test_isoformat_utc_uses_trailing_z(self) -> None:
+        self.assertEqual(
+            record_basler.isoformat_utc(self.utc_value),
+            "2026-08-04T14:53:01.254Z",
+        )
+
+    def test_isoformat_local_uses_numeric_offset(self) -> None:
+        with mock.patch.object(
+            record_basler,
+            "to_local",
+            side_effect=lambda value: value.astimezone(self.fixed_eastern),
+        ):
+            self.assertEqual(
+                record_basler.isoformat_local(self.utc_value),
+                "2026-08-04T10:53:01.254-04:00",
+            )
+
+    def test_filename_local_timestamp_is_filename_safe(self) -> None:
+        with mock.patch.object(
+            record_basler,
+            "to_local",
+            side_effect=lambda value: value.astimezone(self.fixed_eastern),
+        ):
+            self.assertEqual(
+                record_basler.filename_local_timestamp(self.utc_value),
+                "20260804_105301-0400",
+            )
+
+    def test_timestamp_pair_round_trips_same_instant(self) -> None:
+        with mock.patch.object(
+            record_basler,
+            "to_local",
+            side_effect=lambda value: value.astimezone(self.fixed_eastern),
+        ):
+            pair = record_basler.timestamp_pair(self.utc_value)
+
+        self.assertEqual(pair["utc"], "2026-08-04T14:53:01.254Z")
+        self.assertEqual(pair["local"], "2026-08-04T10:53:01.254-04:00")
+        self.assertEqual(
+            validate_session.parse_iso_datetime(pair["utc"]).astimezone(dt.timezone.utc),
+            validate_session.parse_iso_datetime(pair["local"]).astimezone(dt.timezone.utc),
+        )
+
+    def test_local_iso_formatter_uses_numeric_offset(self) -> None:
+        formatter = record_basler.LocalIsoFormatter("%(asctime)s | %(levelname)s | %(message)s")
+        record = logging.LogRecord(
+            name="basler_recorder",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="hello",
+            args=(),
+            exc_info=None,
+        )
+        record.created = self.utc_value.timestamp()
+        with mock.patch.object(
+            record_basler,
+            "to_local",
+            side_effect=lambda value: value.astimezone(self.fixed_eastern),
+        ):
+            self.assertEqual(
+                formatter.formatTime(record),
+                "2026-08-04T10:53:01.254-04:00",
+            )
 
 
 class PreviewResizeTests(unittest.TestCase):
@@ -534,6 +607,40 @@ class RecordingPlanTests(unittest.TestCase):
             record_basler.format_local_finish_time(finish, now_utc=now),
             finish.astimezone().strftime("%H:%M"),
         )
+
+
+class ValidatorTimestampTests(unittest.TestCase):
+    def test_validator_accepts_legacy_and_local_session_names(self) -> None:
+        self.assertEqual(
+            validate_session.detect_session_timestamp_naming("20260804_145301"),
+            "legacy",
+        )
+        self.assertEqual(
+            validate_session.detect_session_timestamp_naming("20260804_105301-0400"),
+            "local_with_offset",
+        )
+
+    def test_validator_accepts_legacy_and_local_clip_names(self) -> None:
+        self.assertEqual(
+            validate_session.detect_clip_timestamp_naming("clip_0000_145302"),
+            "legacy",
+        )
+        self.assertEqual(
+            validate_session.detect_clip_timestamp_naming("clip_0000_105302-0400"),
+            "local_with_offset",
+        )
+
+    def test_validator_rejects_invalid_timestamp_names(self) -> None:
+        self.assertIsNone(
+            validate_session.detect_session_timestamp_naming("20260804_105301_EDT")
+        )
+        self.assertIsNone(
+            validate_session.detect_clip_timestamp_naming("clip_0000_10:53:02-0400")
+        )
+
+    def test_parse_iso_datetime_requires_timezone(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timezone offset"):
+            validate_session.parse_iso_datetime("2026-08-04T10:53:01.254")
 
 
 if __name__ == "__main__":

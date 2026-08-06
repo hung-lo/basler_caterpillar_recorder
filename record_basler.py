@@ -53,16 +53,94 @@ def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def session_stamp_utc(value: dt.datetime) -> str:
-    """UTC session directory timestamp, sortable to one-second precision."""
+def local_now() -> dt.datetime:
+    """Return the current timezone-aware local datetime."""
 
-    return value.astimezone(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return utc_now().astimezone()
 
 
-def clip_clock_utc(value: dt.datetime) -> str:
-    """UTC clip clock time; the session directory already stores the date."""
+def to_local(value: dt.datetime) -> dt.datetime:
+    """Convert a timezone-aware datetime to the computer's local timezone."""
 
-    return value.astimezone(dt.timezone.utc).strftime("%H%M%S")
+    if value.tzinfo is None:
+        raise ValueError("Cannot convert a naive datetime to local time")
+    return value.astimezone()
+
+
+def isoformat_utc(
+    value: dt.datetime,
+    *,
+    timespec: str = "milliseconds",
+) -> str:
+    """Return an ISO-8601 UTC timestamp using a trailing Z."""
+
+    if value.tzinfo is None:
+        raise ValueError("UTC timestamp must be timezone-aware")
+    normalized = value.astimezone(dt.timezone.utc)
+    return normalized.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def isoformat_local(
+    value: dt.datetime,
+    *,
+    timespec: str = "milliseconds",
+) -> str:
+    """Return an ISO-8601 local timestamp with a numeric UTC offset."""
+
+    if value.tzinfo is None:
+        raise ValueError("Local timestamp must be timezone-aware")
+    return to_local(value).isoformat(timespec=timespec)
+
+
+def local_timezone_metadata(
+    reference_utc: Optional[dt.datetime] = None,
+) -> dict[str, Optional[str]]:
+    """Return best-effort local timezone metadata for the provided UTC instant."""
+
+    reference = reference_utc or utc_now()
+    if reference.tzinfo is None:
+        raise ValueError("reference_utc must be timezone-aware")
+
+    local_value = to_local(reference)
+    offset = local_value.utcoffset()
+    if offset is None:
+        offset_text: Optional[str] = None
+    else:
+        total_minutes = int(offset.total_seconds() // 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        absolute_minutes = abs(total_minutes)
+        hours, minutes = divmod(absolute_minutes, 60)
+        offset_text = f"{sign}{hours:02d}:{minutes:02d}"
+
+    return {
+        "local_timezone_label": local_value.tzname(),
+        "local_utc_offset": offset_text,
+    }
+
+
+def timestamp_pair(value: dt.datetime) -> dict[str, str]:
+    if value.tzinfo is None:
+        raise ValueError("timestamp_pair requires a timezone-aware datetime")
+    return {
+        "utc": isoformat_utc(value),
+        "local": isoformat_local(value),
+    }
+
+
+def filename_local_timestamp(value: dt.datetime) -> str:
+    """Return a filename-safe local timestamp with UTC offset."""
+
+    if value.tzinfo is None:
+        raise ValueError("Filename timestamp must be timezone-aware")
+    return to_local(value).strftime("%Y%m%d_%H%M%S%z")
+
+
+def clip_clock_local(value: dt.datetime) -> str:
+    """Return a clip-directory local timestamp with the active UTC offset."""
+
+    if value.tzinfo is None:
+        raise ValueError("Clip timestamp must be timezone-aware")
+    return to_local(value).strftime("%H%M%S%z")
 
 
 def snapshot_stamp_utc(value: dt.datetime) -> str:
@@ -72,7 +150,7 @@ def snapshot_stamp_utc(value: dt.datetime) -> str:
 
 
 def iso_utc_from_ns(value_ns: int) -> str:
-    return dt.datetime.fromtimestamp(value_ns / 1e9, tz=dt.timezone.utc).isoformat()
+    return isoformat_utc(dt.datetime.fromtimestamp(value_ns / 1e9, tz=dt.timezone.utc))
 
 
 def format_clock_duration(seconds: float) -> str:
@@ -142,13 +220,26 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
+class LocalIsoFormatter(logging.Formatter):
+    def formatTime(
+        self,
+        record: logging.LogRecord,
+        datefmt: Optional[str] = None,
+    ) -> str:
+        del datefmt
+        value_utc = dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc)
+        return isoformat_local(value_utc)
+
+
 def setup_logging(session_dir: Optional[Path], verbose: bool) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if session_dir is not None:
         handlers.append(logging.FileHandler(session_dir / "recorder.log", encoding="utf-8"))
+    formatter = LocalIsoFormatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
+    for handler in handlers:
+        handler.setFormatter(formatter)
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
         handlers=handlers,
         force=True,
     )
@@ -1478,7 +1569,9 @@ class ArchiveResult:
     success: bool
     bytes_transferred: Optional[int]
     started_utc: str
+    started_local: str
     completed_utc: Optional[str]
+    completed_local: Optional[str]
     copy_backend: str
     copy_return_code: Optional[int]
     copy_output_tail: Optional[str]
@@ -1638,6 +1731,7 @@ class ArchiveManager:
             copy_file_if_exists(self.local_session_dir / filename, self.archive_session_dir / filename)
 
     def _build_summary(self) -> dict[str, Any]:
+        completed_at = utc_now()
         return {
             "enabled": self.settings.enabled,
             "preflight": dataclasses.asdict(self.preflight),
@@ -1651,7 +1745,8 @@ class ArchiveManager:
             "failure_detected": self._failure,
             "failure_message": self._failure_message,
             "results": [dataclasses.asdict(result) for result in self._results],
-            "completed_utc": utc_now().isoformat(),
+            "completed_utc": isoformat_utc(completed_at),
+            "completed_local": isoformat_local(completed_at),
         }
 
     def _ensure_robocopy_partial_destination(self, destination: Path) -> None:
@@ -1774,12 +1869,15 @@ class ArchiveManager:
         return summary
 
     def _transfer_clip(self, clip_dir: Path) -> ArchiveResult:
-        started_utc = utc_now().isoformat()
+        started_at = utc_now()
+        started_utc = isoformat_utc(started_at)
+        started_local = isoformat_local(started_at)
         clip_name = clip_dir.name
         final_destination = self.archive_session_dir / clip_name
         partial_destination = self.incoming_dir / f"{clip_name}.partial"
         bytes_transferred: Optional[int] = None
         completed_utc: Optional[str] = None
+        completed_local: Optional[str] = None
         copy_return_code: Optional[int] = None
         copy_output_tail: Optional[str] = None
         verification_method = "sha256_manifest"
@@ -1901,7 +1999,9 @@ class ArchiveManager:
             self._mark_failure(error)
             LOG.exception("Archive failed for %s", clip_dir)
         else:
-            completed_utc = utc_now().isoformat()
+            completed_at = utc_now()
+            completed_utc = isoformat_utc(completed_at)
+            completed_local = isoformat_local(completed_at)
         finally:
             if success and verification_succeeded and not local_deleted and self.settings.delete_local_clip_after_verified_transfer:
                 try:
@@ -1926,7 +2026,9 @@ class ArchiveManager:
                 success=success,
                 bytes_transferred=bytes_transferred,
                 started_utc=started_utc,
+                started_local=started_local,
                 completed_utc=completed_utc,
+                completed_local=completed_local,
                 copy_backend=self.copy_backend,
                 copy_return_code=copy_return_code,
                 copy_output_tail=copy_output_tail,
@@ -1958,8 +2060,10 @@ class ArchiveManager:
                     destination_path=str(self.archive_session_dir / request.clip_dir.name) if request is not None else "",
                     success=False,
                     bytes_transferred=None,
-                    started_utc=utc_now().isoformat(),
+                    started_utc=isoformat_utc(utc_now()),
+                    started_local=isoformat_local(utc_now()),
                     completed_utc=None,
+                    completed_local=None,
                     copy_backend=self.copy_backend,
                     copy_return_code=None,
                     copy_output_tail=None,
@@ -2250,17 +2354,30 @@ def record_one_camera(
     next_preview_mono_ns = planned_start_mono_ns
     preview_publish_failed = False
     last_storage_check_ns = planned_start_mono_ns
+    clip_timezone = local_timezone_metadata(clip_start_utc)
 
     metadata: dict[str, Any] = {
         "camera": binding.info,
         "label": label,
         "clip_index": clip_index,
-        "planned_start_utc": clip_start_utc.isoformat(),
+        "planned_start_utc": isoformat_utc(clip_start_utc),
+        "planned_start_local": isoformat_local(clip_start_utc),
+        "planned_finish_utc": isoformat_utc(planned_finish_utc),
+        "planned_finish_local": isoformat_local(planned_finish_utc),
         "planned_duration_s": (planned_stop_mono_ns - planned_start_mono_ns) / 1e9,
         "requested_settings": binding.requested,
         "actual_settings": binding.actual_settings,
         "encoding": encoding_cfg,
         "recording_preview": dataclasses.asdict(preview_settings),
+        "timestamp_policy": {
+            "canonical_wall_clock": "UTC",
+            "human_display": "local_with_numeric_offset",
+            "duration_clock": "monotonic",
+            "local_timezone_label": clip_timezone["local_timezone_label"],
+            "local_utc_offset_at_start": clip_timezone["local_utc_offset"],
+        },
+        "local_timezone_label": clip_timezone["local_timezone_label"],
+        "local_utc_offset_at_clip_start": clip_timezone["local_utc_offset"],
         "video_path": str(final_path),
         "temporary_video_path": str(temp_path),
         "timestamps_path": str(timestamps_path),
@@ -2493,6 +2610,7 @@ def record_one_camera(
             actual_elapsed_s = max(0.0, (last_host_mono_ns - first_host_mono_ns) / 1e9)
             if actual_elapsed_s > 0 and frame_count > 1:
                 measured_fps = (frame_count - 1) / actual_elapsed_s
+        completed_at = utc_now()
 
         metadata.update(
             {
@@ -2504,17 +2622,40 @@ def record_one_camera(
                 "output_height": output_height,
                 "first_host_utc_ns": first_host_utc_ns,
                 "first_host_utc": iso_utc_from_ns(first_host_utc_ns) if first_host_utc_ns else None,
+                "first_host_local": (
+                    isoformat_local(dt.datetime.fromtimestamp(first_host_utc_ns / 1e9, tz=dt.timezone.utc))
+                    if first_host_utc_ns
+                    else None
+                ),
                 "last_host_utc_ns": last_host_utc_ns,
                 "last_host_utc": iso_utc_from_ns(last_host_utc_ns) if last_host_utc_ns else None,
+                "last_host_local": (
+                    isoformat_local(dt.datetime.fromtimestamp(last_host_utc_ns / 1e9, tz=dt.timezone.utc))
+                    if last_host_utc_ns
+                    else None
+                ),
                 "first_host_monotonic_ns": first_host_mono_ns,
                 "last_host_monotonic_ns": last_host_mono_ns,
+                "actual_start_utc": iso_utc_from_ns(first_host_utc_ns) if first_host_utc_ns else None,
+                "actual_start_local": (
+                    isoformat_local(dt.datetime.fromtimestamp(first_host_utc_ns / 1e9, tz=dt.timezone.utc))
+                    if first_host_utc_ns
+                    else None
+                ),
+                "actual_stop_utc": iso_utc_from_ns(last_host_utc_ns) if last_host_utc_ns else None,
+                "actual_stop_local": (
+                    isoformat_local(dt.datetime.fromtimestamp(last_host_utc_ns / 1e9, tz=dt.timezone.utc))
+                    if last_host_utc_ns
+                    else None
+                ),
                 "first_camera_timestamp": first_camera_timestamp,
                 "last_camera_timestamp": last_camera_timestamp,
                 "actual_elapsed_s": actual_elapsed_s,
                 "measured_receive_fps": measured_fps,
                 "ffmpeg_return_code": ffmpeg_return_code,
                 "mp4_remux_succeeded": remuxed,
-                "completed_utc": utc_now().isoformat(),
+                "completed_utc": isoformat_utc(completed_at),
+                "completed_local": isoformat_local(completed_at),
             }
         )
         write_json(metadata_path, metadata)
@@ -3666,21 +3807,36 @@ def write_session_manifest(
     session_name: str,
     session_start_utc: dt.datetime,
 ) -> None:
+    created_at = utc_now()
+    session_timezone = local_timezone_metadata(session_start_utc)
     manifest = {
-        "created_utc": utc_now().isoformat(),
+        "created_utc": isoformat_utc(created_at),
+        "created_local": isoformat_local(created_at),
         "session_name": session_name,
-        "session_start_utc": session_start_utc.isoformat(),
+        "session_start_utc": isoformat_utc(session_start_utc),
+        "session_start_local": isoformat_local(session_start_utc),
+        "local_timezone_label": session_timezone["local_timezone_label"],
+        "local_utc_offset_at_session_start": session_timezone["local_utc_offset"],
         "platform": sys.platform,
         "python": sys.version,
         "config_source": str(config_path.resolve()),
         "ffmpeg": ffmpeg,
         "naming": {
-            "version": 2,
-            "session_directory_format": "YYYYMMDD_HHMMSS",
-            "clip_directory_format": "clip_NNNN_HHMMSS",
+            "version": 3,
+            "session_directory_format": "YYYYMMDD_HHMMSS+ZZZZ (local time with numeric UTC offset)",
+            "clip_directory_format": "clip_NNNN_HHMMSS+ZZZZ (local time with numeric UTC offset)",
             "camera_file_stem": "camera label",
             "path_time_precision": "seconds",
             "scientific_timestamp_precision": "nanoseconds where available",
+        },
+        "timestamp_policy": {
+            "directory_naming": "local_time_with_numeric_utc_offset",
+            "log_display": "local_time_with_numeric_utc_offset",
+            "canonical_metadata_time": "UTC",
+            "human_display": "local_with_numeric_offset",
+            "duration_clock": "monotonic",
+            "local_timezone_label": session_timezone["local_timezone_label"],
+            "local_utc_offset_at_start": session_timezone["local_utc_offset"],
         },
         "config": config,
         "cameras": [
@@ -3709,13 +3865,15 @@ def write_session_summary(
     unexpected_exception: Optional[str],
     exit_status: str,
 ) -> None:
+    finished_at = utc_now()
     summary = {
         "completed_clips": completed_clips,
         "requested_clips": requested_clips,
         "planned_session_span_s": planned_session_span_s,
         "stopped_by_signal": stopped_by_signal,
         "any_failure": any_failure,
-        "finished_utc": utc_now().isoformat(),
+        "finished_utc": isoformat_utc(finished_at),
+        "finished_local": isoformat_local(finished_at),
         "exit_status": exit_status,
         "unexpected_exception": unexpected_exception,
     }
@@ -3741,13 +3899,23 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     )
     schedule_start_utc = utc_now()
     planned_finish_utc = schedule_start_utc + dt.timedelta(seconds=planned_session_duration_s)
+    schedule_timezone = local_timezone_metadata(schedule_start_utc)
     recording_plan = {
         "expected_clips": total_clips,
         "clip_duration_s": clip_duration_s,
         "interval_s": interval_s,
         "planned_session_span_s": planned_session_duration_s,
-        "schedule_start_utc": schedule_start_utc.isoformat(),
-        "planned_finish_utc": planned_finish_utc.isoformat(),
+        "schedule_start_utc": isoformat_utc(schedule_start_utc),
+        "schedule_start_local": isoformat_local(schedule_start_utc),
+        "planned_finish_utc": isoformat_utc(planned_finish_utc),
+        "planned_finish_local": isoformat_local(planned_finish_utc),
+        "timestamp_policy": {
+            "canonical_wall_clock": "UTC",
+            "human_display": "local_with_numeric_offset",
+            "duration_clock": "monotonic",
+            "local_timezone_label": schedule_timezone["local_timezone_label"],
+            "local_utc_offset_at_start": schedule_timezone["local_utc_offset"],
+        },
     }
     requested_clips = total_clips
 
@@ -3755,7 +3923,9 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     subject = sanitize_token(str(config.get("subject", "cohort")))
     output_root = Path(str(config.get("output_root", "./recordings"))).expanduser()
     session_start_utc = utc_now()
-    session_dir = choose_unique_directory(output_root / project / subject / session_stamp_utc(session_start_utc))
+    session_dir = choose_unique_directory(
+        output_root / project / subject / filename_local_timestamp(session_start_utc)
+    )
     session_name = session_dir.name
     session_dir.mkdir(parents=True, exist_ok=False)
     setup_logging(session_dir, verbose)
@@ -4045,12 +4215,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 planned_stop_mono_ns = planned_start_mono_ns + round(clip_duration_s * 1e9)
                 delay_to_start_s = (planned_start_mono_ns - time.monotonic_ns()) / 1e9
                 clip_start_utc = utc_now() + dt.timedelta(seconds=delay_to_start_s)
-                clip_dir = session_dir / f"clip_{clip_index:04d}_{clip_clock_utc(clip_start_utc)}"
+                clip_dir = session_dir / f"clip_{clip_index:04d}_{clip_clock_local(clip_start_utc)}"
                 clip_dir.mkdir(parents=True, exist_ok=False)
                 LOG.info(
                     "Starting clip %d at %s for %.1f s",
                     clip_index,
-                    clip_start_utc.isoformat(),
+                    isoformat_local(clip_start_utc),
                     clip_duration_s,
                 )
 

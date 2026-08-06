@@ -201,6 +201,51 @@ When `clip_duration_s` equals `interval_s`, the run is near-continuous with a sm
 
 Do not treat the long-run template as an exact-duration promise. Inspect `clip_duration_s`, `interval_s`, `number_of_clips`, and `total_duration_h` in the copied config you actually plan to use.
 
+## Time And Timestamp Policy
+
+The recorder uses three kinds of time for different purposes:
+
+| Purpose | Time source |
+|---|---|
+| Folder names, terminal logs, preview, and finish-time display | Local computer time with a numeric UTC offset |
+| Scientific metadata and cross-computer alignment | UTC |
+| Elapsed time, clip scheduling, and heartbeat timing | Monotonic clock |
+
+A new session folder may look like:
+
+```text
+20260804_105301-0400
+```
+
+This means the session was created at local time `10:53:01` with UTC offset `-04:00`.
+
+A clip folder may look like:
+
+```text
+clip_0000_105302-0400
+```
+
+UTC remains the canonical timestamp in JSON metadata and frame timestamp files. Important metadata events also include a human-readable local-time mirror, for example:
+
+```json
+{
+  "session_start_utc": "2026-08-04T14:53:01.254Z",
+  "session_start_local": "2026-08-04T10:53:01.254-04:00"
+}
+```
+
+The per-frame timestamp file does not repeat a formatted local-time string for every frame. Use `host_utc_ns` for absolute timing and `host_monotonic_ns` or `elapsed_s` for intervals.
+
+Local time is used for operator convenience, but UTC is retained because it is unambiguous across computers, time zones, and daylight-saving transitions.
+
+Older sessions may use UTC-looking folder names without an offset, such as:
+
+```text
+20260804_145301
+```
+
+The validator and analysis tools continue to support those legacy names.
+
 ## Check archive settings
 
 Example Windows archive config:
@@ -350,6 +395,8 @@ python record_basler.py --config config_local_macos.yaml
 ```
 
 Confirm the session contains the expected clip directory, MP4, timestamps, JSON metadata, and log files.
+
+New session and clip folders use local time plus a numeric UTC offset. Older sessions may use the legacy timestamp format without an offset.
 
 ## Run the archive smoke test
 

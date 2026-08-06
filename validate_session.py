@@ -13,12 +13,17 @@ import dataclasses
 import datetime as dt
 import gzip
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+
+SESSION_NAME_RE = re.compile(r"^\d{8}_\d{6}(?:[+-]\d{4})?(?:_\d{2})?$")
+CLIP_NAME_RE = re.compile(r"^clip_\d{4}_\d{6}(?:[+-]\d{4})?(?:_\d{2})?$")
 
 
 def utc_from_ns(value_ns: int) -> dt.datetime:
@@ -45,6 +50,14 @@ def parse_iso_ns(value: Any) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def parse_iso_datetime(value: str) -> dt.datetime:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = dt.datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("Timestamp is missing a timezone offset")
+    return parsed
 
 
 def first_present(mapping: dict[str, Any], *names: str) -> Any:
@@ -228,6 +241,17 @@ def parse_session_summary(session_dir: Path) -> tuple[Optional[dict[str, Any]], 
     return summary, issues
 
 
+def parse_session_manifest(session_dir: Path) -> tuple[Optional[dict[str, Any]], list[str]]:
+    manifest_path = session_dir / "session_manifest.json"
+    issues: list[str] = []
+    if not manifest_path.exists():
+        return None, [f"missing session manifest: {manifest_path.name}"]
+    manifest, error = load_json_mapping(manifest_path)
+    if error is not None:
+        return None, [f"{manifest_path.name}: {error}"]
+    return manifest, issues
+
+
 def parse_archive_summary(session_dir: Path) -> tuple[Optional[dict[str, Any]], list[str]]:
     summary_path = session_dir / "archive_summary.json"
     issues: list[str] = []
@@ -257,6 +281,60 @@ def find_clip_directories(root: Path) -> list[Path]:
         [item for item in root.iterdir() if item.is_dir() and item.name.startswith("clip_")],
         key=lambda path: path.name,
     )
+
+
+def detect_session_timestamp_naming(name: str) -> Optional[str]:
+    if not SESSION_NAME_RE.fullmatch(name):
+        return None
+    if re.search(r"[+-]\d{4}(?:_\d{2})?$", name):
+        return "local_with_offset"
+    return "legacy"
+
+
+def detect_clip_timestamp_naming(name: str) -> Optional[str]:
+    if not CLIP_NAME_RE.fullmatch(name):
+        return None
+    if re.search(r"[+-]\d{4}(?:_\d{2})?$", name):
+        return "local_with_offset"
+    return "legacy"
+
+
+def validate_timestamp_pair(
+    mapping: dict[str, Any],
+    *,
+    utc_field: str,
+    local_field: str,
+    issues: list[str],
+    required_local: bool = False,
+) -> None:
+    utc_value = mapping.get(utc_field)
+    local_value = mapping.get(local_field)
+    if utc_value in (None, ""):
+        return
+    if not isinstance(utc_value, str):
+        issues.append(f"{utc_field} is not a string")
+        return
+    try:
+        utc_dt = parse_iso_datetime(utc_value)
+    except Exception as exc:
+        issues.append(f"{utc_field} is invalid: {exc}")
+        return
+
+    if local_value in (None, ""):
+        if required_local:
+            issues.append(f"{local_field} is missing")
+        return
+    if not isinstance(local_value, str):
+        issues.append(f"{local_field} is not a string")
+        return
+    try:
+        local_dt = parse_iso_datetime(local_value)
+    except Exception as exc:
+        issues.append(f"{local_field} is invalid: {exc}")
+        return
+
+    if utc_dt.astimezone(dt.timezone.utc) != local_dt.astimezone(dt.timezone.utc):
+        issues.append(f"{utc_field} and {local_field} do not represent the same instant")
 
 
 def resolve_clip_camera_artifacts(clip_dir: Path, label: str) -> tuple[Optional[Path], Optional[str], list[str]]:
@@ -330,6 +408,8 @@ def validate_clip_camera(
         issues.append("requested_settings missing or invalid")
     if not isinstance(actual_settings, dict):
         actual_settings = {}
+    timestamp_policy = metadata.get("timestamp_policy")
+    requires_local_mirrors = isinstance(timestamp_policy, dict)
 
     label = str(
         first_present(metadata, "label")
@@ -359,6 +439,42 @@ def validate_clip_camera(
 
     if label and label != camera_cfg.get("label"):
         issues.append(f"label mismatch: expected {camera_cfg.get('label')!r}, found {label!r}")
+
+    validate_timestamp_pair(
+        metadata,
+        utc_field="planned_start_utc",
+        local_field="planned_start_local",
+        issues=issues,
+        required_local=requires_local_mirrors,
+    )
+    validate_timestamp_pair(
+        metadata,
+        utc_field="planned_finish_utc",
+        local_field="planned_finish_local",
+        issues=issues,
+        required_local=False,
+    )
+    validate_timestamp_pair(
+        metadata,
+        utc_field="actual_start_utc",
+        local_field="actual_start_local",
+        issues=issues,
+        required_local=False,
+    )
+    validate_timestamp_pair(
+        metadata,
+        utc_field="actual_stop_utc",
+        local_field="actual_stop_local",
+        issues=issues,
+        required_local=False,
+    )
+    validate_timestamp_pair(
+        metadata,
+        utc_field="completed_utc",
+        local_field="completed_local",
+        issues=issues,
+        required_local=requires_local_mirrors,
+    )
 
     timestamp_stats: Optional[TimestampStats] = None
     if timestamps_path.exists():
@@ -443,6 +559,7 @@ def validate_session(session_dir: Path) -> int:
     camera_configs = config.get("cameras") if isinstance(config.get("cameras"), list) else []
     expected_labels = expected_label_order(config)
     archive_config = config.get("archive") if isinstance(config.get("archive"), dict) else {}
+    manifest, manifest_issues = parse_session_manifest(session_dir)
     archive_enabled = bool(archive_config.get("enabled", False)) if isinstance(archive_config, dict) else False
     summary, summary_issues = parse_session_summary(session_dir)
     archive_summary, archive_summary_issues = (
@@ -472,6 +589,9 @@ def validate_session(session_dir: Path) -> int:
         clip_dirs_by_name[clip_dir.name] = clip_dir
     clip_dirs = sorted(clip_dirs_by_name.values(), key=lambda path: path.name)
     leftover_mkvs = find_leftover_capture_mkvs(session_dir)
+    session_timestamp_naming = detect_session_timestamp_naming(session_dir.name)
+    clip_timestamp_namings: set[str] = set()
+    requires_local_mirrors = False
 
     print(f"Session: {session_dir}")
     print(f"Config: {config.get('project')!r} / {config.get('subject')!r}")
@@ -482,6 +602,52 @@ def validate_session(session_dir: Path) -> int:
         print(f"Archive partial dirs: {len(incoming_partial_dirs)}")
     print(f"Visible clip dirs: {len(clip_dirs)}")
     print(f"Temp MKVs: {len(leftover_mkvs)}")
+    if session_timestamp_naming is not None:
+        print(f"Session timestamp naming: {session_timestamp_naming}")
+    else:
+        warnings.append(
+            f"session directory name does not match a supported timestamp format: {session_dir.name}"
+        )
+
+    if manifest is not None:
+        naming = manifest.get("naming")
+        naming_version = coerce_int(naming.get("version")) if isinstance(naming, dict) else None
+        timestamp_policy = manifest.get("timestamp_policy")
+        requires_local_mirrors = naming_version is not None and naming_version >= 3
+        if not requires_local_mirrors and isinstance(timestamp_policy, dict):
+            requires_local_mirrors = True
+        validate_timestamp_pair(
+            manifest,
+            utc_field="created_utc",
+            local_field="created_local",
+            issues=problems,
+            required_local=requires_local_mirrors,
+        )
+        validate_timestamp_pair(
+            manifest,
+            utc_field="session_start_utc",
+            local_field="session_start_local",
+            issues=problems,
+            required_local=requires_local_mirrors,
+        )
+        recording_plan = manifest.get("recording_plan")
+        if isinstance(recording_plan, dict):
+            validate_timestamp_pair(
+                recording_plan,
+                utc_field="schedule_start_utc",
+                local_field="schedule_start_local",
+                issues=problems,
+                required_local=requires_local_mirrors,
+            )
+            validate_timestamp_pair(
+                recording_plan,
+                utc_field="planned_finish_utc",
+                local_field="planned_finish_local",
+                issues=problems,
+                required_local=requires_local_mirrors,
+            )
+    else:
+        problems.extend(manifest_issues)
 
     if duplicate_clip_names:
         problems.append(f"duplicate clip directories found across local/archive views: {sorted(duplicate_clip_names)}")
@@ -510,6 +676,13 @@ def validate_session(session_dir: Path) -> int:
             f"exit_status={format_optional(exit_status)} "
             f"finished_utc={format_optional(finished_utc)} "
             f"unexpected_exception={format_optional(unexpected_exception)}"
+        )
+        validate_timestamp_pair(
+            summary,
+            utc_field="finished_utc",
+            local_field="finished_local",
+            issues=problems,
+            required_local=requires_local_mirrors,
         )
 
         if completed_clips is None:
@@ -569,6 +742,13 @@ def validate_session(session_dir: Path) -> int:
                 f"failure_detected={format_optional(failure_detected)} "
                 f"completed_utc={format_optional(completed_utc)}"
             )
+            validate_timestamp_pair(
+                archive_summary,
+                utc_field="completed_utc",
+                local_field="completed_local",
+                issues=problems,
+                required_local=False,
+            )
 
             if queued_clips is None:
                 problems.append("archive_summary.json: queued_clips missing or invalid")
@@ -613,6 +793,20 @@ def validate_session(session_dir: Path) -> int:
                     if not isinstance(result, dict):
                         problems.append(f"archive_summary.json: result {index} is not an object")
                         continue
+                    validate_timestamp_pair(
+                        result,
+                        utc_field="started_utc",
+                        local_field="started_local",
+                        issues=problems,
+                        required_local=False,
+                    )
+                    validate_timestamp_pair(
+                        result,
+                        utc_field="completed_utc",
+                        local_field="completed_local",
+                        issues=problems,
+                        required_local=False,
+                    )
                     result_success = coerce_bool(result.get("success"))
                     verification_succeeded = coerce_bool(result.get("verification_succeeded"))
                     destination_path_value = result.get("destination_path")
@@ -665,6 +859,13 @@ def validate_session(session_dir: Path) -> int:
     naming_layouts: set[str] = set()
 
     for clip_dir in clip_dirs:
+        clip_timestamp_naming = detect_clip_timestamp_naming(clip_dir.name)
+        if clip_timestamp_naming is None:
+            warnings.append(
+                f"{clip_dir.name}: clip directory name does not match a supported timestamp format"
+            )
+        else:
+            clip_timestamp_namings.add(clip_timestamp_naming)
         try:
             clip_index = int(clip_dir.name.split("_", 2)[1])
         except Exception:
@@ -790,6 +991,12 @@ def validate_session(session_dir: Path) -> int:
         print("Naming layout: legacy")
     elif naming_layouts:
         print(f"Naming layout: mixed ({', '.join(sorted(naming_layouts))})")
+    if clip_timestamp_namings == {"local_with_offset"}:
+        print("Timestamp naming: local_with_offset")
+    elif clip_timestamp_namings == {"legacy"}:
+        print("Timestamp naming: legacy")
+    elif clip_timestamp_namings:
+        print(f"Timestamp naming: mixed ({', '.join(sorted(clip_timestamp_namings))})")
 
     if warnings:
         print("Warnings:")

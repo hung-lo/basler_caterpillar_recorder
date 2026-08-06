@@ -35,6 +35,10 @@ source .venv/bin/activate
 6. Validate the session.
 7. Start the unattended run only after validation passes.
 
+### Timestamp reminder
+
+Folder names and terminal logs use local computer time with a numeric UTC offset. JSON metadata retains canonical UTC timestamps. Elapsed-time calculations use a monotonic clock.
+
 Example commands:
 
 ```bash
