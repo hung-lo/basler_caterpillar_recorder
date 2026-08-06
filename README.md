@@ -187,6 +187,29 @@ rotate: 270
 
 `rotate: 270` means 90 degrees counter-clockwise.
 
+Bounded continuous auto exposure for the current IR setup looks like:
+
+```yaml
+exposure_us: 30000
+gain: 0
+auto_exposure: true
+auto_exposure_mode: continuous
+auto_exposure_lower_us: 6000
+auto_exposure_upper_us: 180000
+auto_target_brightness: 0.59
+auto_exposure_roi: full
+auto_gain: false
+```
+
+Keep these warnings in mind:
+
+- Continuous auto exposure changes exposure during recording.
+- Keep `auto_gain: false` and `gain: 0` for this experiment.
+- `auto_exposure_upper_us` must stay below the frame period.
+- At 5 Hz, use `180000 us`, not the full `200000 us`.
+- `auto_target_brightness: 0.59` is an initial match to the reference image, not an exact guarantee.
+- Run a blocked-light test before unattended recording.
+
 ## Schedule meaning
 
 Use the values in the YAML to understand the planned span.

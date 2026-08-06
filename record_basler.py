@@ -376,6 +376,26 @@ def first_settable_enum(camera: Any, name: str, candidates: Iterable[str]) -> Op
     return None
 
 
+def try_set_first_available(
+    camera: Any,
+    names: Iterable[str],
+    value: Any,
+    *,
+    required: bool = False,
+) -> tuple[Optional[str], Any]:
+    for name in names:
+        if get_node(camera, name) is None:
+            continue
+        ok, actual = try_set(camera, name, value)
+        if ok:
+            return name, actual
+
+    if required:
+        joined = ", ".join(names)
+        raise RuntimeError(f"None of the required camera nodes could be set: {joined}")
+    return None, None
+
+
 def read_setting(camera: Any, name: str) -> Any:
     return node_value(get_node(camera, name))
 
@@ -697,6 +717,76 @@ class CameraBinding:
         return float(value)
 
 
+@dataclasses.dataclass(frozen=True)
+class AutoExposureSettings:
+    mode_raw: str
+    mode_value: str
+    lower_us: float
+    upper_us: float
+    target: float
+    initial_us: float
+    roi: str
+
+
+def parse_auto_exposure_settings(
+    camera_cfg: dict[str, Any],
+    *,
+    label: str,
+) -> AutoExposureSettings:
+    mode_raw = str(camera_cfg.get("auto_exposure_mode", "continuous")).strip().lower()
+    mode_map = {
+        "continuous": "Continuous",
+        "once": "Once",
+    }
+    if mode_raw not in mode_map:
+        raise ValueError("auto_exposure_mode must be one of: continuous, once")
+
+    fps = float(camera_cfg.get("fps", 5.0))
+    lower_us = float(camera_cfg.get("auto_exposure_lower_us", 6000))
+    upper_us = float(camera_cfg.get("auto_exposure_upper_us", 180000))
+    target = float(camera_cfg.get("auto_target_brightness", 0.59))
+    initial_us = float(camera_cfg.get("exposure_us", lower_us))
+    roi = str(camera_cfg.get("auto_exposure_roi", "full")).strip().lower() or "full"
+
+    if lower_us <= 0:
+        raise ValueError("auto_exposure_lower_us must be positive")
+    if upper_us <= lower_us:
+        raise ValueError("auto_exposure_upper_us must be greater than auto_exposure_lower_us")
+    if not lower_us <= initial_us <= upper_us:
+        raise ValueError("exposure_us must fall within the auto-exposure lower/upper limits")
+    if not 0.0 < target < 1.0:
+        raise ValueError("auto_target_brightness must be between 0 and 1")
+    if roi != "full":
+        raise ValueError("auto_exposure_roi must currently be: full")
+    if fps <= 0:
+        raise ValueError("camera fps must be positive when auto exposure is enabled")
+
+    frame_period_us = 1_000_000.0 / fps
+    if upper_us >= frame_period_us:
+        raise ValueError(
+            "auto_exposure_upper_us must be below the nominal frame period "
+            f"({frame_period_us:.0f} us at {fps:g} fps)"
+        )
+    if upper_us > frame_period_us * 0.95:
+        LOG.warning(
+            "%s auto-exposure upper limit %.0f us is very close to the %.0f us "
+            "frame period; verify the measured receive FPS",
+            label,
+            upper_us,
+            frame_period_us,
+        )
+
+    return AutoExposureSettings(
+        mode_raw=mode_raw,
+        mode_value=mode_map[mode_raw],
+        lower_us=lower_us,
+        upper_us=upper_us,
+        target=target,
+        initial_us=initial_us,
+        roi=roi,
+    )
+
+
 def match_device(camera_cfg: dict[str, Any], devices: list[Any], used_serials: set[str]) -> Any:
     serial = str(camera_cfg.get("serial") or "").strip()
     model = str(camera_cfg.get("model") or "").strip()
@@ -804,27 +894,108 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
     else:
         try_set(camera, "PixelFormat", pixel_format, required=True)
 
-    # Stable brightness is preferable for behavioral segmentation. Auto modes are
-    # available for setup, but manual exposure/gain should be used for the real run.
+    # Stable brightness is preferable for behavioral segmentation. This path
+    # supports either manual exposure or bounded camera-side auto exposure.
     auto_exposure = bool(camera_cfg.get("auto_exposure", False))
-    if auto_exposure:
-        first_settable_enum(camera, "ExposureAuto", ("Continuous", "Once"))
+    auto_gain = bool(camera_cfg.get("auto_gain", False))
+    auto_exposure_settings = (
+        parse_auto_exposure_settings(camera_cfg, label=label) if auto_exposure else None
+    )
+
+    try_set(camera, "ExposureAuto", "Off")
+    try_set(camera, "GainAuto", "Off")
+
+    if not auto_gain and camera_cfg.get("gain") is not None:
+        gain_ok, _ = try_set(camera, "Gain", float(camera_cfg["gain"]))
+        if not gain_ok:
+            try_set(camera, "GainRaw", int(camera_cfg["gain"]))
+
+    if auto_exposure_settings is not None:
+        exposure_ok, _ = try_set(camera, "ExposureTime", auto_exposure_settings.initial_us)
+        if not exposure_ok:
+            try_set(camera, "ExposureTimeAbs", auto_exposure_settings.initial_us, required=True)
+
+        lower_name, actual_lower = try_set_first_available(
+            camera,
+            ("AutoExposureTimeLowerLimit", "AutoExposureTimeLowerLimitRaw"),
+            auto_exposure_settings.lower_us,
+            required=True,
+        )
+        upper_name, actual_upper = try_set_first_available(
+            camera,
+            ("AutoExposureTimeUpperLimit", "AutoExposureTimeUpperLimitRaw"),
+            auto_exposure_settings.upper_us,
+            required=True,
+        )
+
+        if get_node(camera, "AutoTargetBrightness") is not None:
+            target_name, actual_target = try_set_first_available(
+                camera,
+                ("AutoTargetBrightness",),
+                auto_exposure_settings.target,
+                required=True,
+            )
+        else:
+            target_name, actual_target = try_set_first_available(
+                camera,
+                ("AutoTargetValue",),
+                int(round(auto_exposure_settings.target * 255)),
+                required=True,
+            )
+
+        image_offset_x = int(read_setting(camera, "OffsetX") or 0)
+        image_offset_y = int(read_setting(camera, "OffsetY") or 0)
+        image_width = int(read_setting(camera, "Width") or 0)
+        image_height = int(read_setting(camera, "Height") or 0)
+        if image_width <= 0 or image_height <= 0:
+            raise RuntimeError("Could not determine the configured camera ROI for auto exposure")
+
+        roi_family: str
+        if get_node(camera, "AutoFunctionROISelector") is not None:
+            roi_family = "ROI"
+            try_set(camera, "AutoFunctionROISelector", "ROI1", required=True)
+            try_set(camera, "AutoFunctionROIOffsetX", image_offset_x, required=True)
+            try_set(camera, "AutoFunctionROIOffsetY", image_offset_y, required=True)
+            try_set(camera, "AutoFunctionROIWidth", image_width, required=True)
+            try_set(camera, "AutoFunctionROIHeight", image_height, required=True)
+            try_set(camera, "AutoFunctionROIUseBrightness", True, required=True)
+        elif get_node(camera, "AutoFunctionAOISelector") is not None:
+            roi_family = "AOI"
+            try_set(camera, "AutoFunctionAOISelector", "AOI1", required=True)
+            try_set(camera, "AutoFunctionAOIOffsetX", image_offset_x, required=True)
+            try_set(camera, "AutoFunctionAOIOffsetY", image_offset_y, required=True)
+            try_set(camera, "AutoFunctionAOIWidth", image_width, required=True)
+            try_set(camera, "AutoFunctionAOIHeight", image_height, required=True)
+            try_set(camera, "AutoFunctionAOIUsageIntensity", True, required=True)
+        else:
+            raise RuntimeError("Auto exposure requires a complete AutoFunction ROI/AOI node family")
     else:
-        try_set(camera, "ExposureAuto", "Off")
         if camera_cfg.get("exposure_us") is not None:
             exposure_ok, _ = try_set(camera, "ExposureTime", float(camera_cfg["exposure_us"]))
             if not exposure_ok:
                 try_set(camera, "ExposureTimeAbs", float(camera_cfg["exposure_us"]))
 
-    auto_gain = bool(camera_cfg.get("auto_gain", False))
     if auto_gain:
         first_settable_enum(camera, "GainAuto", ("Continuous", "Once"))
-    else:
-        try_set(camera, "GainAuto", "Off")
-        if camera_cfg.get("gain") is not None:
-            gain_ok, _ = try_set(camera, "Gain", float(camera_cfg["gain"]))
-            if not gain_ok:
-                try_set(camera, "GainRaw", int(camera_cfg["gain"]))
+
+    if auto_exposure_settings is not None:
+        try_set(camera, "ExposureAuto", auto_exposure_settings.mode_value, required=True)
+        LOG.info(
+            "%s auto exposure: mode=%s target=%0.3f limits=%s..%s us seed=%.0f us "
+            "ROI=%d,%d %dx%d GainAuto=%s gain=%r",
+            label,
+            auto_exposure_settings.mode_value,
+            float(actual_target if actual_target is not None else auto_exposure_settings.target),
+            actual_lower if actual_lower is not None else auto_exposure_settings.lower_us,
+            actual_upper if actual_upper is not None else auto_exposure_settings.upper_us,
+            auto_exposure_settings.initial_us,
+            image_offset_x,
+            image_offset_y,
+            image_width,
+            image_height,
+            read_setting(camera, "GainAuto"),
+            read_setting(camera, "Gain") if read_setting(camera, "Gain") is not None else read_setting(camera, "GainRaw"),
+        )
 
     if camera_cfg.get("balance_white_auto") is not None:
         mode = "Continuous" if bool(camera_cfg["balance_white_auto"]) else "Off"
@@ -864,6 +1035,25 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
         "GainAuto",
         "Gain",
         "GainRaw",
+        "AutoExposureTimeLowerLimit",
+        "AutoExposureTimeUpperLimit",
+        "AutoExposureTimeLowerLimitRaw",
+        "AutoExposureTimeUpperLimitRaw",
+        "AutoTargetBrightness",
+        "AutoTargetValue",
+        "AutoFunctionROISelector",
+        "AutoFunctionROIOffsetX",
+        "AutoFunctionROIOffsetY",
+        "AutoFunctionROIWidth",
+        "AutoFunctionROIHeight",
+        "AutoFunctionROIUseBrightness",
+        "AutoFunctionAOISelector",
+        "AutoFunctionAOIOffsetX",
+        "AutoFunctionAOIOffsetY",
+        "AutoFunctionAOIWidth",
+        "AutoFunctionAOIHeight",
+        "AutoFunctionAOIUsageIntensity",
+        "BslEffectiveExposureTime",
         "AcquisitionFrameRate",
         "AcquisitionFrameRateAbs",
         "ResultingFrameRate",

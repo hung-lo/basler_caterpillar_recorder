@@ -49,6 +49,214 @@ def make_preview_packet(
     )
 
 
+class FakeNode:
+    def __init__(
+        self,
+        name: str,
+        value: object = None,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+        increment: float | None = None,
+        log: list[tuple[str, object]] | None = None,
+    ) -> None:
+        self.name = name
+        self.value = value
+        self.minimum = minimum
+        self.maximum = maximum
+        self.increment = increment
+        self.log = log
+
+    def TrySetValue(self, value: object) -> bool:
+        self.SetValue(value)
+        return True
+
+    def SetValue(self, value: object) -> None:
+        self.value = value
+        if self.log is not None:
+            self.log.append((self.name, value))
+
+    def GetValue(self) -> object:
+        return self.value
+
+    def GetMin(self) -> float:
+        if self.minimum is None:
+            raise AttributeError("no minimum")
+        return self.minimum
+
+    def GetMax(self) -> float:
+        if self.maximum is None:
+            raise AttributeError("no maximum")
+        return self.maximum
+
+    def GetInc(self) -> float:
+        if self.increment is None:
+            raise AttributeError("no increment")
+        return self.increment
+
+
+class FakeDeviceInfo:
+    def GetModelName(self) -> str:
+        return "a2A1920-160ucBAS"
+
+    def GetSerialNumber(self) -> str:
+        return "40604036"
+
+    def GetUserDefinedName(self) -> str:
+        return ""
+
+    def GetDeviceClass(self) -> str:
+        return "BaslerUsb"
+
+    def GetFriendlyName(self) -> str:
+        return "fake"
+
+    def GetFullName(self) -> str:
+        return "fake-full"
+
+
+class FakeCamera:
+    def __init__(self, nodes: dict[str, FakeNode]) -> None:
+        self._device_info = FakeDeviceInfo()
+        for name, node in nodes.items():
+            setattr(self, name, node)
+
+    def Open(self) -> None:
+        return None
+
+    def GetDeviceInfo(self) -> FakeDeviceInfo:
+        return self._device_info
+
+
+def make_fake_camera(modern: bool) -> tuple[FakeCamera, list[tuple[str, object]]]:
+    log: list[tuple[str, object]] = []
+    nodes = {
+        "AcquisitionMode": FakeNode("AcquisitionMode", "SingleFrame", log=log),
+        "ExposureMode": FakeNode("ExposureMode", "TriggerWidth", log=log),
+        "TriggerSelector": FakeNode("TriggerSelector", "FrameStart", log=log),
+        "TriggerMode": FakeNode("TriggerMode", "On", log=log),
+        "Width": FakeNode("Width", 1920, minimum=16, maximum=1920, increment=1, log=log),
+        "Height": FakeNode("Height", 1200, minimum=16, maximum=1200, increment=1, log=log),
+        "OffsetX": FakeNode("OffsetX", 0, minimum=0, maximum=1919, increment=1, log=log),
+        "OffsetY": FakeNode("OffsetY", 0, minimum=0, maximum=1199, increment=1, log=log),
+        "PixelFormat": FakeNode("PixelFormat", "BayerRG8", log=log),
+        "ExposureAuto": FakeNode("ExposureAuto", "Off", log=log),
+        "ExposureTime": FakeNode("ExposureTime", 5000.0, minimum=50, maximum=500000, increment=1, log=log),
+        "GainAuto": FakeNode("GainAuto", "Off", log=log),
+        "Gain": FakeNode("Gain", 0.0, minimum=0, maximum=24, increment=1, log=log),
+        "AcquisitionFrameRateEnable": FakeNode("AcquisitionFrameRateEnable", False, log=log),
+        "AcquisitionFrameRate": FakeNode(
+            "AcquisitionFrameRate",
+            5.0,
+            minimum=1,
+            maximum=60,
+            increment=0.01,
+            log=log,
+        ),
+        "MaxNumBuffer": FakeNode("MaxNumBuffer", 20, minimum=1, maximum=100, increment=1, log=log),
+    }
+    if modern:
+        nodes.update(
+            {
+                "AutoExposureTimeLowerLimit": FakeNode(
+                    "AutoExposureTimeLowerLimit",
+                    6000.0,
+                    minimum=50,
+                    maximum=500000,
+                    increment=1,
+                    log=log,
+                ),
+                "AutoExposureTimeUpperLimit": FakeNode(
+                    "AutoExposureTimeUpperLimit",
+                    180000.0,
+                    minimum=50,
+                    maximum=500000,
+                    increment=1,
+                    log=log,
+                ),
+                "AutoTargetBrightness": FakeNode(
+                    "AutoTargetBrightness",
+                    0.59,
+                    minimum=0.0,
+                    maximum=1.0,
+                    increment=0.001,
+                    log=log,
+                ),
+                "AutoFunctionROISelector": FakeNode("AutoFunctionROISelector", "ROI1", log=log),
+                "AutoFunctionROIOffsetX": FakeNode("AutoFunctionROIOffsetX", 0, log=log),
+                "AutoFunctionROIOffsetY": FakeNode("AutoFunctionROIOffsetY", 0, log=log),
+                "AutoFunctionROIWidth": FakeNode("AutoFunctionROIWidth", 1920, log=log),
+                "AutoFunctionROIHeight": FakeNode("AutoFunctionROIHeight", 1200, log=log),
+                "AutoFunctionROIUseBrightness": FakeNode("AutoFunctionROIUseBrightness", False, log=log),
+            }
+        )
+    else:
+        nodes.update(
+            {
+                "AutoExposureTimeLowerLimitRaw": FakeNode(
+                    "AutoExposureTimeLowerLimitRaw",
+                    6000,
+                    minimum=50,
+                    maximum=500000,
+                    increment=1,
+                    log=log,
+                ),
+                "AutoExposureTimeUpperLimitRaw": FakeNode(
+                    "AutoExposureTimeUpperLimitRaw",
+                    180000,
+                    minimum=50,
+                    maximum=500000,
+                    increment=1,
+                    log=log,
+                ),
+                "AutoTargetValue": FakeNode(
+                    "AutoTargetValue",
+                    150,
+                    minimum=0,
+                    maximum=255,
+                    increment=1,
+                    log=log,
+                ),
+                "AutoFunctionAOISelector": FakeNode("AutoFunctionAOISelector", "AOI1", log=log),
+                "AutoFunctionAOIOffsetX": FakeNode("AutoFunctionAOIOffsetX", 0, log=log),
+                "AutoFunctionAOIOffsetY": FakeNode("AutoFunctionAOIOffsetY", 0, log=log),
+                "AutoFunctionAOIWidth": FakeNode("AutoFunctionAOIWidth", 1920, log=log),
+                "AutoFunctionAOIHeight": FakeNode("AutoFunctionAOIHeight", 1200, log=log),
+                "AutoFunctionAOIUsageIntensity": FakeNode("AutoFunctionAOIUsageIntensity", False, log=log),
+            }
+        )
+    return FakeCamera(nodes), log
+
+
+def configure_fake_camera(camera_cfg: dict[str, object], *, modern: bool) -> tuple[record_basler.CameraBinding, list[tuple[str, object]]]:
+    camera, log = make_fake_camera(modern)
+
+    class FakeFactory:
+        def CreateDevice(self, device_info: object) -> object:
+            return device_info
+
+    class FakeTlFactory:
+        @staticmethod
+        def GetInstance() -> FakeFactory:
+            return FakeFactory()
+
+    class FakeConverter:
+        def __init__(self) -> None:
+            self.OutputPixelFormat = None
+            self.OutputBitAlignment = None
+
+    fake_pylon = mock.Mock()
+    fake_pylon.TlFactory = FakeTlFactory
+    fake_pylon.InstantCamera = mock.Mock(return_value=camera)
+    fake_pylon.ImageFormatConverter = FakeConverter
+    fake_pylon.PixelType_BGR8packed = "bgr8"
+    fake_pylon.OutputBitAlignment_MsbAligned = "msb"
+
+    with mock.patch.object(record_basler, "pylon", fake_pylon):
+        binding = record_basler.configure_camera(dict(camera_cfg), FakeDeviceInfo())
+    return binding, log
+
+
 class ArchiveBackendTests(unittest.TestCase):
     def test_resolve_archive_backend_auto_uses_robocopy_on_windows(self) -> None:
         settings = dataclasses.replace(record_basler.ArchiveSettings(), backend="auto")
@@ -323,6 +531,192 @@ class TimeFormattingTests(unittest.TestCase):
                 formatter.formatTime(record),
                 "2026-08-04T10:53:01.254-04:00",
             )
+
+
+class AutoExposureSettingsTests(unittest.TestCase):
+    def test_invalid_auto_exposure_limits_raise(self) -> None:
+        with self.assertRaisesRegex(ValueError, "greater than auto_exposure_lower_us"):
+            record_basler.parse_auto_exposure_settings(
+                {
+                    "fps": 5,
+                    "auto_exposure_lower_us": 6000,
+                    "auto_exposure_upper_us": 6000,
+                    "auto_target_brightness": 0.59,
+                    "exposure_us": 6000,
+                },
+                label="camera1",
+            )
+
+    def test_invalid_auto_exposure_target_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            record_basler.parse_auto_exposure_settings(
+                {
+                    "fps": 5,
+                    "auto_exposure_lower_us": 6000,
+                    "auto_exposure_upper_us": 180000,
+                    "auto_target_brightness": 1.2,
+                    "exposure_us": 30000,
+                },
+                label="camera1",
+            )
+
+    def test_upper_limit_at_frame_period_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "below the nominal frame period"):
+            record_basler.parse_auto_exposure_settings(
+                {
+                    "fps": 5,
+                    "auto_exposure_lower_us": 6000,
+                    "auto_exposure_upper_us": 200000,
+                    "auto_target_brightness": 0.59,
+                    "exposure_us": 30000,
+                },
+                label="camera1",
+            )
+
+    def test_continuous_mode_maps_to_camera_enum(self) -> None:
+        settings = record_basler.parse_auto_exposure_settings(
+            {
+                "fps": 5,
+                "auto_exposure_mode": "continuous",
+                "auto_exposure_lower_us": 6000,
+                "auto_exposure_upper_us": 180000,
+                "auto_target_brightness": 0.59,
+                "exposure_us": 30000,
+            },
+            label="camera1",
+        )
+        self.assertEqual(settings.mode_value, "Continuous")
+
+
+class ConfigureCameraAutoExposureTests(unittest.TestCase):
+    def test_modern_auto_exposure_nodes_are_configured_in_order(self) -> None:
+        binding, log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": True,
+                "auto_exposure_mode": "continuous",
+                "auto_exposure_lower_us": 6000,
+                "auto_exposure_upper_us": 180000,
+                "auto_target_brightness": 0.59,
+                "auto_exposure_roi": "full",
+                "auto_gain": False,
+                "max_num_buffer": 30,
+            },
+            modern=True,
+        )
+
+        relevant = [
+            item
+            for item in log
+            if item[0]
+            in {
+                "ExposureAuto",
+                "GainAuto",
+                "Gain",
+                "ExposureTime",
+                "AutoExposureTimeLowerLimit",
+                "AutoExposureTimeUpperLimit",
+                "AutoTargetBrightness",
+                "AutoFunctionROISelector",
+                "AutoFunctionROIOffsetX",
+                "AutoFunctionROIOffsetY",
+                "AutoFunctionROIWidth",
+                "AutoFunctionROIHeight",
+                "AutoFunctionROIUseBrightness",
+            }
+        ]
+        self.assertEqual(
+            relevant,
+            [
+                ("ExposureAuto", "Off"),
+                ("GainAuto", "Off"),
+                ("Gain", 0.0),
+                ("ExposureTime", 30000.0),
+                ("AutoExposureTimeLowerLimit", 6000.0),
+                ("AutoExposureTimeUpperLimit", 180000.0),
+                ("AutoTargetBrightness", 0.59),
+                ("AutoFunctionROISelector", "ROI1"),
+                ("AutoFunctionROIOffsetX", 0),
+                ("AutoFunctionROIOffsetY", 0),
+                ("AutoFunctionROIWidth", 1920),
+                ("AutoFunctionROIHeight", 1200),
+                ("AutoFunctionROIUseBrightness", True),
+                ("ExposureAuto", "Continuous"),
+            ],
+        )
+        self.assertEqual(binding.actual_settings["ExposureAuto"], "Continuous")
+        self.assertEqual(binding.actual_settings["GainAuto"], "Off")
+        self.assertEqual(binding.actual_settings["Gain"], 0.0)
+
+    def test_legacy_auto_exposure_uses_raw_and_aoi_nodes(self) -> None:
+        binding, log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": True,
+                "auto_exposure_mode": "continuous",
+                "auto_exposure_lower_us": 6000,
+                "auto_exposure_upper_us": 180000,
+                "auto_target_brightness": 0.59,
+                "auto_exposure_roi": "full",
+                "auto_gain": False,
+            },
+            modern=False,
+        )
+
+        self.assertIn(("AutoExposureTimeLowerLimitRaw", 6000.0), log)
+        self.assertIn(("AutoExposureTimeUpperLimitRaw", 180000.0), log)
+        self.assertIn(("AutoTargetValue", 150), log)
+        self.assertIn(("AutoFunctionAOISelector", "AOI1"), log)
+        self.assertIn(("AutoFunctionAOIUsageIntensity", True), log)
+        self.assertEqual(binding.actual_settings["ExposureAuto"], "Continuous")
+
+    def test_manual_exposure_behavior_is_unchanged(self) -> None:
+        binding, log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": False,
+                "auto_gain": False,
+            },
+            modern=True,
+        )
+
+        relevant = [item for item in log if item[0] in {"ExposureAuto", "ExposureTime", "GainAuto", "Gain"}]
+        self.assertEqual(
+            relevant,
+            [
+                ("ExposureAuto", "Off"),
+                ("GainAuto", "Off"),
+                ("Gain", 0.0),
+                ("ExposureTime", 30000.0),
+            ],
+        )
+        self.assertNotIn(("AutoExposureTimeLowerLimit", 6000.0), log)
+        self.assertEqual(binding.actual_settings["ExposureAuto"], "Off")
+        self.assertEqual(binding.actual_settings["GainAuto"], "Off")
 
 
 class PreviewResizeTests(unittest.TestCase):
