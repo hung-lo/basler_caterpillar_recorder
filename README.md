@@ -293,9 +293,10 @@ If you want a lightweight monitor window during recording, add:
 recording_preview:
   enabled: true
   fps: 1
-  max_width: 640
+  max_width: 600
   max_height: 720
   show_status: true
+  layout: card_panel
 ```
 
 During recording:
@@ -304,8 +305,13 @@ During recording:
 - the preview shows clip and session progress;
 - the terminal prints periodic `STATUS` heartbeats;
 - `q` hides the recording preview without stopping acquisition;
-- `s` saves the latest low-resolution monitor frame into the clip directory;
+- `s` saves the raw preview frame without the panel or footer into the clip directory;
 - `Ctrl+C` stops the recording cleanly.
+
+Supported layouts:
+
+- `card_panel`: appends a right-side information panel and bottom status footer while keeping the camera image unobstructed.
+- `legacy_overlay`: uses the older translucent text overlay on top of the preview image.
 
 The preview-enabled example configs are:
 

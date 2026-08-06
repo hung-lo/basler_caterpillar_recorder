@@ -16,6 +16,37 @@ import numpy as np
 import record_basler
 
 
+def make_preview_packet(
+    frame: np.ndarray,
+    *,
+    label: str = "camera1",
+    clip_index: int = 0,
+    total_clips: int = 3,
+    frame_index: int = 42,
+    elapsed_s: float = 12.5,
+    planned_duration_s: float = 60.0,
+    session_elapsed_s: float = 12.5,
+    planned_session_duration_s: float = 180.0,
+    planned_finish_utc: dt.datetime | None = None,
+    measured_receive_fps: float | None = 5.0,
+) -> record_basler.PreviewPacket:
+    return record_basler.PreviewPacket(
+        label=label,
+        clip_index=clip_index,
+        total_clips=total_clips,
+        frame_index=frame_index,
+        frame=frame,
+        host_monotonic_ns=123456789,
+        elapsed_s=elapsed_s,
+        planned_duration_s=planned_duration_s,
+        session_elapsed_s=session_elapsed_s,
+        planned_session_duration_s=planned_session_duration_s,
+        planned_finish_utc=planned_finish_utc
+        or dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
+        measured_receive_fps=measured_receive_fps,
+    )
+
+
 class ArchiveBackendTests(unittest.TestCase):
     def test_resolve_archive_backend_auto_uses_robocopy_on_windows(self) -> None:
         settings = dataclasses.replace(record_basler.ArchiveSettings(), backend="auto")
@@ -245,56 +276,144 @@ class PreviewResizeTests(unittest.TestCase):
         self.assertEqual(resized.shape[:2], (375, 600))
 
 
+class RecordingPreviewSettingsTests(unittest.TestCase):
+    def test_default_layout_is_card_panel(self) -> None:
+        settings = record_basler.parse_recording_preview_settings({})
+        self.assertEqual(settings.layout, "card_panel")
+
+    def test_legacy_layout_is_accepted(self) -> None:
+        settings = record_basler.parse_recording_preview_settings(
+            {"recording_preview": {"layout": "legacy_overlay"}}
+        )
+        self.assertEqual(settings.layout, "legacy_overlay")
+
+    def test_layout_is_case_normalized(self) -> None:
+        settings = record_basler.parse_recording_preview_settings(
+            {"recording_preview": {"layout": "CARD_PANEL"}}
+        )
+        self.assertEqual(settings.layout, "card_panel")
+
+    def test_invalid_layout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "recording_preview.layout"):
+            record_basler.parse_recording_preview_settings(
+                {"recording_preview": {"layout": "side_panel"}}
+            )
+
+
 class RecordingPreviewTests(unittest.TestCase):
-    def test_card_panel_layout_stays_out_of_footer_and_compacts_when_needed(self) -> None:
+    def test_card_panel_layout_stays_out_of_footer_and_minimal_mode_fits_short_frame(self) -> None:
         layout = record_basler._calculate_card_panel_layout(260, 180, 42)
 
         self.assertEqual(layout.footer_y, 180)
-        self.assertTrue(layout.compact_mode)
+        self.assertEqual(layout.mode, "minimal")
         self.assertLessEqual(layout.recording_card[1] + layout.recording_card[3], 180 - 12)
         self.assertLessEqual(layout.session_card[1] + layout.session_card[3], 180 - 12)
 
+    def test_full_mode_selected_for_tall_portrait_frame(self) -> None:
+        layout = record_basler._calculate_card_panel_layout(450, 720, 42)
+        self.assertEqual(layout.mode, "full")
+
+    def test_compact_mode_selected_for_medium_frame(self) -> None:
+        layout = record_basler._calculate_card_panel_layout(450, 360, 42)
+        self.assertEqual(layout.mode, "compact")
+
+    def test_minimal_mode_selected_for_small_frame(self) -> None:
+        layout = record_basler._calculate_card_panel_layout(260, 180, 42)
+        self.assertEqual(layout.mode, "minimal")
+
+    def test_recording_card_and_session_card_bounds_are_inside_layout(self) -> None:
+        for image_h, image_w in [(720, 450), (375, 600), (180, 260)]:
+            layout = record_basler._calculate_card_panel_layout(image_w, image_h, 42)
+            recording_x, recording_y, recording_w, recording_h = layout.recording_card
+            session_x, session_y, session_w, session_h = layout.session_card
+
+            self.assertEqual(recording_x, image_w + 12)
+            self.assertEqual(session_x, image_w + 12)
+            self.assertLessEqual(recording_y + recording_h, layout.footer_y - 12)
+            self.assertLessEqual(session_y + session_h, layout.footer_y - 12)
+            self.assertLess(recording_y + recording_h, layout.footer_y)
+            self.assertLess(session_y + session_h, layout.footer_y)
+
+            recording_content_bottom = recording_y + record_basler._measure_recording_card_height(
+                recording_w,
+                mode=layout.recording_mode,
+            )
+            session_content_bottom = session_y + record_basler._measure_session_card_height(
+                session_w,
+                mode=layout.mode,
+            )
+            self.assertLessEqual(recording_content_bottom, recording_y + recording_h)
+            self.assertLessEqual(session_content_bottom, session_y + session_h)
+            self.assertLessEqual(session_content_bottom, layout.footer_y - 12)
+
     def test_card_panel_adds_panel_and_preserves_camera_frame(self) -> None:
-        frame = np.zeros((375, 600, 3), dtype=np.uint8)
-        packet = record_basler.PreviewPacket(
-            label="camera1",
-            clip_index=0,
-            total_clips=3,
-            frame_index=42,
-            frame=frame,
-            host_monotonic_ns=123456789,
-            elapsed_s=12.5,
-            planned_duration_s=60.0,
-            session_elapsed_s=12.5,
-            planned_session_duration_s=180.0,
-            planned_finish_utc=dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
-            measured_receive_fps=5.0,
-        )
+        frame = np.zeros((720, 450, 3), dtype=np.uint8)
+        original = frame.copy()
+        packet = make_preview_packet(frame)
 
         preview = record_basler.draw_recording_preview(
             packet,
             record_basler.RecordingPreviewSettings(),
         )
 
-        self.assertEqual(preview.shape, (417, 816, 3))
-        np.testing.assert_array_equal(preview[:375, :600], frame)
+        self.assertGreater(preview.shape[0], frame.shape[0])
+        self.assertGreater(preview.shape[1], frame.shape[1])
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
+        np.testing.assert_array_equal(frame, original)
+
+    def test_card_panel_keeps_landscape_source_unchanged(self) -> None:
+        frame = np.zeros((375, 600, 3), dtype=np.uint8)
+        original = frame.copy()
+        packet = make_preview_packet(frame, label="arena_B_M05-M07")
+
+        preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+
+        self.assertGreater(preview.shape[0], frame.shape[0])
+        self.assertGreater(preview.shape[1], frame.shape[1])
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
+        np.testing.assert_array_equal(frame, original)
+
+    def test_card_panel_handles_small_frame_without_error(self) -> None:
+        frame = np.zeros((180, 260, 3), dtype=np.uint8)
+        packet = make_preview_packet(
+            frame,
+            label="arena_B_M05-M07",
+            elapsed_s=-5.0,
+            planned_duration_s=10.0,
+            session_elapsed_s=-2.0,
+            planned_session_duration_s=20.0,
+            measured_receive_fps=None,
+        )
+
+        preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+        self.assertGreater(preview.shape[0], frame.shape[0])
+        self.assertGreater(preview.shape[1], frame.shape[1])
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
+
+    def test_card_panel_handles_very_short_frame_without_error(self) -> None:
+        frame = np.zeros((150, 220, 3), dtype=np.uint8)
+        layout = record_basler._calculate_card_panel_layout(frame.shape[1], frame.shape[0], 38)
+        self.assertEqual(layout.mode, "minimal")
+        packet = make_preview_packet(frame, label="very_long_camera_label_for_testing_overflow")
+
+        preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
+
+    def test_show_status_false_returns_original_dimensions(self) -> None:
+        frame = np.zeros((260, 450, 3), dtype=np.uint8)
+        packet = make_preview_packet(frame)
+
+        preview = record_basler.draw_recording_preview(
+            packet,
+            record_basler.RecordingPreviewSettings(show_status=False),
+        )
+
+        self.assertEqual(preview.shape, frame.shape)
+        np.testing.assert_array_equal(preview, frame)
 
     def test_legacy_overlay_keeps_original_shape(self) -> None:
         frame = np.zeros((120, 220, 3), dtype=np.uint8)
-        packet = record_basler.PreviewPacket(
-            label="camera1",
-            clip_index=0,
-            total_clips=1,
-            frame_index=0,
-            frame=frame,
-            host_monotonic_ns=123456789,
-            elapsed_s=0.0,
-            planned_duration_s=10.0,
-            session_elapsed_s=0.0,
-            planned_session_duration_s=10.0,
-            planned_finish_utc=dt.datetime(2026, 8, 5, 14, 0, tzinfo=dt.timezone.utc),
-            measured_receive_fps=None,
-        )
+        packet = make_preview_packet(frame, measured_receive_fps=None, planned_duration_s=10.0, session_elapsed_s=0.0, planned_session_duration_s=10.0)
 
         preview = record_basler.draw_recording_preview(
             packet,
@@ -302,6 +421,25 @@ class RecordingPreviewTests(unittest.TestCase):
         )
 
         self.assertEqual(preview.shape, frame.shape)
+        self.assertFalse(np.array_equal(preview, frame))
+
+    def test_negative_and_overrun_progress_render_without_error(self) -> None:
+        frame = np.zeros((375, 600, 3), dtype=np.uint8)
+        cases = [
+            make_preview_packet(frame, elapsed_s=-2.0, session_elapsed_s=-4.0, measured_receive_fps=None),
+            make_preview_packet(frame, elapsed_s=999.0, planned_duration_s=12.0, session_elapsed_s=999.0, planned_session_duration_s=12.0),
+        ]
+
+        for packet in cases:
+            preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+            np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
+
+    def test_long_camera_label_renders_without_error(self) -> None:
+        frame = np.zeros((375, 600, 3), dtype=np.uint8)
+        packet = make_preview_packet(frame, label="arena_B_M05-M07_very_long_camera_label_that_should_be_ellipsized")
+
+        preview = record_basler.draw_recording_preview(packet, record_basler.RecordingPreviewSettings())
+        np.testing.assert_array_equal(preview[: frame.shape[0], : frame.shape[1]], frame)
         self.assertFalse(np.array_equal(preview, frame))
 
 

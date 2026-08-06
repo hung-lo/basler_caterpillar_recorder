@@ -42,6 +42,7 @@ recording_preview:
   max_width: 800
   max_height: 700
   show_status: true
+  layout: card_panel
 
 cameras:
   - label: camera1
