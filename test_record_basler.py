@@ -13,6 +13,7 @@ from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 import numpy as np
+import yaml
 
 import record_basler
 import validate_session
@@ -1109,6 +1110,91 @@ class ValidatorTimestampTests(unittest.TestCase):
     def test_parse_iso_datetime_requires_timezone(self) -> None:
         with self.assertRaisesRegex(ValueError, "timezone offset"):
             validate_session.parse_iso_datetime("2026-08-04T10:53:01.254")
+
+
+class ConfigTemplateConsistencyTests(unittest.TestCase):
+    def test_all_tracked_config_templates_use_standard_auto_exposure(self) -> None:
+        root = Path(__file__).resolve().parent
+        config_paths = sorted(
+            path for path in root.glob("config_*.yaml") if not path.name.startswith("config_local")
+        )
+
+        self.assertTrue(config_paths, "expected at least one config_*.yaml template")
+
+        for config_path in config_paths:
+            with config_path.open("r", encoding="utf-8") as handle:
+                config = yaml.safe_load(handle)
+
+            self.assertIsInstance(config, dict, f"{config_path.name}: YAML root must be a mapping")
+            cameras = config.get("cameras")
+            self.assertIsInstance(cameras, list, f"{config_path.name}: cameras must be a list")
+
+            for camera in cameras:
+                self.assertIsInstance(camera, dict, f"{config_path.name}: each camera must be a mapping")
+                label = str(camera.get("label") or "").strip() or "<missing label>"
+                prefix = f"{config_path.name} {label}:"
+
+                self.assertIs(
+                    camera.get("auto_exposure"),
+                    True,
+                    f"{prefix} auto_exposure must be true",
+                )
+                self.assertEqual(
+                    camera.get("auto_exposure_mode"),
+                    "continuous",
+                    f"{prefix} auto_exposure_mode must be continuous",
+                )
+                self.assertEqual(
+                    float(camera.get("auto_exposure_lower_us")),
+                    6000.0,
+                    f"{prefix} auto_exposure_lower_us must be 6000",
+                )
+                self.assertEqual(
+                    float(camera.get("auto_exposure_upper_us")),
+                    180000.0,
+                    f"{prefix} auto_exposure_upper_us must be 180000",
+                )
+                self.assertEqual(
+                    float(camera.get("auto_target_brightness")),
+                    0.70,
+                    f"{prefix} auto_target_brightness must be 0.70",
+                )
+                self.assertEqual(
+                    camera.get("auto_exposure_roi"),
+                    "full",
+                    f"{prefix} auto_exposure_roi must be full",
+                )
+                self.assertEqual(
+                    float(camera.get("gain")),
+                    0.0,
+                    f"{prefix} gain must be 0",
+                )
+                self.assertIs(
+                    camera.get("auto_gain"),
+                    False,
+                    f"{prefix} auto_gain must be false",
+                )
+
+                lower = float(camera["auto_exposure_lower_us"])
+                upper = float(camera["auto_exposure_upper_us"])
+                seed = float(camera["exposure_us"])
+                fps = float(camera["fps"])
+
+                self.assertLessEqual(
+                    lower,
+                    seed,
+                    f"{prefix} exposure_us must be >= auto_exposure_lower_us",
+                )
+                self.assertLessEqual(
+                    seed,
+                    upper,
+                    f"{prefix} exposure_us must be <= auto_exposure_upper_us",
+                )
+                self.assertLess(
+                    upper,
+                    1_000_000.0 / fps,
+                    f"{prefix} auto_exposure_upper_us must stay below the frame period",
+                )
 
 
 if __name__ == "__main__":

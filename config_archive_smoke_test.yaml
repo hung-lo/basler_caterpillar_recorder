@@ -59,9 +59,15 @@ cameras:
     binning: 1
     pixel_format: auto
     # output_width: 960
-    exposure_us: 5000
+    # Starting exposure used before camera-side auto exposure takes over.
+    exposure_us: 30000
     gain: 0
-    auto_exposure: false
+    auto_exposure: true
+    auto_exposure_mode: continuous
+    auto_exposure_lower_us: 6000
+    auto_exposure_upper_us: 180000
+    auto_target_brightness: 0.70
+    auto_exposure_roi: full
     auto_gain: false
     balance_white_auto: false
     rotate: 270
