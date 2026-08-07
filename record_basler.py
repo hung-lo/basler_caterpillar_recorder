@@ -1272,6 +1272,8 @@ class FFmpegWriter:
 class ClipResult:
     label: str
     success: bool
+    planned_complete: bool
+    interrupted_by_user: bool
     metadata_path: Path
     video_path: Optional[Path]
     error: Optional[str] = None
@@ -1582,6 +1584,27 @@ def clip_directory_ready_for_archive(
             )
 
     return not issues, issues, total_bytes
+
+
+def summarize_clip_results(
+    clip_results: list[ClipResult],
+    *,
+    expected_camera_count: int,
+) -> tuple[bool, bool, bool, bool]:
+    clip_results_complete = len(clip_results) == expected_camera_count
+    clip_finalized_successfully = clip_results_complete and all(result.success for result in clip_results)
+    clip_reached_planned_end = clip_finalized_successfully and all(
+        result.planned_complete for result in clip_results
+    )
+    clip_interrupted_by_user = clip_finalized_successfully and any(
+        result.interrupted_by_user for result in clip_results
+    )
+    return (
+        clip_results_complete,
+        clip_finalized_successfully,
+        clip_reached_planned_end,
+        clip_interrupted_by_user,
+    )
 
 
 def resolve_executable(configured: str) -> Optional[str]:
@@ -2539,6 +2562,7 @@ def record_one_camera(
     encoding_cfg: dict[str, Any],
     ready_barrier: threading.Barrier,
     stop_event: threading.Event,
+    user_stop_event: threading.Event,
     storage_root: Path,
     clip_stop_threshold_bytes: Optional[int],
     result_queue: queue.Queue[ClipResult],
@@ -2586,6 +2610,9 @@ def record_one_camera(
     preview_publish_failed = False
     last_storage_check_ns = planned_start_mono_ns
     clip_timezone = local_timezone_metadata(clip_start_utc)
+    planned_complete = False
+    interrupted_by_user = False
+    stop_reason = "unknown"
 
     metadata: dict[str, Any] = {
         "camera": binding.info,
@@ -2651,6 +2678,8 @@ def record_one_camera(
         while camera.IsGrabbing() and not stop_event.is_set():
             now_mono_ns = time.monotonic_ns()
             if now_mono_ns >= planned_stop_mono_ns:
+                planned_complete = True
+                stop_reason = "planned_end"
                 break
             try:
                 grab = camera.RetrieveResult(2000, pylon.TimeoutHandling_ThrowException)
@@ -2674,6 +2703,8 @@ def record_one_camera(
                 if host_mono_ns < planned_start_mono_ns:
                     continue
                 if host_mono_ns >= planned_stop_mono_ns:
+                    planned_complete = True
+                    stop_reason = "planned_end"
                     break
 
                 image = binding.converter.Convert(grab)
@@ -2813,11 +2844,20 @@ def record_one_camera(
                 "H.264 capture succeeded, but MP4 remux failed. "
                 f"The recoverable MKV was kept at {temp_path}."
             )
-        if error_message is None and stop_event.is_set():
-            error_message = "Recording stopped before the planned clip end"
+        if not planned_complete and stop_event.is_set():
+            if user_stop_event.is_set():
+                interrupted_by_user = True
+                stop_reason = "user_interrupt"
+            elif error_message is None:
+                error_message = "Recording stopped early by a non-user stop request"
+                stop_reason = "internal_stop"
+        elif error_message is None and stop_reason == "unknown":
+            stop_reason = "planned_end" if planned_complete else "completed_without_stop_reason"
 
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
+        if stop_reason == "unknown":
+            stop_reason = "failure"
         LOG.exception("Recording failed for %s", label)
         stop_event.set()
     finally:
@@ -2859,6 +2899,9 @@ def record_one_camera(
         metadata.update(
             {
                 "success": error_message is None,
+                "planned_clip_complete": planned_complete,
+                "interrupted_by_user": interrupted_by_user,
+                "stop_reason": stop_reason,
                 "error": error_message,
                 "frame_count": frame_count,
                 "grab_failures": grab_failures,
@@ -2908,6 +2951,8 @@ def record_one_camera(
             ClipResult(
                 label=label,
                 success=error_message is None,
+                planned_complete=planned_complete,
+                interrupted_by_user=interrupted_by_user,
                 metadata_path=metadata_path,
                 video_path=final_path if final_path.exists() else (temp_path if temp_path.exists() else None),
                 error=error_message,
@@ -4137,6 +4182,7 @@ def write_session_manifest(
 def write_session_summary(
     session_dir: Path,
     completed_clips: int,
+    interrupted_clips: int,
     requested_clips: Optional[int],
     planned_session_span_s: Optional[float],
     stopped_by_signal: bool,
@@ -4147,6 +4193,7 @@ def write_session_summary(
     finished_at = utc_now()
     summary = {
         "completed_clips": completed_clips,
+        "interrupted_clips": interrupted_clips,
         "requested_clips": requested_clips,
         "planned_session_span_s": planned_session_span_s,
         "stopped_by_signal": stopped_by_signal,
@@ -4307,11 +4354,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     used_serials: set[str] = set()
     bindings: list[CameraBinding] = []
     recording_stop_event = threading.Event()
+    user_stop_event = threading.Event()
     archive_failure_event = threading.Event()
     preview_active_event = threading.Event()
     stopped_by_signal = False
     clip_index = 0
     completed_clips = 0
+    interrupted_clips = 0
     any_failure = False
     unexpected_exception: Optional[str] = None
     exit_status = "running"
@@ -4322,7 +4371,11 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     def request_stop(signum: int, _frame: Any) -> None:
         nonlocal stopped_by_signal
         stopped_by_signal = True
-        LOG.warning("Received signal %s; stopping after the current frame", signum)
+        user_stop_event.set()
+        LOG.warning(
+            "Received signal %s; gracefully finalizing the active clip before exit",
+            signum,
+        )
         recording_stop_event.set()
 
     signal.signal(signal.SIGINT, request_stop)
@@ -4528,6 +4581,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                             "encoding_cfg": encoding_cfg,
                             "ready_barrier": barrier,
                             "stop_event": recording_stop_event,
+                            "user_stop_event": user_stop_event,
                             "storage_root": session_dir,
                             "clip_stop_threshold_bytes": clip_stop_threshold_bytes,
                             "result_queue": results,
@@ -4567,10 +4621,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     clip_results.append(results.get())
                 for result in clip_results:
                     LOG.info(
-                        "Clip %d camera=%s success=%s video=%s metadata=%s",
+                        "Clip %d camera=%s success=%s planned_complete=%s interrupted_by_user=%s video=%s metadata=%s",
                         clip_index,
                         result.label,
                         result.success,
+                        result.planned_complete,
+                        result.interrupted_by_user,
                         result.video_path,
                         result.metadata_path,
                     )
@@ -4583,11 +4639,35 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                         len(bindings),
                         len(clip_results),
                     )
-                clip_finalized_successfully = len(clip_results) == len(bindings) and all(
-                    result.success for result in clip_results
+                (
+                    clip_results_complete,
+                    clip_finalized_successfully,
+                    clip_reached_planned_end,
+                    clip_interrupted_by_user,
+                ) = summarize_clip_results(
+                    clip_results,
+                    expected_camera_count=len(bindings),
                 )
-                if clip_finalized_successfully:
+                if clip_reached_planned_end:
                     completed_clips += 1
+                elif clip_interrupted_by_user:
+                    interrupted_clips += 1
+                    for result in clip_results:
+                        if result.interrupted_by_user:
+                            metadata, metadata_error = read_json_mapping(result.metadata_path)
+                            elapsed_s = metadata.get("actual_elapsed_s") if metadata_error is None and metadata else None
+                            LOG.info(
+                                "Clip %d camera=%s finalized successfully after operator interruption",
+                                clip_index,
+                                result.label,
+                            )
+                            if elapsed_s is not None:
+                                LOG.info(
+                                    "Clip %d is intentionally incomplete (%.1f / %.1f s)",
+                                    clip_index,
+                                    float(elapsed_s),
+                                    clip_duration_s,
+                                )
 
                 archive_failure = archive_manager.failure_detected() if archive_manager else False
                 clip_total_bytes_before_cleanup = tree_stats(clip_dir)[1]
@@ -4637,6 +4717,8 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                             try:
                                 assert archive_manager is not None
                                 archive_manager.enqueue_clip(clip_dir)
+                                if clip_interrupted_by_user:
+                                    LOG.info("Queued interrupted clip %d for archive", clip_index)
                             except Exception as exc:
                                 any_failure = True
                                 LOG.exception("Failed to enqueue clip %d for archive", clip_index)
@@ -4662,13 +4744,21 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 if any_failure:
                     break
 
+                if stopped_by_signal or user_stop_event.is_set():
+                    LOG.info(
+                        "Operator stop complete; active clip finalized%s. No additional clips will be started.",
+                        " and queued for archive" if clip_finalized_successfully else "",
+                    )
+                    break
+
                 clip_index += 1
 
             LOG.info("Recording finished after %d completed clip(s)", completed_clips)
     except KeyboardInterrupt:
         stopped_by_signal = True
         exit_status = "interrupted"
-        LOG.warning("KeyboardInterrupt received; stopping recording")
+        user_stop_event.set()
+        LOG.warning("KeyboardInterrupt received; gracefully finalizing the active clip")
         recording_stop_event.set()
     except Exception as exc:
         any_failure = True
@@ -4679,6 +4769,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     finally:
         if archive_manager is not None:
             try:
+                if stopped_by_signal or user_stop_event.is_set():
+                    pending = archive_manager.unarchived_count()
+                    LOG.info(
+                        "Ctrl+C requested. Recording has stopped; waiting for %d archive transfer(s) to finish before exit...",
+                        pending,
+                    )
+                    LOG.info("Waiting for archive transfers to finish ...")
                 archive_manager.wait_until_idle()
                 archive_manager.close_transfers()
             except Exception as exc:
@@ -4699,6 +4796,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
             write_session_summary(
                 session_dir=session_dir,
                 completed_clips=completed_clips,
+                interrupted_clips=interrupted_clips,
                 requested_clips=requested_clips,
                 planned_session_span_s=planned_session_duration_s,
                 stopped_by_signal=stopped_by_signal,

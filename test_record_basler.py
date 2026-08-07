@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import gzip
 import json
 import logging
 import tempfile
@@ -410,6 +411,75 @@ class ArchiveBackendTests(unittest.TestCase):
                 manager._ensure_robocopy_partial_destination(
                     archive_session_dir / "clip_0000.partial"
                 )
+
+    def test_valid_interrupted_clip_is_ready_for_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp) / "clip_0000_105302-0400"
+            clip_dir.mkdir()
+            metadata_path = clip_dir / "camera1.json"
+            (clip_dir / "camera1.mp4").write_bytes(b"mp4")
+            with gzip.open(
+                clip_dir / "camera1.timestamps.csv.gz",
+                "wt",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write("frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n")
+                handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+            record_basler.write_json(
+                metadata_path,
+                {
+                    "success": True,
+                    "planned_clip_complete": False,
+                    "interrupted_by_user": True,
+                    "stop_reason": "user_interrupt",
+                    "grab_failures": 0,
+                    "mp4_remux_succeeded": True,
+                },
+            )
+
+            ready, issues, _total_bytes = record_basler.clip_directory_ready_for_archive(
+                clip_dir,
+                expected_camera_count=1,
+                max_clip_size_bytes=10_000_000,
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(issues, [])
+
+    def test_summarize_clip_results_treats_valid_user_interrupt_as_non_failure(self) -> None:
+        results = [
+            record_basler.ClipResult(
+                label="camera1",
+                success=True,
+                planned_complete=False,
+                interrupted_by_user=True,
+                metadata_path=Path("camera1.json"),
+                video_path=Path("camera1.mp4"),
+                error=None,
+            )
+        ]
+
+        summary = record_basler.summarize_clip_results(results, expected_camera_count=1)
+
+        self.assertEqual(summary, (True, True, False, True))
+
+    def test_summarize_clip_results_keeps_internal_stop_as_failure(self) -> None:
+        results = [
+            record_basler.ClipResult(
+                label="camera1",
+                success=False,
+                planned_complete=False,
+                interrupted_by_user=False,
+                metadata_path=Path("camera1.json"),
+                video_path=Path("camera1.mp4"),
+                error="Recording stopped early by a non-user stop request",
+            )
+        ]
+
+        summary = record_basler.summarize_clip_results(results, expected_camera_count=1)
+
+        self.assertEqual(summary, (True, False, False, False))
 
 
 class JsonSerializationTests(unittest.TestCase):
