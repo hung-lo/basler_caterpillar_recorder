@@ -388,7 +388,7 @@ During recording:
 
 Press `Ctrl+C` once to stop recording gracefully.
 
-If a clip is currently being recorded, the recorder stops acquisition after the current frame, finalizes the partial MP4 and timestamp sidecar, and marks the clip as intentionally incomplete. When archiving is enabled, the partial clip is queued for archive and verified before the program exits.
+If a clip is currently being recorded, the recorder stops acquisition after the current frame, finalizes the partial MP4 and timestamp sidecar, and marks the clip as intentionally incomplete. On Windows, the recorder isolates FFmpeg from console `Ctrl+C` events so Python handles the stop request and then closes FFmpeg through its stdin pipe for a clean partial-clip finalize. When archiving is enabled, the partial clip is queued for archive and verified before the program exits.
 
 The interrupted clip is preserved but is not counted as a fully completed scheduled clip.
 

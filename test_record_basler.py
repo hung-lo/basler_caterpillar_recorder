@@ -542,6 +542,165 @@ class ArchiveBackendTests(unittest.TestCase):
         )
 
 
+class FFmpegWriterTests(unittest.TestCase):
+    def make_writer(self, root: Path) -> record_basler.FFmpegWriter:
+        return record_basler.FFmpegWriter(
+            ffmpeg="ffmpeg",
+            temp_path=root / "camera1.capture.mkv",
+            final_path=root / "camera1.mp4",
+            width=1920,
+            height=1200,
+            fps=5.0,
+            encoding_cfg={"codec": "libx264", "preset": "veryfast", "crf": 23},
+        )
+
+    def test_start_uses_new_process_group_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            process = mock.Mock()
+            with mock.patch.object(record_basler.os, "name", "nt"):
+                with mock.patch.object(
+                    record_basler.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x200,
+                    create=True,
+                ):
+                    with mock.patch.object(
+                        record_basler.subprocess,
+                        "Popen",
+                        return_value=process,
+                    ) as popen_mock:
+                        writer.start()
+
+            self.assertIs(writer.process, process)
+            self.assertEqual(popen_mock.call_args.kwargs["creationflags"], 0x200)
+            if writer.stderr_handle is not None:
+                writer.stderr_handle.close()
+
+    def test_start_uses_zero_creationflags_off_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            process = mock.Mock()
+            with mock.patch.object(record_basler.os, "name", "posix"):
+                with mock.patch.object(
+                    record_basler.subprocess,
+                    "Popen",
+                    return_value=process,
+                ) as popen_mock:
+                    writer.start()
+
+            self.assertIs(writer.process, process)
+            self.assertEqual(popen_mock.call_args.kwargs["creationflags"], 0)
+            if writer.stderr_handle is not None:
+                writer.stderr_handle.close()
+
+    def test_close_and_remux_uses_new_process_group_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.temp_path.write_bytes(b"mkv")
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 0
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(record_basler.os, "name", "nt"):
+                with mock.patch.object(
+                    record_basler.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x200,
+                    create=True,
+                ):
+                    with mock.patch.object(
+                        record_basler.subprocess,
+                        "run",
+                        return_value=mock.Mock(returncode=0),
+                    ) as run_mock:
+                        return_code, remuxed = writer.close_and_remux(keep_temp=True)
+
+            self.assertEqual((return_code, remuxed), (0, True))
+            self.assertEqual(run_mock.call_args.kwargs["creationflags"], 0x200)
+
+    def test_close_and_remux_success_on_zero_capture_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.temp_path.write_bytes(b"mkv")
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 0
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(
+                record_basler.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0),
+            ) as run_mock:
+                return_code, remuxed = writer.close_and_remux(keep_temp=True)
+
+            self.assertEqual((return_code, remuxed), (0, True))
+            self.assertTrue(remuxed)
+            run_mock.assert_called_once()
+
+    def test_close_and_remux_recovers_nonzero_capture_exit_for_user_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.temp_path.write_bytes(b"mkv")
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 255
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(
+                record_basler.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0),
+            ) as run_mock:
+                return_code, remuxed = writer.close_and_remux(
+                    keep_temp=True,
+                    allow_nonzero_capture_recovery=True,
+                )
+
+            self.assertEqual((return_code, remuxed), (255, True))
+            run_mock.assert_called_once()
+
+    def test_close_and_remux_does_not_recover_nonzero_capture_exit_without_allowance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 255
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(record_basler.subprocess, "run") as run_mock:
+                return_code, remuxed = writer.close_and_remux(
+                    keep_temp=True,
+                    allow_nonzero_capture_recovery=False,
+                )
+
+            self.assertEqual((return_code, remuxed), (255, False))
+            run_mock.assert_not_called()
+
+    def test_close_and_remux_failed_recovery_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.temp_path.write_bytes(b"mkv")
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 255
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(
+                record_basler.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=1),
+            ):
+                return_code, remuxed = writer.close_and_remux(
+                    keep_temp=True,
+                    allow_nonzero_capture_recovery=True,
+                )
+
+            self.assertEqual((return_code, remuxed), (255, False))
+
+
 class JsonSerializationTests(unittest.TestCase):
     def test_windows_path_serialization(self) -> None:
         payload = {

@@ -69,7 +69,7 @@ python validate_session.py SESSION_PATH
 
 Press `Ctrl+C` once to stop recording gracefully.
 
-If a clip is in progress, the recorder finalizes the partial MP4 and timestamp sidecar before exiting. When archiving is enabled, it also waits for the partial clip and any earlier queued clips to finish transfer and verification before the program exits.
+If a clip is in progress, the recorder finalizes the partial MP4 and timestamp sidecar before exiting. On Windows, the recorder isolates FFmpeg from console `Ctrl+C` events so Python handles the stop request and then closes FFmpeg through its stdin pipe for a clean partial-clip finalize. When archiving is enabled, it also waits for the partial clip and any earlier queued clips to finish transfer and verification before the program exits.
 
 The interrupted clip is preserved but is not counted as a fully completed scheduled clip.
 

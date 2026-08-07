@@ -1133,6 +1133,14 @@ def close_bindings(bindings: Iterable[CameraBinding]) -> None:
             pass
 
 
+def child_creationflags(*, isolate_ctrl_c: bool = False) -> int:
+    if os.name != "nt":
+        return 0
+    if isolate_ctrl_c:
+        return int(subprocess.CREATE_NEW_PROCESS_GROUP)
+    return 0
+
+
 class FFmpegWriter:
     def __init__(
         self,
@@ -1202,6 +1210,7 @@ class FFmpegWriter:
             stdout=subprocess.DEVNULL,
             stderr=self.stderr_handle,
             bufsize=0,
+            creationflags=child_creationflags(isolate_ctrl_c=True),
         )
 
     def write(self, frame: np.ndarray) -> None:
@@ -1217,7 +1226,12 @@ class FFmpegWriter:
         except BrokenPipeError as exc:
             raise RuntimeError(f"FFmpeg stopped while writing {self.temp_path}") from exc
 
-    def close_and_remux(self, *, keep_temp: bool = False) -> tuple[int, bool]:
+    def close_and_remux(
+        self,
+        *,
+        keep_temp: bool = False,
+        allow_nonzero_capture_recovery: bool = False,
+    ) -> tuple[int, bool]:
         if self.process is None:
             return -1, False
         if self.process.stdin is not None:
@@ -1229,8 +1243,15 @@ class FFmpegWriter:
         if self.stderr_handle is not None:
             self.stderr_handle.close()
         if return_code != 0:
-            LOG.error("FFmpeg encoding failed for %s; see %s", self.temp_path, self.stderr_path)
-            return return_code, False
+            if not allow_nonzero_capture_recovery:
+                LOG.error("FFmpeg encoding failed for %s; see %s", self.temp_path, self.stderr_path)
+                return return_code, False
+            LOG.warning(
+                "FFmpeg capture exited with code %s during an operator stop; "
+                "attempting to recover/remux %s",
+                return_code,
+                self.temp_path,
+            )
 
         # MKV is resilient during capture. Remuxing is fast and does not recompress.
         remux_log = self.final_path.with_name(f"{self.final_path.stem}.remux.log")
@@ -1249,7 +1270,13 @@ class FFmpegWriter:
             str(self.final_path),
         ]
         with remux_log.open("wb") as log_handle:
-            remux = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=log_handle, check=False)
+            remux = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=log_handle,
+                check=False,
+                creationflags=child_creationflags(isolate_ctrl_c=True),
+            )
         if remux.returncode == 0:
             if not keep_temp:
                 self.temp_path.unlink(missing_ok=True)
@@ -2676,6 +2703,7 @@ def record_one_camera(
     error_message: Optional[str] = None
     remuxed = False
     ffmpeg_return_code: Optional[int] = None
+    ffmpeg_nonzero_exit_recovered = False
     output_width: Optional[int] = None
     output_height: Optional[int] = None
     preview_interval_ns = max(1, round(1e9 / preview_settings.fps))
@@ -2909,14 +2937,22 @@ def record_one_camera(
             timestamp_handle.close()
             timestamp_handle = None
 
-        ffmpeg_return_code, remuxed = writer.close_and_remux(keep_temp=True)
+        ffmpeg_return_code, remuxed = writer.close_and_remux(
+            keep_temp=True,
+            allow_nonzero_capture_recovery=user_stop_event.is_set(),
+        )
+        ffmpeg_nonzero_exit_recovered = (
+            user_stop_event.is_set()
+            and ffmpeg_return_code != 0
+            and remuxed
+        )
         writer = None
-        if ffmpeg_return_code != 0:
+        if ffmpeg_return_code != 0 and not ffmpeg_nonzero_exit_recovered:
             raise RuntimeError(f"FFmpeg exited with code {ffmpeg_return_code}")
         if not remuxed:
             raise RuntimeError(
-                "H.264 capture succeeded, but MP4 remux failed. "
-                f"The recoverable MKV was kept at {temp_path}."
+                "H.264 capture did not produce a recoverable MP4. "
+                f"The capture MKV was kept at {temp_path}."
             )
 
     except Exception as exc:
@@ -3016,7 +3052,9 @@ def record_one_camera(
                 "last_camera_timestamp": last_camera_timestamp,
                 "actual_elapsed_s": actual_elapsed_s,
                 "measured_receive_fps": measured_fps,
+                "ffmpeg_capture_return_code": ffmpeg_return_code,
                 "ffmpeg_return_code": ffmpeg_return_code,
+                "ffmpeg_nonzero_exit_recovered": ffmpeg_nonzero_exit_recovered,
                 "mp4_remux_succeeded": remuxed,
                 "completed_utc": isoformat_utc(completed_at),
                 "completed_local": isoformat_local(completed_at),
