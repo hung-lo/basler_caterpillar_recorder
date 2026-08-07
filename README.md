@@ -384,6 +384,16 @@ During recording:
 - `s` saves the raw preview frame without the panel or footer into the clip directory;
 - `Ctrl+C` stops the recording cleanly.
 
+### Stopping a recording safely
+
+Press `Ctrl+C` once to stop recording gracefully.
+
+If a clip is currently being recorded, the recorder stops acquisition after the current frame, finalizes the partial MP4 and timestamp sidecar, and marks the clip as intentionally incomplete. When archiving is enabled, the partial clip is queued for archive and verified before the program exits.
+
+The interrupted clip is preserved but is not counted as a fully completed scheduled clip.
+
+After pressing `Ctrl+C`, keep the terminal open until the recorder reports that pending archive transfers have finished.
+
 Supported layouts:
 
 - `card_panel`: appends a right-side information panel and bottom status footer while keeping the camera image unobstructed.

@@ -481,6 +481,66 @@ class ArchiveBackendTests(unittest.TestCase):
 
         self.assertEqual(summary, (True, False, False, False))
 
+    def test_classify_clip_stop_clean_user_interrupt(self) -> None:
+        classification = record_basler.classify_clip_stop(
+            error_message=None,
+            planned_complete=False,
+            stop_event_set=True,
+            operator_stop_requested=True,
+            stop_reason="unknown",
+        )
+
+        self.assertIsNone(classification.error_message)
+        self.assertFalse(classification.planned_complete)
+        self.assertTrue(classification.operator_stop_requested)
+        self.assertTrue(classification.interrupted_by_user)
+        self.assertEqual(classification.stop_reason, "user_interrupt")
+
+    def test_classify_clip_stop_error_takes_precedence_over_user_interrupt(self) -> None:
+        classification = record_basler.classify_clip_stop(
+            error_message="FFmpeg remux failed",
+            planned_complete=False,
+            stop_event_set=True,
+            operator_stop_requested=True,
+            stop_reason="user_interrupt",
+        )
+
+        self.assertEqual(classification.error_message, "FFmpeg remux failed")
+        self.assertTrue(classification.operator_stop_requested)
+        self.assertFalse(classification.interrupted_by_user)
+        self.assertEqual(classification.stop_reason, "failure")
+
+    def test_classify_clip_stop_normal_completion_remains_planned_end(self) -> None:
+        classification = record_basler.classify_clip_stop(
+            error_message=None,
+            planned_complete=True,
+            stop_event_set=False,
+            operator_stop_requested=False,
+            stop_reason="unknown",
+        )
+
+        self.assertIsNone(classification.error_message)
+        self.assertFalse(classification.interrupted_by_user)
+        self.assertEqual(classification.stop_reason, "planned_end")
+
+    def test_describe_operator_stop_completion_uses_real_archive_state(self) -> None:
+        self.assertEqual(
+            record_basler.describe_operator_stop_completion(
+                clip_finalized_successfully=True,
+                clip_queued_for_archive=True,
+                archive_enabled=True,
+            ),
+            "Operator stop complete; active clip finalized and queued for archive. No additional clips will be started.",
+        )
+        self.assertEqual(
+            record_basler.describe_operator_stop_completion(
+                clip_finalized_successfully=True,
+                clip_queued_for_archive=False,
+                archive_enabled=False,
+            ),
+            "Operator stop complete; active clip finalized locally. Archiving is disabled. No additional clips will be started.",
+        )
+
 
 class JsonSerializationTests(unittest.TestCase):
     def test_windows_path_serialization(self) -> None:

@@ -1279,6 +1279,15 @@ class ClipResult:
     error: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class StopClassification:
+    error_message: Optional[str]
+    planned_complete: bool
+    interrupted_by_user: bool
+    operator_stop_requested: bool
+    stop_reason: str
+
+
 def bytes_to_gib(value: int) -> float:
     return value / float(1024**3)
 
@@ -1604,6 +1613,70 @@ def summarize_clip_results(
         clip_finalized_successfully,
         clip_reached_planned_end,
         clip_interrupted_by_user,
+    )
+
+
+def classify_clip_stop(
+    *,
+    error_message: Optional[str],
+    planned_complete: bool,
+    stop_event_set: bool,
+    operator_stop_requested: bool,
+    stop_reason: str,
+) -> StopClassification:
+    interrupted_by_user = False
+    next_error = error_message
+    next_reason = stop_reason
+
+    if next_error is not None:
+        if next_reason in {"unknown", "user_interrupt"}:
+            next_reason = "failure"
+    elif planned_complete:
+        if next_reason == "unknown":
+            next_reason = "planned_end"
+    elif stop_event_set:
+        if operator_stop_requested:
+            interrupted_by_user = True
+            next_reason = "user_interrupt"
+        else:
+            next_error = "Recording stopped early by a non-user stop request"
+            next_reason = "internal_stop"
+    elif next_reason == "unknown":
+        next_reason = "completed_without_stop_reason"
+
+    return StopClassification(
+        error_message=next_error,
+        planned_complete=planned_complete,
+        interrupted_by_user=interrupted_by_user,
+        operator_stop_requested=operator_stop_requested,
+        stop_reason=next_reason,
+    )
+
+
+def describe_operator_stop_completion(
+    *,
+    clip_finalized_successfully: bool,
+    clip_queued_for_archive: bool,
+    archive_enabled: bool,
+) -> str:
+    if clip_queued_for_archive:
+        return (
+            "Operator stop complete; active clip finalized and queued for archive. "
+            "No additional clips will be started."
+        )
+    if clip_finalized_successfully and archive_enabled:
+        return (
+            "Operator stop complete; active clip finalized locally, but was not queued for archive. "
+            "No additional clips will be started."
+        )
+    if clip_finalized_successfully:
+        return (
+            "Operator stop complete; active clip finalized locally. "
+            "Archiving is disabled. No additional clips will be started."
+        )
+    return (
+        "Operator stop complete; active clip did not finalize successfully. "
+        "No additional clips will be started."
     )
 
 
@@ -2636,6 +2709,7 @@ def record_one_camera(
         },
         "local_timezone_label": clip_timezone["local_timezone_label"],
         "local_utc_offset_at_clip_start": clip_timezone["local_utc_offset"],
+        "operator_stop_requested": False,
         "video_path": str(final_path),
         "temporary_video_path": str(temp_path),
         "timestamps_path": str(timestamps_path),
@@ -2844,15 +2918,6 @@ def record_one_camera(
                 "H.264 capture succeeded, but MP4 remux failed. "
                 f"The recoverable MKV was kept at {temp_path}."
             )
-        if not planned_complete and stop_event.is_set():
-            if user_stop_event.is_set():
-                interrupted_by_user = True
-                stop_reason = "user_interrupt"
-            elif error_message is None:
-                error_message = "Recording stopped early by a non-user stop request"
-                stop_reason = "internal_stop"
-        elif error_message is None and stop_reason == "unknown":
-            stop_reason = "planned_end" if planned_complete else "completed_without_stop_reason"
 
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
@@ -2895,11 +2960,23 @@ def record_one_camera(
             if actual_elapsed_s > 0 and frame_count > 1:
                 measured_fps = (frame_count - 1) / actual_elapsed_s
         completed_at = utc_now()
+        classification = classify_clip_stop(
+            error_message=error_message,
+            planned_complete=planned_complete,
+            stop_event_set=stop_event.is_set(),
+            operator_stop_requested=user_stop_event.is_set(),
+            stop_reason=stop_reason,
+        )
+        error_message = classification.error_message
+        planned_complete = classification.planned_complete
+        interrupted_by_user = classification.interrupted_by_user
+        stop_reason = classification.stop_reason
 
         metadata.update(
             {
                 "success": error_message is None,
                 "planned_clip_complete": planned_complete,
+                "operator_stop_requested": classification.operator_stop_requested,
                 "interrupted_by_user": interrupted_by_user,
                 "stop_reason": stop_reason,
                 "error": error_message,
@@ -4671,6 +4748,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
                 archive_failure = archive_manager.failure_detected() if archive_manager else False
                 clip_total_bytes_before_cleanup = tree_stats(clip_dir)[1]
+                clip_queued_for_archive = False
 
                 if (
                     not any_failure
@@ -4717,6 +4795,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                             try:
                                 assert archive_manager is not None
                                 archive_manager.enqueue_clip(clip_dir)
+                                clip_queued_for_archive = True
                                 if clip_interrupted_by_user:
                                     LOG.info("Queued interrupted clip %d for archive", clip_index)
                             except Exception as exc:
@@ -4746,8 +4825,12 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
 
                 if stopped_by_signal or user_stop_event.is_set():
                     LOG.info(
-                        "Operator stop complete; active clip finalized%s. No additional clips will be started.",
-                        " and queued for archive" if clip_finalized_successfully else "",
+                        "%s",
+                        describe_operator_stop_completion(
+                            clip_finalized_successfully=clip_finalized_successfully,
+                            clip_queued_for_archive=clip_queued_for_archive,
+                            archive_enabled=archive_settings.enabled,
+                        ),
                     )
                     break
 
@@ -4770,12 +4853,9 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         if archive_manager is not None:
             try:
                 if stopped_by_signal or user_stop_event.is_set():
-                    pending = archive_manager.unarchived_count()
                     LOG.info(
-                        "Ctrl+C requested. Recording has stopped; waiting for %d archive transfer(s) to finish before exit...",
-                        pending,
+                        "Ctrl+C requested. Recording has stopped; waiting for pending archive transfers to finish before exit..."
                     )
-                    LOG.info("Waiting for archive transfers to finish ...")
                 archive_manager.wait_until_idle()
                 archive_manager.close_transfers()
             except Exception as exc:

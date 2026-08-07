@@ -65,6 +65,16 @@ python validate_session.py SESSION_PATH
 - `q` hides the recording preview without stopping acquisition.
 - `Ctrl+C` stops the recording cleanly.
 
+### Stopping a recording safely
+
+Press `Ctrl+C` once to stop recording gracefully.
+
+If a clip is in progress, the recorder finalizes the partial MP4 and timestamp sidecar before exiting. When archiving is enabled, it also waits for the partial clip and any earlier queued clips to finish transfer and verification before the program exits.
+
+The interrupted clip is preserved but is not counted as a fully completed scheduled clip.
+
+After pressing `Ctrl+C`, keep the terminal open until the recorder reports that pending archive transfers have finished.
+
 ## Final pre-run checklist
 
 - Dry run passed.
