@@ -154,7 +154,7 @@ output_root:
 
 schedule:
   # Optional one-shot local start. Remove or leave null for immediate start.
-  # start_at_local: "2026-08-08 05:00"
+  # start_at_local: "YYYY-MM-DD HH:MM"
   clip_duration_s:
   interval_s:
   number_of_clips:
@@ -237,11 +237,24 @@ One-shot scheduled starts must include both date and time, for example:
 
 ```yaml
 schedule:
-  start_at_local: "2026-08-08 05:00"
+  start_at_local: "2026-09-01 05:00"
   clip_duration_s: 1800
   interval_s: 1800
   total_duration_h: 24
 ```
+
+Supported `start_at_local` formats are:
+
+- `YYYY-MM-DD HH:MM`
+- `YYYY-MM-DD HH:MM:SS`
+
+Important scheduler rules:
+
+- Omit `start_at_local` or set it to `null` for the normal immediate-start behavior.
+- The value is interpreted in the recording computer's local timezone.
+- A clock-only value such as `"05:00"` is rejected.
+- A past scheduled time is rejected instead of silently starting immediately.
+- In scheduled mode, the recorder waits first and only creates the real session directory when the scheduled start is reached.
 
 Remove or comment `start_at_local` after that experiment if you want the next invocation to start immediately.
 
@@ -354,6 +367,15 @@ For a scheduled overnight macOS run, the recommended sequence is:
 python record_basler.py --config config_local_macos.yaml --dry-run
 caffeinate -i python record_basler.py --config config_local_macos.yaml
 ```
+
+During an actual scheduled wait, the recorder:
+
+- performs pre-arm FFmpeg / camera / archive checks before waiting;
+- prints periodic `STATUS` heartbeats until the requested start;
+- repeats critical checks again at the scheduled start before opening cameras;
+- keeps built-in sleep prevention active during the wait when `system.prevent_sleep_during_recording: true`.
+
+Pressing `Ctrl+C` during the scheduled waiting phase cancels the run cleanly before recording starts.
 
 ## Setup preview
 
