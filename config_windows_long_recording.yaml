@@ -69,6 +69,9 @@ archive:
   stop_before_next_clip_on_transfer_failure: true
 
 schedule:
+  # Optional one-shot wall-clock start in this computer's local timezone.
+  # Omit or leave null to start normally when the recorder is launched.
+  # start_at_local: "2026-08-08 05:00"
   # Start-to-start scheduling.
   # 30 clips x 10 minutes = approximately 5 hours.
   clip_duration_s: 600

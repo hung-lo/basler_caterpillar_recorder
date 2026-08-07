@@ -17,6 +17,7 @@ firmware, so every requested setting is queried and logged rather than assumed.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import dataclasses
 import datetime as dt
@@ -3221,6 +3222,44 @@ def validate_schedule(schedule: dict[str, Any]) -> tuple[float, float, Optional[
     return clip_duration_s, interval_s, total_duration_s, number_of_clips
 
 
+def parse_start_at_local(
+    schedule: dict[str, Any],
+    *,
+    now_utc: Optional[dt.datetime] = None,
+) -> Optional[dt.datetime]:
+    raw = schedule.get("start_at_local")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "schedule.start_at_local must be null or a local datetime string in "
+            "'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD HH:MM:SS' format"
+        )
+
+    parsed_naive: Optional[dt.datetime] = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            parsed_naive = dt.datetime.strptime(raw.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if parsed_naive is None:
+        raise ValueError(
+            "schedule.start_at_local must use 'YYYY-MM-DD HH:MM' or "
+            "'YYYY-MM-DD HH:MM:SS' in the computer's local timezone"
+        )
+
+    target_local = parsed_naive.astimezone()
+    target_utc = target_local.astimezone(dt.timezone.utc)
+    reference_utc = now_utc or utc_now()
+    if target_utc <= reference_utc:
+        raise ValueError(
+            f"schedule.start_at_local {raw.strip()} is already in the past. "
+            "Remove start_at_local to start immediately, or set a future date/time."
+        )
+    return target_utc
+
+
 def expected_clip_count(
     *,
     interval_s: float,
@@ -3268,6 +3307,88 @@ def format_local_finish_time(
     if local_finish.date() == local_now.date():
         return local_finish.strftime("%H:%M")
     return local_finish.strftime("%Y-%m-%d %H:%M")
+
+
+def match_configured_devices(camera_cfgs: list[dict[str, Any]]) -> list[Any]:
+    devices = enumerate_devices()
+    if len(devices) < len(camera_cfgs):
+        raise RuntimeError(
+            f"Config requests {len(camera_cfgs)} cameras, but only {len(devices)} were detected."
+        )
+
+    used_serials: set[str] = set()
+    matched: list[Any] = []
+    for camera_cfg_raw in camera_cfgs:
+        camera_cfg = dict(camera_cfg_raw)
+        device = match_device(camera_cfg, devices, used_serials)
+        matched.append(device)
+        used_serials.add(camera_info_dict(device)["serial"])
+    return matched
+
+
+def existing_disk_usage_probe_path(path: Path) -> Path:
+    candidate = path.expanduser()
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            return Path.cwd()
+        candidate = parent
+    return candidate
+
+
+def log_scheduled_start_plan(
+    *,
+    requested_start_utc: dt.datetime,
+    planned_session_duration_s: float,
+    now_utc: Optional[dt.datetime] = None,
+) -> None:
+    reference_utc = now_utc or utc_now()
+    planned_finish_utc = requested_start_utc + dt.timedelta(seconds=planned_session_duration_s)
+    LOG.info("Scheduled recording armed")
+    LOG.info("Requested start: %s", isoformat_local(requested_start_utc))
+    LOG.info(
+        "Starts in: %s",
+        format_clock_duration((requested_start_utc - reference_utc).total_seconds()),
+    )
+    LOG.info(
+        "Planned recording span: %s",
+        format_clock_duration(planned_session_duration_s),
+    )
+    LOG.info(
+        "Planned finish: %s local",
+        format_local_finish_time(planned_finish_utc, now_utc=requested_start_utc),
+    )
+
+
+def wait_until_scheduled_start(
+    *,
+    target_utc: dt.datetime,
+    terminal_interval_s: float,
+    cancel_event: Optional[threading.Event] = None,
+    now_utc_fn: Any = utc_now,
+    monotonic_fn: Any = time.monotonic,
+    sleep_fn: Any = time.sleep,
+) -> bool:
+    next_status_mono = monotonic_fn()
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+
+        remaining_s = (target_utc - now_utc_fn()).total_seconds()
+        if remaining_s <= 0:
+            return True
+
+        now_mono = monotonic_fn()
+        if terminal_interval_s > 0 and now_mono >= next_status_mono:
+            LOG.info(
+                "STATUS | waiting for scheduled start | starts in %s | start %s local",
+                format_clock_duration(remaining_s),
+                isoformat_local(target_utc),
+            )
+            next_status_mono = now_mono + terminal_interval_s
+
+        sleep_fn(min(remaining_s, 1.0))
 
 
 PREVIEW_PANEL_BACKGROUND = (42, 27, 24)
@@ -4321,48 +4442,31 @@ def write_session_summary(
     write_json(session_dir / "session_summary.json", summary)
 
 
-def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
-    schedule = dict(config.get("schedule") or {})
-    clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
-    system_settings = parse_system_settings(config)
-    status_settings = parse_status_settings(config)
-    preview_settings = parse_recording_preview_settings(config)
-    archive_settings = parse_archive_settings(config)
-    total_clips = expected_clip_count(
-        interval_s=interval_s,
-        total_duration_s=total_duration_s,
-        number_of_clips=number_of_clips,
-    )
-    planned_session_duration_s = planned_session_span_s(
-        clip_count=total_clips,
-        clip_duration_s=clip_duration_s,
-        interval_s=interval_s,
-    )
-    schedule_start_utc = utc_now()
-    planned_finish_utc = schedule_start_utc + dt.timedelta(seconds=planned_session_duration_s)
-    schedule_timezone = local_timezone_metadata(schedule_start_utc)
-    recording_plan = {
-        "expected_clips": total_clips,
-        "clip_duration_s": clip_duration_s,
-        "interval_s": interval_s,
-        "planned_session_span_s": planned_session_duration_s,
-        "schedule_start_utc": isoformat_utc(schedule_start_utc),
-        "schedule_start_local": isoformat_local(schedule_start_utc),
-        "planned_finish_utc": isoformat_utc(planned_finish_utc),
-        "planned_finish_local": isoformat_local(planned_finish_utc),
-        "timestamp_policy": {
-            "canonical_wall_clock": "UTC",
-            "human_display": "local_with_numeric_offset",
-            "duration_clock": "monotonic",
-            "local_timezone_label": schedule_timezone["local_timezone_label"],
-            "local_utc_offset_at_start": schedule_timezone["local_utc_offset"],
-        },
-    }
+def run_recording_session(
+    *,
+    config_path: Path,
+    config: dict[str, Any],
+    verbose: bool,
+    ffmpeg: str,
+    clip_duration_s: float,
+    interval_s: float,
+    total_duration_s: Optional[float],
+    number_of_clips: Optional[int],
+    total_clips: int,
+    planned_session_duration_s: float,
+    planned_finish_utc: dt.datetime,
+    system_settings: SystemSettings,
+    status_settings: StatusSettings,
+    preview_settings: RecordingPreviewSettings,
+    archive_settings: ArchiveSettings,
+    recording_plan: dict[str, Any],
+    output_root: Path,
+    project: str,
+    subject: str,
+    camera_cfgs: list[dict[str, Any]],
+    manage_sleep: bool = True,
+) -> int:
     requested_clips = total_clips
-
-    project = sanitize_token(str(config.get("project", "caterpillar")))
-    subject = sanitize_token(str(config.get("subject", "cohort")))
-    output_root = Path(str(config.get("output_root", "./recordings"))).expanduser()
     session_start_utc = utc_now()
     session_dir = choose_unique_directory(
         output_root / project / subject / filename_local_timestamp(session_start_utc)
@@ -4372,6 +4476,9 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     setup_logging(session_dir, verbose)
 
     LOG.info("Session directory: %s", session_dir)
+    LOG.info("Start mode: %s", recording_plan.get("start_mode"))
+    if recording_plan.get("requested_start_local"):
+        LOG.info("Requested start: %s", recording_plan["requested_start_local"])
     LOG.info(
         "Schedule: %.1f s recording every %.1f s; total_duration_s=%s number_of_clips=%s",
         clip_duration_s,
@@ -4427,46 +4534,13 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         for error in archive_preflight.errors:
             LOG.error("Archive preflight issue: %s", error)
 
-    if dry_run:
-        shutil.copy2(config_path, session_dir / "config_used.yaml")
-        write_json(
-            session_dir / "dry_run.json",
-            {
-                "project": project,
-                "subject": subject,
-                "clip_duration_s": clip_duration_s,
-                "interval_s": interval_s,
-                "total_duration_s": total_duration_s,
-                "number_of_clips": number_of_clips,
-                "status": dataclasses.asdict(status_settings),
-                "system": dataclasses.asdict(system_settings),
-                "recording_preview": dataclasses.asdict(preview_settings),
-                "archive": dataclasses.asdict(archive_settings),
-                "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
-                "recording_plan": recording_plan,
-            },
-        )
-        LOG.info("Dry run completed; no cameras were opened.")
-        if archive_preflight is not None and not archive_preflight.ok:
-            return 1
-        return 0
-
     if archive_settings.enabled and (archive_preflight is None or not archive_preflight.ok):
-        LOG.error("Archive preflight failed; refusing to open cameras")
+        LOG.error("Scheduled start reached but archive preflight failed")
+        LOG.error("Refusing to open cameras")
         return 1
 
-    ffmpeg = find_ffmpeg(config.get("ffmpeg"))
-    camera_cfgs = config.get("cameras")
-    if not isinstance(camera_cfgs, list) or not camera_cfgs:
-        raise ValueError("config.cameras must be a non-empty list")
+    matched_devices = match_configured_devices(camera_cfgs)
 
-    devices = enumerate_devices()
-    if len(devices) < len(camera_cfgs):
-        raise RuntimeError(
-            f"Config requests {len(camera_cfgs)} cameras, but only {len(devices)} were detected."
-        )
-
-    used_serials: set[str] = set()
     bindings: list[CameraBinding] = []
     recording_stop_event = threading.Event()
     user_stop_event = threading.Event()
@@ -4497,14 +4571,16 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, request_stop)
 
+    sleep_context = (
+        SleepInhibitor(system_settings.prevent_sleep_during_recording)
+        if manage_sleep
+        else nullcontext()
+    )
+
     try:
-        with SleepInhibitor(system_settings.prevent_sleep_during_recording):
-            for camera_cfg_raw in camera_cfgs:
-                camera_cfg = dict(camera_cfg_raw)
-                device = match_device(camera_cfg, devices, used_serials)
-                info = camera_info_dict(device)
-                used_serials.add(info["serial"])
-                bindings.append(configure_camera(camera_cfg, device))
+        with sleep_context:
+            for camera_cfg_raw, device in zip(camera_cfgs, matched_devices):
+                bindings.append(configure_camera(dict(camera_cfg_raw), device))
 
             write_session_manifest(
                 session_dir,
@@ -4657,7 +4733,6 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     LOG.error("Cannot start clip %d: %s", clip_index, readiness_error)
                     break
 
-                # Give all writer threads one second to create files and start grabbing.
                 planned_start_mono_ns = time.monotonic_ns() + 1_000_000_000
                 planned_stop_mono_ns = planned_start_mono_ns + round(clip_duration_s * 1e9)
                 delay_to_start_s = (planned_start_mono_ns - time.monotonic_ns()) / 1e9
@@ -4936,6 +5011,225 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     if exit_status in {"failed", "exception"}:
         return 1
     return 0
+
+
+def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_run: bool) -> int:
+    schedule = dict(config.get("schedule") or {})
+    clip_duration_s, interval_s, total_duration_s, number_of_clips = validate_schedule(schedule)
+    requested_start_utc = parse_start_at_local(schedule)
+    start_mode = "absolute_local" if requested_start_utc is not None else "immediate"
+    system_settings = parse_system_settings(config)
+    status_settings = parse_status_settings(config)
+    preview_settings = parse_recording_preview_settings(config)
+    archive_settings = parse_archive_settings(config)
+    total_clips = expected_clip_count(
+        interval_s=interval_s,
+        total_duration_s=total_duration_s,
+        number_of_clips=number_of_clips,
+    )
+    planned_session_duration_s = planned_session_span_s(
+        clip_count=total_clips,
+        clip_duration_s=clip_duration_s,
+        interval_s=interval_s,
+    )
+    schedule_start_utc = requested_start_utc or utc_now()
+    planned_finish_utc = schedule_start_utc + dt.timedelta(seconds=planned_session_duration_s)
+    schedule_timezone = local_timezone_metadata(schedule_start_utc)
+    recording_plan = {
+        "expected_clips": total_clips,
+        "clip_duration_s": clip_duration_s,
+        "interval_s": interval_s,
+        "planned_session_span_s": planned_session_duration_s,
+        "start_mode": start_mode,
+        "requested_start_utc": isoformat_utc(requested_start_utc) if requested_start_utc is not None else None,
+        "requested_start_local": isoformat_local(requested_start_utc) if requested_start_utc is not None else None,
+        "schedule_start_utc": isoformat_utc(schedule_start_utc),
+        "schedule_start_local": isoformat_local(schedule_start_utc),
+        "planned_finish_utc": isoformat_utc(planned_finish_utc),
+        "planned_finish_local": isoformat_local(planned_finish_utc),
+        "timestamp_policy": {
+            "canonical_wall_clock": "UTC",
+            "human_display": "local_with_numeric_offset",
+            "duration_clock": "monotonic",
+            "local_timezone_label": schedule_timezone["local_timezone_label"],
+            "local_utc_offset_at_start": schedule_timezone["local_utc_offset"],
+        },
+    }
+
+    project = sanitize_token(str(config.get("project", "caterpillar")))
+    subject = sanitize_token(str(config.get("subject", "cohort")))
+    output_root = Path(str(config.get("output_root", "./recordings"))).expanduser()
+    camera_cfgs_raw = config.get("cameras")
+    if not isinstance(camera_cfgs_raw, list) or not camera_cfgs_raw:
+        raise ValueError("config.cameras must be a non-empty list")
+    camera_cfgs = [dict(item) for item in camera_cfgs_raw]
+
+    if dry_run:
+        session_start_utc = utc_now()
+        session_dir = choose_unique_directory(
+            output_root / project / subject / filename_local_timestamp(session_start_utc)
+        )
+        session_name = session_dir.name
+        session_dir.mkdir(parents=True, exist_ok=False)
+        setup_logging(session_dir, verbose)
+
+        archive_preflight: Optional[ArchivePreflightResult] = None
+        if archive_settings.enabled:
+            archive_preflight = preflight_archive_settings(
+                archive_settings,
+                local_output_root=output_root,
+                session_dir=session_dir,
+                project=project,
+                subject=subject,
+                session_name=session_name,
+            )
+            LOG.info(
+                "Archive preflight: ok=%s destination_free_gb=%s local_free_gb=%s archive_session_dir=%s",
+                archive_preflight.ok,
+                f"{archive_preflight.destination_free_gb:.1f}" if archive_preflight.destination_free_gb is not None else "n/a",
+                f"{archive_preflight.local_free_gb:.1f}" if archive_preflight.local_free_gb is not None else "n/a",
+                archive_preflight.archive_session_dir,
+            )
+            for error in archive_preflight.errors:
+                LOG.error("Archive preflight issue: %s", error)
+
+        LOG.info("Start mode: %s", start_mode)
+        if requested_start_utc is not None:
+            LOG.info("Requested start: %s", isoformat_local(requested_start_utc))
+            LOG.info(
+                "Would begin in: %s",
+                format_clock_duration((requested_start_utc - utc_now()).total_seconds()),
+            )
+        LOG.info(
+            "Recording plan: clips=%d planned_span=%s planned_finish_local=%s",
+            total_clips,
+            format_clock_duration(planned_session_duration_s),
+            format_local_finish_time(planned_finish_utc, now_utc=schedule_start_utc),
+        )
+
+        shutil.copy2(config_path, session_dir / "config_used.yaml")
+        write_json(
+            session_dir / "dry_run.json",
+            {
+                "project": project,
+                "subject": subject,
+                "clip_duration_s": clip_duration_s,
+                "interval_s": interval_s,
+                "total_duration_s": total_duration_s,
+                "number_of_clips": number_of_clips,
+                "status": dataclasses.asdict(status_settings),
+                "system": dataclasses.asdict(system_settings),
+                "recording_preview": dataclasses.asdict(preview_settings),
+                "archive": dataclasses.asdict(archive_settings),
+                "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
+                "recording_plan": recording_plan,
+            },
+        )
+        LOG.info("Dry run completed; no cameras were opened and no scheduled wait was entered.")
+        if archive_preflight is not None and not archive_preflight.ok:
+            return 1
+        return 0
+
+    if requested_start_utc is not None:
+        setup_logging(None, verbose)
+        if not system_settings.prevent_sleep_during_recording:
+            LOG.warning(
+                "Scheduled recording is armed but system sleep prevention is disabled. "
+                "The computer must remain awake until the scheduled start."
+            )
+
+        try:
+            find_ffmpeg(config.get("ffmpeg"))
+            match_configured_devices(camera_cfgs)
+        except Exception:
+            LOG.exception("Scheduled recording was not armed because pre-start validation failed")
+            return 1
+
+        if archive_settings.enabled:
+            provisional_session_name = f"scheduled_preflight_{filename_local_timestamp(requested_start_utc)}"
+            archive_preflight = preflight_archive_settings(
+                archive_settings,
+                local_output_root=output_root,
+                session_dir=existing_disk_usage_probe_path(output_root / project / subject),
+                project=project,
+                subject=subject,
+                session_name=provisional_session_name,
+            )
+            LOG.info(
+                "Archive preflight: ok=%s destination_free_gb=%s local_free_gb=%s archive_session_dir=%s",
+                archive_preflight.ok,
+                f"{archive_preflight.destination_free_gb:.1f}" if archive_preflight.destination_free_gb is not None else "n/a",
+                f"{archive_preflight.local_free_gb:.1f}" if archive_preflight.local_free_gb is not None else "n/a",
+                archive_preflight.archive_session_dir,
+            )
+            for error in archive_preflight.errors:
+                LOG.error("Archive preflight issue: %s", error)
+            if not archive_preflight.ok:
+                LOG.error("Scheduled recording was not armed because archive preflight failed.")
+                return 1
+
+        log_scheduled_start_plan(
+            requested_start_utc=requested_start_utc,
+            planned_session_duration_s=planned_session_duration_s,
+        )
+        try:
+            with SleepInhibitor(system_settings.prevent_sleep_during_recording):
+                wait_until_scheduled_start(
+                    target_utc=requested_start_utc,
+                    terminal_interval_s=status_settings.terminal_interval_s,
+                )
+                ffmpeg = find_ffmpeg(config.get("ffmpeg"))
+                match_configured_devices(camera_cfgs)
+                return run_recording_session(
+                    config_path=config_path,
+                    config=config,
+                    verbose=verbose,
+                    ffmpeg=ffmpeg,
+                    clip_duration_s=clip_duration_s,
+                    interval_s=interval_s,
+                    total_duration_s=total_duration_s,
+                    number_of_clips=number_of_clips,
+                    total_clips=total_clips,
+                    planned_session_duration_s=planned_session_duration_s,
+                    planned_finish_utc=planned_finish_utc,
+                    system_settings=system_settings,
+                    status_settings=status_settings,
+                    preview_settings=preview_settings,
+                    archive_settings=archive_settings,
+                    recording_plan=recording_plan,
+                    output_root=output_root,
+                    project=project,
+                    subject=subject,
+                    camera_cfgs=camera_cfgs,
+                    manage_sleep=False,
+                )
+        except KeyboardInterrupt:
+            LOG.warning("Scheduled recording cancelled before start.")
+            return 130
+
+    ffmpeg = find_ffmpeg(config.get("ffmpeg"))
+    return run_recording_session(
+        config_path=config_path,
+        config=config,
+        verbose=verbose,
+        ffmpeg=ffmpeg,
+        clip_duration_s=clip_duration_s,
+        interval_s=interval_s,
+        total_duration_s=total_duration_s,
+        number_of_clips=number_of_clips,
+        total_clips=total_clips,
+        planned_session_duration_s=planned_session_duration_s,
+        planned_finish_utc=planned_finish_utc,
+        system_settings=system_settings,
+        status_settings=status_settings,
+        preview_settings=preview_settings,
+        archive_settings=archive_settings,
+        recording_plan=recording_plan,
+        output_root=output_root,
+        project=project,
+        subject=subject,
+        camera_cfgs=camera_cfgs,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

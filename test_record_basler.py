@@ -1367,6 +1367,188 @@ class RecordingPlanTests(unittest.TestCase):
         )
 
 
+class StartSchedulingTests(unittest.TestCase):
+    def test_parse_start_at_local_absent_returns_none(self) -> None:
+        self.assertIsNone(record_basler.parse_start_at_local({}))
+
+    def test_parse_start_at_local_null_returns_none(self) -> None:
+        self.assertIsNone(record_basler.parse_start_at_local({"start_at_local": None}))
+
+    def test_parse_start_at_local_future_minute_format(self) -> None:
+        target = record_basler.parse_start_at_local(
+            {"start_at_local": "2026-08-08 05:00"},
+            now_utc=dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(
+            record_basler.isoformat_utc(target),
+            "2026-08-08T09:00:00.000Z",
+        )
+
+    def test_parse_start_at_local_seconds_format(self) -> None:
+        target = record_basler.parse_start_at_local(
+            {"start_at_local": "2026-08-08 05:00:30"},
+            now_utc=dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(
+            record_basler.isoformat_utc(target),
+            "2026-08-08T09:00:30.000Z",
+        )
+
+    def test_parse_start_at_local_rejects_bad_formats(self) -> None:
+        for raw in ("05:00", "tomorrow 5am", "2026/08/08 05:00", ""):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(ValueError, "schedule.start_at_local"):
+                    record_basler.parse_start_at_local({"start_at_local": raw})
+
+    def test_parse_start_at_local_rejects_past_time(self) -> None:
+        with self.assertRaisesRegex(ValueError, "already in the past"):
+            record_basler.parse_start_at_local(
+                {"start_at_local": "2026-08-07 05:00"},
+                now_utc=dt.datetime(2026, 8, 7, 10, 0, tzinfo=dt.timezone.utc),
+            )
+
+    def test_wait_until_scheduled_start_uses_short_sleeps(self) -> None:
+        base = dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc)
+        state = {"utc": base, "mono": 0.0}
+        sleeps: list[float] = []
+
+        def now_utc_fn() -> dt.datetime:
+            return state["utc"]
+
+        def monotonic_fn() -> float:
+            state["mono"] += 0.5
+            return state["mono"]
+
+        def sleep_fn(duration: float) -> None:
+            sleeps.append(duration)
+            state["utc"] += dt.timedelta(seconds=duration)
+
+        reached = record_basler.wait_until_scheduled_start(
+            target_utc=base + dt.timedelta(seconds=2.5),
+            terminal_interval_s=60.0,
+            now_utc_fn=now_utc_fn,
+            monotonic_fn=monotonic_fn,
+            sleep_fn=sleep_fn,
+        )
+
+        self.assertTrue(reached)
+        self.assertTrue(sleeps)
+        self.assertLessEqual(max(sleeps), 1.0)
+
+    def test_wait_until_scheduled_start_can_cancel_cleanly(self) -> None:
+        base = dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc)
+        state = {"utc": base, "mono": 0.0}
+        cancel_event = threading.Event()
+
+        def now_utc_fn() -> dt.datetime:
+            return state["utc"]
+
+        def monotonic_fn() -> float:
+            state["mono"] += 1.0
+            return state["mono"]
+
+        def sleep_fn(duration: float) -> None:
+            state["utc"] += dt.timedelta(seconds=duration)
+            cancel_event.set()
+
+        reached = record_basler.wait_until_scheduled_start(
+            target_utc=base + dt.timedelta(minutes=5),
+            terminal_interval_s=60.0,
+            cancel_event=cancel_event,
+            now_utc_fn=now_utc_fn,
+            monotonic_fn=monotonic_fn,
+            sleep_fn=sleep_fn,
+        )
+
+        self.assertFalse(reached)
+
+    def test_dry_run_absolute_start_writes_requested_start_metadata_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = {
+                "project": "project",
+                "subject": "subject",
+                "output_root": str(output_root),
+                "schedule": {
+                    "start_at_local": "2026-08-08 05:00",
+                    "clip_duration_s": 600,
+                    "interval_s": 600,
+                    "number_of_clips": 2,
+                },
+                "archive": {"enabled": False},
+                "cameras": [{"label": "camera1"}],
+            }
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with mock.patch.object(
+                record_basler,
+                "wait_until_scheduled_start",
+                side_effect=AssertionError("wait should not run during dry-run"),
+            ):
+                exit_code = record_basler.run_recording(
+                    config_path,
+                    config,
+                    verbose=False,
+                    dry_run=True,
+                )
+
+            self.assertEqual(exit_code, 0)
+            dry_run_paths = list(output_root.glob("project/subject/*/dry_run.json"))
+            self.assertEqual(len(dry_run_paths), 1)
+            payload = json.loads(dry_run_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["recording_plan"]["start_mode"], "absolute_local")
+            self.assertEqual(
+                payload["recording_plan"]["requested_start_local"],
+                "2026-08-08T05:00:00.000-04:00",
+            )
+            self.assertEqual(
+                payload["recording_plan"]["requested_start_utc"],
+                "2026-08-08T09:00:00.000Z",
+            )
+
+    def test_immediate_mode_does_not_enter_scheduled_wait_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = {
+                "project": "project",
+                "subject": "subject",
+                "output_root": str(output_root),
+                "schedule": {
+                    "clip_duration_s": 600,
+                    "interval_s": 600,
+                    "number_of_clips": 1,
+                },
+                "archive": {"enabled": False},
+                "cameras": [{"label": "camera1"}],
+            }
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with mock.patch.object(
+                record_basler,
+                "wait_until_scheduled_start",
+                side_effect=AssertionError("immediate mode should not wait"),
+            ):
+                with mock.patch.object(record_basler, "find_ffmpeg", return_value="ffmpeg"):
+                    with mock.patch.object(
+                        record_basler,
+                        "run_recording_session",
+                        return_value=0,
+                    ) as session_mock:
+                        exit_code = record_basler.run_recording(
+                            config_path,
+                            config,
+                            verbose=False,
+                            dry_run=False,
+                        )
+
+            self.assertEqual(exit_code, 0)
+            session_mock.assert_called_once()
+
+
 class ValidatorTimestampTests(unittest.TestCase):
     def test_validator_accepts_legacy_and_local_session_names(self) -> None:
         self.assertEqual(

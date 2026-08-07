@@ -35,6 +35,15 @@ source .venv/bin/activate
 6. Validate the session.
 7. Start the unattended run only after validation passes.
 
+For an optional one-shot scheduled start, set:
+
+```yaml
+schedule:
+  start_at_local: "2026-08-08 05:00"
+```
+
+Then run the usual dry run first. Remove or comment `start_at_local` after that experiment if the next launch should start immediately.
+
 ### Timestamp reminder
 
 Folder names and terminal logs use local computer time with a numeric UTC offset. JSON metadata retains canonical UTC timestamps. Elapsed-time calculations use a monotonic clock.
@@ -47,6 +56,7 @@ python record_basler.py --config config_local_macos.yaml --dry-run
 python record_basler.py --config config_local_macos.yaml --preview camera1
 python record_basler.py --config config_smoke_test.yaml
 caffeinate -i python record_basler.py --config config_archive_smoke_test.yaml
+caffeinate -i python record_basler.py --config config_local_macos.yaml
 python validate_session.py SESSION_PATH
 ```
 

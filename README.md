@@ -153,6 +153,8 @@ experiment:
 output_root:
 
 schedule:
+  # Optional one-shot local start. Remove or leave null for immediate start.
+  # start_at_local: "2026-08-08 05:00"
   clip_duration_s:
   interval_s:
   number_of_clips:
@@ -214,7 +216,12 @@ Keep these warnings in mind:
 
 ## Schedule meaning
 
-Use the values in the YAML to understand the planned span.
+The recorder now has two scheduling layers:
+
+- Initial start: immediate by default, or optional `schedule.start_at_local` in this computer's local timezone.
+- Clip schedule: `clip_duration_s`, `interval_s`, and `total_duration_h` or `number_of_clips`.
+
+Use the values in the YAML to understand the planned span after recording starts.
 
 When a schedule is limited by `number_of_clips`, the nominal span is:
 
@@ -225,6 +232,18 @@ When a schedule is limited by `number_of_clips`, the nominal span is:
 When `clip_duration_s` equals `interval_s`, the run is near-continuous with a small clip-boundary overhead.
 
 Do not treat the long-run template as an exact-duration promise. Inspect `clip_duration_s`, `interval_s`, `number_of_clips`, and `total_duration_h` in the copied config you actually plan to use.
+
+One-shot scheduled starts must include both date and time, for example:
+
+```yaml
+schedule:
+  start_at_local: "2026-08-08 05:00"
+  clip_duration_s: 1800
+  interval_s: 1800
+  total_duration_h: 24
+```
+
+Remove or comment `start_at_local` after that experiment if you want the next invocation to start immediately.
 
 ## Time And Timestamp Policy
 
@@ -313,6 +332,8 @@ If transfer fails, the local clip is preserved. Do not manually delete `.incomin
 
 A dry run checks config, schedule, paths, archive backend, mount point, executables, and free space without opening the camera.
 
+If `schedule.start_at_local` is set, the dry run validates the requested future local start time and reports the planned start and finish, but it does not enter the scheduled wait.
+
 Windows:
 
 ```powershell
@@ -326,6 +347,13 @@ python record_basler.py --config config_local_macos.yaml --dry-run
 ```
 
 Do not continue if the dry run reports a failure.
+
+For a scheduled overnight macOS run, the recommended sequence is:
+
+```bash
+python record_basler.py --config config_local_macos.yaml --dry-run
+caffeinate -i python record_basler.py --config config_local_macos.yaml
+```
 
 ## Setup preview
 
