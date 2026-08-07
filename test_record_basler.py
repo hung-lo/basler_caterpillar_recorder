@@ -1369,6 +1369,28 @@ class RecordingPlanTests(unittest.TestCase):
 
 
 class StartSchedulingTests(unittest.TestCase):
+    def _fixed_now_utc(self) -> dt.datetime:
+        return dt.datetime(2026, 8, 7, 4, 0, tzinfo=dt.timezone.utc)
+
+    def _scheduled_local_text(
+        self,
+        *,
+        delta: dt.timedelta,
+        include_seconds: bool = False,
+    ) -> tuple[str, dt.datetime]:
+        target_local = self._fixed_now_utc().astimezone() + delta
+        fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
+        return target_local.strftime(fmt), target_local.astimezone(dt.timezone.utc)
+
+    def _advancing_utc_now(self, start: dt.datetime) -> object:
+        state = {"count": -1}
+
+        def fake_utc_now() -> dt.datetime:
+            state["count"] += 1
+            return start + dt.timedelta(seconds=state["count"])
+
+        return fake_utc_now
+
     def _make_config(
         self,
         output_root: Path,
@@ -1463,26 +1485,25 @@ class StartSchedulingTests(unittest.TestCase):
         self.assertIsNone(record_basler.parse_start_at_local({"start_at_local": None}))
 
     def test_parse_start_at_local_future_minute_format(self) -> None:
+        schedule_text, expected_utc = self._scheduled_local_text(delta=dt.timedelta(hours=5))
         target = record_basler.parse_start_at_local(
-            {"start_at_local": "2026-08-08 05:00"},
-            now_utc=dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc),
+            {"start_at_local": schedule_text},
+            now_utc=self._fixed_now_utc(),
         )
 
-        self.assertEqual(
-            record_basler.isoformat_utc(target),
-            "2026-08-08T09:00:00.000Z",
-        )
+        self.assertEqual(record_basler.isoformat_utc(target), record_basler.isoformat_utc(expected_utc))
 
     def test_parse_start_at_local_seconds_format(self) -> None:
+        schedule_text, expected_utc = self._scheduled_local_text(
+            delta=dt.timedelta(hours=5, seconds=30),
+            include_seconds=True,
+        )
         target = record_basler.parse_start_at_local(
-            {"start_at_local": "2026-08-08 05:00:30"},
-            now_utc=dt.datetime(2026, 8, 8, 8, 0, tzinfo=dt.timezone.utc),
+            {"start_at_local": schedule_text},
+            now_utc=self._fixed_now_utc(),
         )
 
-        self.assertEqual(
-            record_basler.isoformat_utc(target),
-            "2026-08-08T09:00:30.000Z",
-        )
+        self.assertEqual(record_basler.isoformat_utc(target), record_basler.isoformat_utc(expected_utc))
 
     def test_parse_start_at_local_rejects_bad_formats(self) -> None:
         for raw in ("05:00", "tomorrow 5am", "2026/08/08 05:00", ""):
@@ -1491,10 +1512,11 @@ class StartSchedulingTests(unittest.TestCase):
                     record_basler.parse_start_at_local({"start_at_local": raw})
 
     def test_parse_start_at_local_rejects_past_time(self) -> None:
+        schedule_text, _expected_utc = self._scheduled_local_text(delta=dt.timedelta(hours=-1))
         with self.assertRaisesRegex(ValueError, "already in the past"):
             record_basler.parse_start_at_local(
-                {"start_at_local": "2026-08-07 05:00"},
-                now_utc=dt.datetime(2026, 8, 7, 10, 0, tzinfo=dt.timezone.utc),
+                {"start_at_local": schedule_text},
+                now_utc=self._fixed_now_utc(),
             )
 
     def test_wait_until_scheduled_start_uses_short_sleeps(self) -> None:
@@ -1556,12 +1578,13 @@ class StartSchedulingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "recordings"
             config_path = Path(tmp) / "config.yaml"
+            schedule_text, expected_utc = self._scheduled_local_text(delta=dt.timedelta(hours=5))
             config = {
                 "project": "project",
                 "subject": "subject",
                 "output_root": str(output_root),
                 "schedule": {
-                    "start_at_local": "2026-08-08 05:00",
+                    "start_at_local": schedule_text,
                     "clip_duration_s": 600,
                     "interval_s": 600,
                     "number_of_clips": 2,
@@ -1576,12 +1599,17 @@ class StartSchedulingTests(unittest.TestCase):
                 "wait_until_scheduled_start",
                 side_effect=AssertionError("wait should not run during dry-run"),
             ):
-                exit_code = record_basler.run_recording(
-                    config_path,
-                    config,
-                    verbose=False,
-                    dry_run=True,
-                )
+                with mock.patch.object(
+                    record_basler,
+                    "utc_now",
+                    side_effect=self._advancing_utc_now(self._fixed_now_utc()),
+                ):
+                    exit_code = record_basler.run_recording(
+                        config_path,
+                        config,
+                        verbose=False,
+                        dry_run=True,
+                    )
 
             self.assertEqual(exit_code, 0)
             dry_run_paths = list(output_root.glob("project/subject/*/dry_run.json"))
@@ -1590,11 +1618,11 @@ class StartSchedulingTests(unittest.TestCase):
             self.assertEqual(payload["recording_plan"]["start_mode"], "absolute_local")
             self.assertEqual(
                 payload["recording_plan"]["requested_start_local"],
-                "2026-08-08T05:00:00.000-04:00",
+                record_basler.isoformat_local(expected_utc),
             )
             self.assertEqual(
                 payload["recording_plan"]["requested_start_utc"],
-                "2026-08-08T09:00:00.000Z",
+                record_basler.isoformat_utc(expected_utc),
             )
 
     def test_immediate_mode_does_not_enter_scheduled_wait_path(self) -> None:
@@ -1740,7 +1768,8 @@ class StartSchedulingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "recordings"
             config_path = Path(tmp) / "config.yaml"
-            config = self._make_config(output_root, start_at_local="2026-08-08 05:00")
+            schedule_text, expected_utc = self._scheduled_local_text(delta=dt.timedelta(hours=5))
+            config = self._make_config(output_root, start_at_local=schedule_text)
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
             with mock.patch.object(record_basler, "find_ffmpeg", return_value="ffmpeg"):
@@ -1753,12 +1782,17 @@ class StartSchedulingTests(unittest.TestCase):
                         with mock.patch.object(record_basler, "wait_until_scheduled_start", return_value=True) as wait_mock:
                             with mock.patch.object(record_basler, "record_one_camera", side_effect=self._fake_record_one_camera):
                                 with mock.patch.object(record_basler.signal, "signal"):
-                                    exit_code = record_basler.run_recording(
-                                        config_path,
-                                        config,
-                                        verbose=False,
-                                        dry_run=False,
-                                    )
+                                    with mock.patch.object(
+                                        record_basler,
+                                        "utc_now",
+                                        side_effect=self._advancing_utc_now(self._fixed_now_utc()),
+                                    ):
+                                        exit_code = record_basler.run_recording(
+                                            config_path,
+                                            config,
+                                            verbose=False,
+                                            dry_run=False,
+                                        )
 
             self.assertEqual(exit_code, 0)
             wait_mock.assert_called_once()
@@ -1768,7 +1802,11 @@ class StartSchedulingTests(unittest.TestCase):
             self.assertEqual(manifest["recording_plan"]["start_mode"], "absolute_local")
             self.assertEqual(
                 manifest["recording_plan"]["requested_start_local"],
-                "2026-08-08T05:00:00.000-04:00",
+                record_basler.isoformat_local(expected_utc),
+            )
+            self.assertEqual(
+                manifest["recording_plan"]["requested_start_utc"],
+                record_basler.isoformat_utc(expected_utc),
             )
 
 
