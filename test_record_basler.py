@@ -7,6 +7,7 @@ import datetime as dt
 import gzip
 import json
 import logging
+import queue
 import tempfile
 import threading
 import unittest
@@ -1368,6 +1369,93 @@ class RecordingPlanTests(unittest.TestCase):
 
 
 class StartSchedulingTests(unittest.TestCase):
+    def _make_config(
+        self,
+        output_root: Path,
+        *,
+        start_at_local: str | None | object = ...,
+        number_of_clips: int = 1,
+    ) -> dict[str, object]:
+        schedule: dict[str, object] = {
+            "clip_duration_s": 1,
+            "interval_s": 1,
+            "number_of_clips": number_of_clips,
+        }
+        if start_at_local is not ...:
+            schedule["start_at_local"] = start_at_local
+        return {
+            "project": "project",
+            "subject": "subject",
+            "output_root": str(output_root),
+            "schedule": schedule,
+            "archive": {"enabled": False},
+            "status": {"terminal_interval_s": 0},
+            "system": {"prevent_sleep_during_recording": False},
+            "cameras": [{"label": "camera1", "fps": 5}],
+        }
+
+    def _make_binding(self, label: str = "camera1") -> record_basler.CameraBinding:
+        camera = mock.Mock()
+        camera.IsGrabbing.return_value = False
+        camera.IsOpen.return_value = False
+        camera.StopGrabbing.return_value = None
+        camera.Close.return_value = None
+        camera.DestroyDevice.return_value = None
+        return record_basler.CameraBinding(
+            label=label,
+            requested={"label": label, "fps": 5},
+            camera=camera,
+            info={"model": "fake", "serial": "40604036"},
+            actual_settings={"AcquisitionFrameRate": 5.0},
+            converter=mock.Mock(),
+        )
+
+    def _fake_record_one_camera(self, **kwargs: object) -> None:
+        binding = kwargs["binding"]
+        clip_dir = kwargs["clip_dir"]
+        ready_barrier = kwargs["ready_barrier"]
+        result_queue = kwargs["result_queue"]
+        assert isinstance(binding, record_basler.CameraBinding)
+        assert isinstance(clip_dir, Path)
+        assert isinstance(ready_barrier, threading.Barrier)
+        assert isinstance(result_queue, queue.Queue)
+
+        ready_barrier.wait(timeout=5)
+
+        file_stem = record_basler.sanitize_token(binding.label)
+        video_path = clip_dir / f"{file_stem}.mp4"
+        metadata_path = clip_dir / f"{file_stem}.json"
+        timestamps_path = clip_dir / f"{file_stem}.timestamps.csv.gz"
+        video_path.write_bytes(b"mp4")
+        with gzip.open(timestamps_path, "wt", encoding="utf-8", newline="") as handle:
+            handle.write(
+                "frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n"
+            )
+            handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+        record_basler.write_json(
+            metadata_path,
+            {
+                "success": True,
+                "planned_clip_complete": True,
+                "interrupted_by_user": False,
+                "stop_reason": "planned_end",
+                "grab_failures": 0,
+                "mp4_remux_succeeded": True,
+                "actual_elapsed_s": 1.0,
+            },
+        )
+        result_queue.put(
+            record_basler.ClipResult(
+                label=binding.label,
+                success=True,
+                planned_complete=True,
+                interrupted_by_user=False,
+                metadata_path=metadata_path,
+                video_path=video_path,
+                error=None,
+            )
+        )
+
     def test_parse_start_at_local_absent_returns_none(self) -> None:
         self.assertIsNone(record_basler.parse_start_at_local({}))
 
@@ -1513,18 +1601,7 @@ class StartSchedulingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "recordings"
             config_path = Path(tmp) / "config.yaml"
-            config = {
-                "project": "project",
-                "subject": "subject",
-                "output_root": str(output_root),
-                "schedule": {
-                    "clip_duration_s": 600,
-                    "interval_s": 600,
-                    "number_of_clips": 1,
-                },
-                "archive": {"enabled": False},
-                "cameras": [{"label": "camera1"}],
-            }
+            config = self._make_config(output_root)
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
             with mock.patch.object(
@@ -1547,6 +1624,152 @@ class StartSchedulingTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             session_mock.assert_called_once()
+            self.assertEqual(
+                session_mock.call_args.kwargs["recording_plan"]["start_mode"],
+                "immediate",
+            )
+
+    def test_null_start_at_local_does_not_enter_scheduled_wait_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = self._make_config(output_root, start_at_local=None)
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with mock.patch.object(
+                record_basler,
+                "wait_until_scheduled_start",
+                side_effect=AssertionError("null start_at_local should not wait"),
+            ):
+                with mock.patch.object(record_basler, "find_ffmpeg", return_value="ffmpeg"):
+                    with mock.patch.object(
+                        record_basler,
+                        "run_recording_session",
+                        return_value=0,
+                    ) as session_mock:
+                        exit_code = record_basler.run_recording(
+                            config_path,
+                            config,
+                            verbose=False,
+                            dry_run=False,
+                        )
+
+            self.assertEqual(exit_code, 0)
+            session_mock.assert_called_once()
+            self.assertEqual(
+                session_mock.call_args.kwargs["recording_plan"]["start_mode"],
+                "immediate",
+            )
+
+    def test_run_recording_session_initializes_without_scheduler_only_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = self._make_config(output_root, number_of_clips=0)
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            binding = self._make_binding()
+
+            exit_code = None
+            with mock.patch.object(record_basler, "match_configured_devices", return_value=[object()]):
+                with mock.patch.object(record_basler, "configure_camera", return_value=binding):
+                    with mock.patch.object(record_basler.signal, "signal"):
+                        exit_code = record_basler.run_recording_session(
+                            config_path=config_path,
+                            config=config,
+                            verbose=False,
+                            ffmpeg="ffmpeg",
+                            clip_duration_s=1.0,
+                            interval_s=1.0,
+                            total_duration_s=None,
+                            number_of_clips=0,
+                            total_clips=0,
+                            planned_session_duration_s=0.0,
+                            planned_finish_utc=dt.datetime(2026, 8, 8, 9, 0, tzinfo=dt.timezone.utc),
+                            system_settings=record_basler.SystemSettings(False),
+                            status_settings=record_basler.StatusSettings(0.0),
+                            preview_settings=record_basler.RecordingPreviewSettings(enabled=False),
+                            archive_settings=record_basler.ArchiveSettings(enabled=False),
+                            recording_plan={
+                                "start_mode": "immediate",
+                                "requested_start_utc": None,
+                                "requested_start_local": None,
+                            },
+                            output_root=output_root,
+                            project="project",
+                            subject="subject",
+                            camera_cfgs=[{"label": "camera1", "fps": 5}],
+                            manage_sleep=False,
+                        )
+
+            self.assertEqual(exit_code, 0)
+            manifest_paths = list(output_root.glob("project/subject/*/session_manifest.json"))
+            self.assertEqual(len(manifest_paths), 1)
+            manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["recording_plan"]["start_mode"], "immediate")
+
+    def test_run_recording_immediate_initialization_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = self._make_config(output_root)
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with mock.patch.object(record_basler, "find_ffmpeg", return_value="ffmpeg"):
+                with mock.patch.object(record_basler, "match_configured_devices", return_value=[object()]):
+                    with mock.patch.object(
+                        record_basler,
+                        "configure_camera",
+                        side_effect=lambda camera_cfg, device: self._make_binding(str(camera_cfg["label"])),
+                    ):
+                        with mock.patch.object(record_basler, "record_one_camera", side_effect=self._fake_record_one_camera):
+                            with mock.patch.object(record_basler.signal, "signal"):
+                                exit_code = record_basler.run_recording(
+                                    config_path,
+                                    config,
+                                    verbose=False,
+                                    dry_run=False,
+                                )
+
+            self.assertEqual(exit_code, 0)
+            manifest_paths = list(output_root.glob("project/subject/*/session_manifest.json"))
+            self.assertEqual(len(manifest_paths), 1)
+            manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["recording_plan"]["start_mode"], "immediate")
+
+    def test_run_recording_scheduled_initialization_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "recordings"
+            config_path = Path(tmp) / "config.yaml"
+            config = self._make_config(output_root, start_at_local="2026-08-08 05:00")
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with mock.patch.object(record_basler, "find_ffmpeg", return_value="ffmpeg"):
+                with mock.patch.object(record_basler, "match_configured_devices", return_value=[object()]):
+                    with mock.patch.object(
+                        record_basler,
+                        "configure_camera",
+                        side_effect=lambda camera_cfg, device: self._make_binding(str(camera_cfg["label"])),
+                    ):
+                        with mock.patch.object(record_basler, "wait_until_scheduled_start", return_value=True) as wait_mock:
+                            with mock.patch.object(record_basler, "record_one_camera", side_effect=self._fake_record_one_camera):
+                                with mock.patch.object(record_basler.signal, "signal"):
+                                    exit_code = record_basler.run_recording(
+                                        config_path,
+                                        config,
+                                        verbose=False,
+                                        dry_run=False,
+                                    )
+
+            self.assertEqual(exit_code, 0)
+            wait_mock.assert_called_once()
+            manifest_paths = list(output_root.glob("project/subject/*/session_manifest.json"))
+            self.assertEqual(len(manifest_paths), 1)
+            manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["recording_plan"]["start_mode"], "absolute_local")
+            self.assertEqual(
+                manifest["recording_plan"]["requested_start_local"],
+                "2026-08-08T05:00:00.000-04:00",
+            )
 
 
 class ValidatorTimestampTests(unittest.TestCase):

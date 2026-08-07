@@ -4501,7 +4501,7 @@ def run_recording_session(
         "Recording plan: clips=%d planned_span=%s planned_finish_local=%s",
         total_clips,
         format_clock_duration(planned_session_duration_s),
-        format_local_finish_time(planned_finish_utc, now_utc=schedule_start_utc),
+        format_local_finish_time(planned_finish_utc, now_utc=session_start_utc),
     )
 
     archive_preflight: Optional[ArchivePreflightResult] = None
@@ -4535,7 +4535,7 @@ def run_recording_session(
             LOG.error("Archive preflight issue: %s", error)
 
     if archive_settings.enabled and (archive_preflight is None or not archive_preflight.ok):
-        LOG.error("Scheduled start reached but archive preflight failed")
+        LOG.error("Archive preflight failed")
         LOG.error("Refusing to open cameras")
         return 1
 
