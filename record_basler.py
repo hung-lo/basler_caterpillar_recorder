@@ -2447,6 +2447,27 @@ def destroy_preview_windows(window_names: Iterable[str]) -> None:
         pass
 
 
+def reset_recording_preview_for_clip(
+    *,
+    preview_settings: RecordingPreviewSettings,
+    preview_active_event: threading.Event,
+    clip_index: int,
+    total_clips: int,
+) -> None:
+    """Restore the recording preview for a newly starting clip."""
+
+    if preview_settings.enabled:
+        if not preview_active_event.is_set():
+            LOG.info(
+                "Recording preview re-enabled for clip %d/%d",
+                clip_index + 1,
+                total_clips,
+            )
+        preview_active_event.set()
+    else:
+        preview_active_event.clear()
+
+
 def draw_preview_status(
     preview: np.ndarray,
     *,
@@ -2606,7 +2627,19 @@ def monitor_recording_threads(
                 time.sleep(0.02)
 
             if key in (ord("q"), 27):
-                LOG.info("Recording preview hidden; acquisition continues")
+                if clip_index + 1 < total_clips:
+                    LOG.info(
+                        "Recording preview hidden for clip %d/%d; acquisition continues. "
+                        "Preview will reopen when the next clip starts.",
+                        clip_index + 1,
+                        total_clips,
+                    )
+                else:
+                    LOG.info(
+                        "Recording preview hidden for final clip %d/%d; acquisition continues.",
+                        clip_index + 1,
+                        total_clips,
+                    )
                 preview_active_event.clear()
                 destroy_preview_windows(window_names)
             elif key == ord("s") and latest:
@@ -3890,7 +3923,7 @@ def _draw_recording_preview_legacy(packet: PreviewPacket) -> np.ndarray:
     status_font_scale = 0.40 if display.shape[1] < 500 else 0.48
     controls_font_scale = 0.34
     text_thickness = 1
-    controls_text = "q hide | s snapshot"
+    controls_text = "q hide this clip | s snapshot"
     fps_text = (
         f"{packet.measured_receive_fps:.2f} fps"
         if packet.measured_receive_fps is not None
@@ -4732,6 +4765,13 @@ def run_recording_session(
                     any_failure = True
                     LOG.error("Cannot start clip %d: %s", clip_index, readiness_error)
                     break
+
+                reset_recording_preview_for_clip(
+                    preview_settings=preview_settings,
+                    preview_active_event=preview_active_event,
+                    clip_index=clip_index,
+                    total_clips=total_clips,
+                )
 
                 planned_start_mono_ns = time.monotonic_ns() + 1_000_000_000
                 planned_stop_mono_ns = planned_start_mono_ns + round(clip_duration_s * 1e9)

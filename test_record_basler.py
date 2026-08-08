@@ -1478,6 +1478,33 @@ class StartSchedulingTests(unittest.TestCase):
             )
         )
 
+    def test_reset_recording_preview_for_clip_reenables_preview_when_configured(self) -> None:
+        preview_settings = record_basler.RecordingPreviewSettings(enabled=True)
+        preview_active_event = threading.Event()
+
+        record_basler.reset_recording_preview_for_clip(
+            preview_settings=preview_settings,
+            preview_active_event=preview_active_event,
+            clip_index=1,
+            total_clips=3,
+        )
+
+        self.assertTrue(preview_active_event.is_set())
+
+    def test_reset_recording_preview_for_clip_keeps_preview_disabled_when_config_disabled(self) -> None:
+        preview_settings = record_basler.RecordingPreviewSettings(enabled=False)
+        preview_active_event = threading.Event()
+        preview_active_event.set()
+
+        record_basler.reset_recording_preview_for_clip(
+            preview_settings=preview_settings,
+            preview_active_event=preview_active_event,
+            clip_index=1,
+            total_clips=3,
+        )
+
+        self.assertFalse(preview_active_event.is_set())
+
     def test_parse_start_at_local_absent_returns_none(self) -> None:
         self.assertIsNone(record_basler.parse_start_at_local({}))
 

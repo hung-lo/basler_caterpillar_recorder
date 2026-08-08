@@ -72,7 +72,7 @@ python validate_session.py SESSION_PATH
 
 ## Stop controls
 
-- `q` hides the recording preview without stopping acquisition.
+- `q` hides the recording preview for the current clip without stopping acquisition. It reopens automatically at the next clip if preview remains enabled.
 - `Ctrl+C` stops the recording cleanly.
 
 ### Stopping a recording safely

@@ -430,7 +430,7 @@ During recording:
 - the preview is display-only;
 - the preview shows clip and session progress;
 - the terminal prints periodic `STATUS` heartbeats;
-- `q` hides the recording preview without stopping acquisition;
+- `q` hides the recording preview for the current clip without stopping acquisition; the preview reopens at the next clip;
 - `s` saves the raw preview frame without the panel or footer into the clip directory;
 - `Ctrl+C` stops the recording cleanly.
 
