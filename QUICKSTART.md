@@ -5,6 +5,7 @@ For first-time setup, start with [README.md](./README.md). This file is only the
 ## Before you start
 
 - Make sure the camera is visible in pylon Viewer.
+- The current caterpillar templates keep continuous white balance on; if colors look off, check the camera settings before changing exposure or gain.
 - Make sure the archive drive is mounted if you are using archive mode.
 - Keep the computer on AC power.
 - Use `config_local_windows.yaml` or `config_local_macos.yaml`, not the tracked templates.

@@ -153,6 +153,7 @@ def make_fake_camera(modern: bool) -> tuple[FakeCamera, list[tuple[str, object]]
         "ExposureTime": FakeNode("ExposureTime", 5000.0, minimum=50, maximum=500000, increment=1, log=log),
         "GainAuto": FakeNode("GainAuto", "Off", log=log),
         "Gain": FakeNode("Gain", 0.0, minimum=0, maximum=24, increment=1, log=log),
+        "BalanceWhiteAuto": FakeNode("BalanceWhiteAuto", "Off", log=log),
         "AcquisitionFrameRateEnable": FakeNode("AcquisitionFrameRateEnable", False, log=log),
         "AcquisitionFrameRate": FakeNode(
             "AcquisitionFrameRate",
@@ -1008,6 +1009,47 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
         self.assertEqual(binding.actual_settings["ExposureAuto"], "Continuous")
         self.assertEqual(binding.actual_settings["GainAuto"], "Off")
         self.assertEqual(binding.actual_settings["Gain"], 0.0)
+
+    def test_white_balance_maps_boolean_and_is_saved_in_metadata(self) -> None:
+        on_binding, on_log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": False,
+                "auto_gain": False,
+                "balance_white_auto": True,
+            },
+            modern=True,
+        )
+        self.assertIn(("BalanceWhiteAuto", "Continuous"), on_log)
+        self.assertEqual(on_binding.actual_settings["BalanceWhiteAuto"], "Continuous")
+
+        off_binding, off_log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": False,
+                "auto_gain": False,
+                "balance_white_auto": False,
+            },
+            modern=True,
+        )
+        self.assertIn(("BalanceWhiteAuto", "Off"), off_log)
+        self.assertEqual(off_binding.actual_settings["BalanceWhiteAuto"], "Off")
 
     def test_legacy_auto_exposure_uses_raw_and_aoi_nodes(self) -> None:
         binding, log = configure_fake_camera(

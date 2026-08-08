@@ -441,6 +441,21 @@ def enable_chunk_timestamp(camera: Any) -> bool:
     return ok
 
 
+def configure_white_balance(camera: Any, camera_cfg: dict[str, Any], *, label: str) -> Optional[str]:
+    requested = camera_cfg.get("balance_white_auto")
+    if requested is None:
+        return None
+
+    mode = "Continuous" if bool(requested) else "Off"
+    ok, actual = try_set(camera, "BalanceWhiteAuto", mode)
+    if not ok:
+        LOG.warning("%s white balance: requested=%s but BalanceWhiteAuto is unavailable", label, mode)
+        return None
+
+    LOG.info("%s white balance: requested=%s actual=%s", label, mode, actual)
+    return str(actual) if actual is not None else None
+
+
 def get_grab_value(grab_result: Any, names: Iterable[str]) -> Any:
     for name in names:
         try:
@@ -1030,9 +1045,7 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
             read_setting(camera, "Gain") if read_setting(camera, "Gain") is not None else read_setting(camera, "GainRaw"),
         )
 
-    if camera_cfg.get("balance_white_auto") is not None:
-        mode = "Continuous" if bool(camera_cfg["balance_white_auto"]) else "Off"
-        try_set(camera, "BalanceWhiteAuto", mode)
+    configure_white_balance(camera, camera_cfg, label=label)
 
     fps = float(camera_cfg.get("fps", 5.0))
     try_set(camera, "AcquisitionFrameRateEnable", True)
@@ -1068,6 +1081,7 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
         "GainAuto",
         "Gain",
         "GainRaw",
+        "BalanceWhiteAuto",
         "AutoExposureTimeLowerLimit",
         "AutoExposureTimeUpperLimit",
         "AutoExposureTimeLowerLimitRaw",

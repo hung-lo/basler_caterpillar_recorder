@@ -2,7 +2,7 @@
 
 This repository documents and drives the current one-camera recording workflow for the Basler `a2A1920-160ucBAS` camera with serial `40604036` and YAML label `camera1`.
 
-<img src="docs/images/recording_preview.png" alt="Recording preview window" width="760">
+<img src="docs/images/recording_preview.png" alt="Recording preview window" width="720">
 
 The recorder supports:
 
@@ -166,6 +166,12 @@ cameras:
     fps:
     width:
     height:
+    auto_exposure:
+    auto_exposure_lower_us:
+    auto_exposure_upper_us:
+    auto_target_brightness:
+    auto_gain:
+    balance_white_auto:
     exposure_us:
     gain:
     rotate:
@@ -191,7 +197,7 @@ rotate: 270
 
 `rotate: 270` means 90 degrees counter-clockwise.
 
-Bounded continuous auto exposure for the current IR setup looks like:
+Bounded continuous auto exposure and continuous white balance for the current caterpillar setup look like:
 
 ```yaml
 exposure_us: 30000
@@ -203,15 +209,18 @@ auto_exposure_upper_us: 180000
 auto_target_brightness: 0.70
 auto_exposure_roi: full
 auto_gain: false
+balance_white_auto: true
 ```
 
 Keep these warnings in mind:
 
 - Continuous auto exposure changes exposure during recording.
+- Continuous white balance changes color balance during recording.
 - Keep `auto_gain: false` and `gain: 0` for this experiment.
 - `auto_exposure_upper_us` must stay below the frame period.
 - At 5 Hz, use `180000 us`, not the full `200000 us`.
 - `auto_target_brightness: 0.70` is the current empirically tuned target for the MBL dish/leaf scene, not an exact guarantee.
+- Do not treat raw RGB values or intensity as calibrated measurements while either auto exposure or white balance is enabled.
 - Run a blocked-light test before unattended recording.
 
 ## Schedule meaning
@@ -423,7 +432,7 @@ recording_preview:
 
 The `card_panel` layout keeps the camera image unobstructed while showing clip and session progress, measured receive FPS, current exposure, estimated finish time, and recording status.
 
-<img src="docs/images/recording_preview.png" alt="Recording preview window" width="760">
+<img src="docs/images/recording_preview.png" alt="Recording preview window" width="720">
 
 During recording:
 

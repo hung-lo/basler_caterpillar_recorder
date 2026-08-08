@@ -69,7 +69,7 @@ cameras:
     auto_target_brightness: 0.70
     auto_exposure_roi: full
     auto_gain: false
-    balance_white_auto: false
+    balance_white_auto: true  # Keep color balance continuous while frames are acquired.
     rotate: 270
     flip_horizontal: false
     flip_vertical: false
