@@ -36,6 +36,8 @@ DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_ANIMALS = [f"C{index:02d}" for index in range(1, 9)]
 TIMESTAMP_SUFFIXES = (".timestamps.csv.gz", ".timestamps.csv")
 MAX_CLIP_ANNOTATIONS = 60
+SHORT_EVENT_THRESHOLD_SECONDS = 300
+SHORT_EVENT_MARKER_SIZE = 90
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
 MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
@@ -318,12 +320,15 @@ def load_behavior_events(path: Optional[Path], tz: dt.tzinfo) -> list[BehaviorEv
                     raise ValueError("missing animal_id")
                 start_text = str(row.get("start_local") or "").strip()
                 end_text = str(row.get("end_local") or "").strip()
-                if not start_text or not end_text:
-                    raise ValueError("missing start_local or end_local")
+                if not start_text:
+                    raise ValueError("missing start_local")
                 start_local = parse_local_datetime(start_text, tz)
-                end_local = parse_local_datetime(end_text, tz)
-                if end_local <= start_local:
-                    raise ValueError("end_local must be after start_local")
+                if end_text:
+                    end_local = parse_local_datetime(end_text, tz)
+                    if end_local <= start_local:
+                        raise ValueError("end_local must be after start_local")
+                else:
+                    end_local = start_local + dt.timedelta(seconds=1)
                 events.append(
                     BehaviorEvent(
                         animal_id=animal_id,
@@ -353,6 +358,10 @@ def _bar_left_width(start_utc: dt.datetime, end_utc: dt.datetime, tz: dt.tzinfo)
     left = mdates.date2num(to_plot_local(start_utc, tz))
     width = max((end_utc - start_utc).total_seconds() / 86400.0, 1.0 / 86400.0 / 24.0)
     return left, width
+
+
+def _event_duration_s(event: BehaviorEvent) -> float:
+    return max((event.end_local - event.start_local).total_seconds(), 0.0)
 
 
 def plot_recording_timeline(
@@ -480,8 +489,20 @@ def plot_recording_timeline(
                 categories[category] = color_cycle(len(categories) % color_cycle.N)
             color = categories[category]
             left = mdates.date2num(event.start_local.replace(tzinfo=None))
-            width = max((event.end_local - event.start_local).total_seconds() / 86400.0, 1.0 / 86400.0 / 24.0)
+            duration_s = _event_duration_s(event)
+            width = max(duration_s / 86400.0, 1.0 / 86400.0 / 24.0)
             ax_beh.broken_barh([(left, width)], (y - 0.32, 0.64), facecolors=color, alpha=0.8)
+            if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS:
+                ax_beh.scatter(
+                    left,
+                    y,
+                    s=SHORT_EVENT_MARKER_SIZE,
+                    marker="D",
+                    color=color,
+                    edgecolors="black",
+                    linewidths=0.6,
+                    zorder=5,
+                )
 
         if categories:
             legend_handles = [Patch(facecolor=color, label=label, alpha=0.8) for label, color in categories.items()]

@@ -8,6 +8,7 @@ import gzip
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import plot_recording_timeline as timeline
 
@@ -168,6 +169,63 @@ class TimelinePlotTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["frames"], "3")
             self.assertEqual(rows[0]["start_utc"], "2026-08-09T19:00:00.000000Z")
+
+    def test_blank_end_local_becomes_point_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events_path = root / "behavior_events.csv"
+            with events_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C01", "2026-08-09 15:00:00", "", "electrical_stimulation", "event", ""])
+                writer.writerow(["", "", "2026-08-09 15:10:00", "shed", "event", "unknown start"])
+
+            events = timeline.load_behavior_events(events_path, dt.timezone(dt.timedelta(hours=-4)))
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].event, "electrical_stimulation")
+            self.assertEqual((events[0].end_local - events[0].start_local).total_seconds(), 1.0)
+
+    def test_short_events_draw_a_marker_without_changing_the_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_png = root / "timeline.png"
+            events = [
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+                    event="electrical_stimulation",
+                    kind="event",
+                    notes="",
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 15, 0),
+                    event="feeding",
+                    kind="event",
+                    notes="",
+                ),
+            ]
+
+            with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=events,
+                    animals=["C01"],
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=output_png,
+                    annotate_clips=False,
+                )
+
+            self.assertTrue(output_png.exists())
+            self.assertEqual(mock_scatter.call_count, 1)
+            scatter_args, scatter_kwargs = mock_scatter.call_args
+            self.assertEqual(scatter_kwargs["marker"], "D")
+            self.assertEqual(scatter_kwargs["s"], 90)
+            self.assertEqual(scatter_kwargs["edgecolors"], "black")
+            self.assertEqual(scatter_kwargs["linewidths"], 0.6)
 
 
 if __name__ == "__main__":
