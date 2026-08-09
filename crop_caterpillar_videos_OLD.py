@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 r"""
-MBL Caterpillar Cropper v3 - timestamped output names.
+MBL Caterpillar Cropper v2 - recursive recorder layout support.
 
 Supports both:
-    ROOT\clip_0000_152652.mp4
+  ROOT\clip_0000_152652.mp4
+and:
+  ROOT\20260806_132323\clip_0001_132356\camera1.mp4
 
-and the recorder layout:
-    ROOT\20260809_134217-0400\clip_0000_134218-0400\camera1.mp4
-
-For the nested recorder layout, output names use:
-    caterpillar ID + clip date + actual clip start time + timezone + raw clip index
-
-Example:
-    C01_20260809_134218-0400_clip_0000.mp4
-
-The date is taken from the session directory.
-The time/timezone and clip index are taken from the clip directory.
+Nested camera1.mp4 files are named from their clip directory, e.g.:
+  C01_clip_0001_132356.mp4
 
 Original videos are never modified or deleted.
 """
@@ -25,16 +18,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-VERSION = "MBL Caterpillar Cropper v3 TIMESTAMPED"
+VERSION = "MBL Caterpillar Cropper v2 RECURSIVE"
 DEFAULT_ROOT = Path(r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08")
-
 EXPECTED_WIDTH = 1200
 EXPECTED_HEIGHT = 1920
 DEFAULT_MIN_AGE_SECONDS = 180
@@ -57,14 +48,6 @@ VIDEO_CODEC = "libx264"
 PRESET = "veryfast"
 CRF = "18"
 ENCODER_THREADS_PER_OUTPUT = "1"
-
-SESSION_RE = re.compile(
-    r"^(?P<date>\d{8})_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$"
-)
-CLIP_RE = re.compile(
-    r"^clip_(?P<index>\d+)_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$",
-    re.IGNORECASE,
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,9 +83,10 @@ def discover_sources(root: Path) -> list[Path]:
         if p.is_file():
             found.add(p)
 
-    # Recorder layout: session/clip_xxxx_xxxxxx/camera1.mp4.
+    # Actual recorder layout: session/clip_xxxx_xxxxxx/camera1.mp4.
     for p in root.rglob("camera1.mp4"):
         if p.is_file() and p.parent.name.lower().startswith("clip_"):
+            # Defensive exclusion in case output organization changes later.
             if "cropped_by_caterpillar" not in {part.lower() for part in p.parts}:
                 found.add(p)
 
@@ -115,63 +99,24 @@ def discover_sources(root: Path) -> list[Path]:
     return sorted(found, key=safe_sort_key)
 
 
-def recording_stem(source: Path) -> str:
-    r"""
-    Build the identifying portion of the cropped output filename.
-
-    Nested example:
-      source:
-        ...\20260809_134217-0400\clip_0000_134218-0400\camera1.mp4
-      result:
-        20260809_134218-0400_clip_0000
-
-    We intentionally use:
-      - DATE from the session directory
-      - TIME and timezone from the clip directory
-      - raw clip index from the clip directory
-
-    This makes filenames chronological while keeping raw-data provenance.
-    """
-    if (
-        source.name.lower() == "camera1.mp4"
-        and source.parent.name.lower().startswith("clip_")
-    ):
-        clip_match = CLIP_RE.match(source.parent.name)
-        session_match = SESSION_RE.match(source.parent.parent.name)
-
-        if clip_match and session_match:
-            date = session_match.group("date")
-            clip_time = clip_match.group("time")
-            clip_index = clip_match.group("index")
-
-            # Prefer the clip timezone because it belongs to the actual clip
-            # timestamp; fall back to the session timezone if needed.
-            tz = clip_match.group("tz") or session_match.group("tz") or ""
-
-            return f"{date}_{clip_time}{tz}_clip_{clip_index}"
-
-        # Defensive fallback for an unexpected recorder directory name.
+def clip_stem(source: Path) -> str:
+    # Nested recorder file: .../clip_0001_132356/camera1.mp4
+    if source.name.lower() == "camera1.mp4" and source.parent.name.lower().startswith("clip_"):
         return source.parent.name
-
-    # Flat legacy input does not contain a date in its path, so preserve its
-    # original stem rather than inventing a date.
+    # Flat file: clip_0000_152652.mp4
     return source.stem
 
 
 def output_path(output_dir: Path, caterpillar_id: str, source: Path) -> Path:
-    return output_dir / f"{caterpillar_id}_{recording_stem(source)}.mp4"
+    return output_dir / f"{caterpillar_id}_{clip_stem(source)}.mp4"
 
 
 def temp_path(output_dir: Path, caterpillar_id: str, source: Path) -> Path:
-    return output_dir / f".{caterpillar_id}_{recording_stem(source)}.partial.mp4"
+    return output_dir / f".{caterpillar_id}_{clip_stem(source)}.partial.mp4"
 
 
 def missing_ids(output_dir: Path, source: Path) -> list[str]:
-    return [
-        cid
-        for cid in CROPS
-        if not output_path(output_dir, cid, source).exists()
-    ]
+    return [cid for cid in CROPS if not output_path(output_dir, cid, source).exists()]
 
 
 def age_seconds(path: Path) -> float | None:
@@ -183,26 +128,14 @@ def age_seconds(path: Path) -> float | None:
 
 def probe_resolution(path: Path) -> tuple[int, int] | None:
     cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height",
-        "-of",
-        "json",
-        str(path),
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", str(path)
     ]
     result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        creationflags=creation_flags(),
+        cmd, capture_output=True, text=True, creationflags=creation_flags()
     )
     if result.returncode != 0:
         return None
-
     try:
         payload = json.loads(result.stdout)
         stream = payload["streams"][0]
@@ -212,10 +145,7 @@ def probe_resolution(path: Path) -> tuple[int, int] | None:
 
 
 def font_for_ffmpeg() -> str | None:
-    for p in (
-        Path(r"C:\Windows\Fonts\arial.ttf"),
-        Path(r"C:\Windows\Fonts\segoeui.ttf"),
-    ):
+    for p in (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\segoeui.ttf")):
         if p.exists():
             return p.as_posix().replace(":", r"\:")
     return None
@@ -237,61 +167,30 @@ def build_ffmpeg(source: Path, output_dir: Path, ids: list[str]):
 
     for i, cid in enumerate(ids):
         x, y, w, h = CROPS[cid]
-
         if font:
             draw = (
-                f"drawtext=fontfile='{font}':text='{cid}':"
-                "x=14:y=14:fontsize=30:"
+                f"drawtext=fontfile='{font}':text='{cid}':x=14:y=14:fontsize=30:"
                 "fontcolor=white:borderw=2:bordercolor=black"
             )
         else:
             draw = (
-                f"drawtext=text='{cid}':"
-                "x=14:y=14:fontsize=30:"
+                f"drawtext=text='{cid}':x=14:y=14:fontsize=30:"
                 "fontcolor=white:borderw=2:bordercolor=black"
             )
-
-        filters.append(
-            f"{inputs[i]}crop={w}:{h}:{x}:{y},{draw}[out{i}]"
-        )
-        pairs.append(
-            (
-                temp_path(output_dir, cid, source),
-                output_path(output_dir, cid, source),
-            )
-        )
+        filters.append(f"{inputs[i]}crop={w}:{h}:{x}:{y},{draw}[out{i}]")
+        pairs.append((temp_path(output_dir, cid, source), output_path(output_dir, cid, source)))
 
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-nostdin",
-        "-i",
-        str(source),
-        "-filter_complex",
-        ";".join(filters),
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        "-i", str(source), "-filter_complex", ";".join(filters)
     ]
 
     for i, (tmp, _final) in enumerate(pairs):
         cmd += [
-            "-map",
-            f"[out{i}]",
-            "-an",
-            "-c:v",
-            VIDEO_CODEC,
-            "-preset",
-            PRESET,
-            "-crf",
-            CRF,
-            "-pix_fmt",
-            "yuv420p",
-            "-threads",
-            ENCODER_THREADS_PER_OUTPUT,
-            "-movflags",
-            "+faststart",
-            "-y",
-            str(tmp),
+            "-map", f"[out{i}]", "-an",
+            "-c:v", VIDEO_CODEC, "-preset", PRESET, "-crf", CRF,
+            "-pix_fmt", "yuv420p", "-threads", ENCODER_THREADS_PER_OUTPUT,
+            "-movflags", "+faststart", "-y", str(tmp)
         ]
 
     return cmd, pairs
@@ -299,17 +198,14 @@ def build_ffmpeg(source: Path, output_dir: Path, ids: list[str]):
 
 def process_source(source: Path, output_dir: Path) -> bool:
     ids = missing_ids(output_dir, source)
-
     if not ids:
         print(f"SKIP already complete: {source}")
         return False
 
     res = probe_resolution(source)
-
     if res is None:
         print(f"SKIP ffprobe cannot read yet: {source}")
         return False
-
     if res != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
         print(
             f"SKIP unexpected resolution {res[0]}x{res[1]} "
@@ -318,12 +214,7 @@ def process_source(source: Path, output_dir: Path) -> bool:
         return False
 
     print(f"PROCESS {source}")
-    print(
-        "  outputs: "
-        + ", ".join(
-            output_path(output_dir, cid, source).name for cid in ids
-        )
-    )
+    print("  outputs: " + ", ".join(ids))
 
     for cid in ids:
         tmp = temp_path(output_dir, cid, source)
@@ -335,7 +226,6 @@ def process_source(source: Path, output_dir: Path) -> bool:
 
     cmd, pairs = build_ffmpeg(source, output_dir, ids)
     result = subprocess.run(cmd, creationflags=creation_flags())
-
     if result.returncode != 0:
         print(f"ERROR ffmpeg failed: {source}")
         for tmp, _ in pairs:
@@ -351,16 +241,11 @@ def process_source(source: Path, output_dir: Path) -> bool:
             return False
         os.replace(tmp, final)
 
-    print(f"DONE {recording_stem(source)}")
+    print(f"DONE {clip_stem(source)}")
     return True
 
 
-def scan_once(
-    root: Path,
-    min_age: int,
-    dry_run: bool,
-    max_process: int | None = None,
-) -> int:
+def scan_once(root: Path, min_age: int, dry_run: bool, max_process: int | None = None) -> int:
     output_dir = root / "cropped_by_caterpillar"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -369,43 +254,30 @@ def scan_once(
 
     if not sources:
         print("No matching inputs found.")
-        print(
-            r"Expected nested layout like: "
-            r"20260809_134217-0400\clip_0000_134218-0400\camera1.mp4"
-        )
+        print(r"Expected nested layout like: SESSION\clip_0001_132356\camera1.mp4")
         return 0
 
     processed = 0
-
     for source in sources:
         age = age_seconds(source)
-
         if age is None:
             print(f"SKIP cannot stat: {source}")
             continue
 
         ids = missing_ids(output_dir, source)
-
         if not ids:
             print(f"SKIP already complete: {source}")
             continue
 
         if age < min_age:
-            print(
-                f"SKIP too recent ({age:.0f}s old; need {min_age}s): "
-                f"{source}"
-            )
+            print(f"SKIP too recent ({age:.0f}s old; need {min_age}s): {source}")
             continue
 
         if dry_run:
             print(f"WOULD PROCESS ({age:.0f}s old): {source}")
-            print(
-                "  would create: "
-                + ", ".join(
-                    output_path(output_dir, cid, source).name
-                    for cid in ids
-                )
-            )
+            print("  would create: " + ", ".join(
+                output_path(output_dir, cid, source).name for cid in ids
+            ))
             processed += 1
         else:
             if process_source(source, output_dir):
@@ -421,26 +293,16 @@ def main() -> int:
     args = parse_args()
     root = args.root.resolve()
 
-    print("=" * 68)
+    print("=" * 60)
     print(VERSION)
-    print("=" * 68)
+    print("=" * 60)
     print(f"Source: {root}")
     print(f"Output: {root / 'cropped_by_caterpillar'}")
-    print(
-        "Naming: C01_YYYYMMDD_HHMMSS-TZ_clip_0000.mp4"
-    )
-    print(
-        r"Input search: clip_*.mp4 plus recursive clip_*\camera1.mp4"
-    )
-    print(
-        f"Safety delay: {args.min_age_seconds} seconds after last write"
-    )
+    print(r"Input search: clip_*.mp4 plus recursive clip_*\camera1.mp4")
+    print(f"Safety delay: {args.min_age_seconds} seconds after last write")
 
     if not root.exists():
-        print(
-            f"ERROR root folder does not exist: {root}",
-            file=sys.stderr,
-        )
+        print(f"ERROR root folder does not exist: {root}", file=sys.stderr)
         return 2
 
     if not args.dry_run:
@@ -448,32 +310,15 @@ def main() -> int:
         require_program("ffprobe")
 
     if not args.watch:
-        count = scan_once(
-            root,
-            args.min_age_seconds,
-            args.dry_run,
-        )
-        label = (
-            "eligible source clips"
-            if args.dry_run
-            else "source clips processed"
-        )
+        count = scan_once(root, args.min_age_seconds, args.dry_run)
+        label = "eligible source clips" if args.dry_run else "source clips processed"
         print(f"Finished scan. {label}: {count}")
         return 0
 
-    print(
-        f"Watch mode: scanning every {args.poll_seconds}s; "
-        "max one source per cycle."
-    )
-
+    print(f"Watch mode: scanning every {args.poll_seconds}s; max one source per cycle.")
     try:
         while True:
-            scan_once(
-                root,
-                args.min_age_seconds,
-                False,
-                max_process=1,
-            )
+            scan_once(root, args.min_age_seconds, False, max_process=1)
             time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
         print("\nCrop watcher stopped.")
