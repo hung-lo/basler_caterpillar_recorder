@@ -14,6 +14,33 @@ import plot_recording_timeline as timeline
 
 
 class TimelinePlotTests(unittest.TestCase):
+    def capture_timeline_figure(
+        self,
+        *,
+        clips: list[timeline.RecordingClip],
+        events: list[timeline.BehaviorEvent],
+        animals: list[str] | None = None,
+    ):
+        captured: dict[str, object] = {}
+
+        def fake_savefig(fig, *args, **kwargs):
+            captured["fig"] = fig
+
+        with mock.patch("matplotlib.figure.Figure.savefig", new=fake_savefig):
+            with mock.patch("matplotlib.pyplot.close"):
+                timeline.plot_recording_timeline(
+                    clips=clips,
+                    events=events,
+                    animals=animals or timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        fig = captured["fig"]
+        self.addCleanup(timeline.plt.close, fig)
+        return fig
+
     def write_timestamp_clip(
         self,
         clip_dir: Path,
@@ -213,7 +240,7 @@ class TimelinePlotTests(unittest.TestCase):
                 timeline.plot_recording_timeline(
                     clips=[],
                     events=events,
-                    animals=["C01"],
+                    animals=timeline.ANIMAL_ORDER,
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                     output_path=output_png,
                     annotate_clips=False,
@@ -222,10 +249,119 @@ class TimelinePlotTests(unittest.TestCase):
             self.assertTrue(output_png.exists())
             self.assertEqual(mock_scatter.call_count, 1)
             scatter_args, scatter_kwargs = mock_scatter.call_args
-            self.assertEqual(scatter_kwargs["marker"], "D")
-            self.assertEqual(scatter_kwargs["s"], 90)
+            self.assertEqual(scatter_kwargs["marker"], "*")
+            self.assertEqual(scatter_kwargs["s"], timeline.STIM_MARKER_SIZE)
             self.assertEqual(scatter_kwargs["edgecolors"], "black")
             self.assertEqual(scatter_kwargs["linewidths"], 0.6)
+
+    def test_behavior_axis_uses_canonical_animal_order(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C08",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+                event="shed",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 5, 1),
+                event="death",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C06",
+                start_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 15, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        fig = self.capture_timeline_figure(clips=[], events=events, animals=["C08", "C01", "C06"])
+        ax_beh = fig.axes[1]
+
+        self.assertEqual(
+            [tick.get_text() for tick in ax_beh.get_yticklabels()],
+            timeline.ANIMAL_ORDER,
+        )
+
+    def test_empty_animal_rows_remain_visible(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C08",
+                start_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 0, 1),
+                event="shed",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        fig = self.capture_timeline_figure(clips=[], events=events)
+        ax_beh = fig.axes[1]
+
+        self.assertEqual(
+            [tick.get_text() for tick in ax_beh.get_yticklabels()],
+            timeline.ANIMAL_ORDER,
+        )
+
+    def test_shed_and_molt_use_triangle_marker(self) -> None:
+        self.assertEqual(timeline.get_point_event_style("shed")[0], "^")
+        self.assertEqual(timeline.get_point_event_style("molt")[0], "^")
+
+    def test_electrical_stimulation_uses_large_star_marker(self) -> None:
+        marker, size, _color = timeline.get_point_event_style("electrical_stimulation")
+
+        self.assertEqual(marker, "*")
+        self.assertEqual(size, timeline.STIM_MARKER_SIZE)
+
+    def test_death_uses_x_marker(self) -> None:
+        marker, _size, _color = timeline.get_point_event_style("death")
+
+        self.assertEqual(marker, "X")
+
+    def test_unknown_point_event_uses_generic_circle(self) -> None:
+        marker, size, _color = timeline.get_point_event_style("feeding_resumed")
+
+        self.assertEqual(marker, "o")
+        self.assertEqual(size, timeline.DEFAULT_POINT_MARKER_SIZE)
+
+    def test_long_interval_does_not_create_point_marker(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+            event="feeding",
+            kind="event",
+            notes="",
+        )
+
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=[event],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        self.assertEqual(mock_scatter.call_count, 0)
+        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -15,12 +15,17 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
+MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ["MPLCONFIGDIR"] = str(MPLCONFIGDIR)
+
 try:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 except ImportError as exc:  # pragma: no cover - import-time guard for missing optional deps
     raise SystemExit(
@@ -34,14 +39,38 @@ LOG = logging.getLogger("plot_recording_timeline")
 UTC = dt.timezone.utc
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_ANIMALS = [f"C{index:02d}" for index in range(1, 9)]
+ANIMAL_ORDER = [f"C{index:02d}" for index in range(1, 9)]
 TIMESTAMP_SUFFIXES = (".timestamps.csv.gz", ".timestamps.csv")
 MAX_CLIP_ANNOTATIONS = 60
 SHORT_EVENT_THRESHOLD_SECONDS = 300
-SHORT_EVENT_MARKER_SIZE = 90
+DEFAULT_POINT_MARKER_SIZE = 70
+SHED_MARKER_SIZE = 100
+STIM_MARKER_SIZE = 180
+DEATH_MARKER_SIZE = 120
 
-MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
-MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
-os.environ["MPLCONFIGDIR"] = str(MPLCONFIGDIR)
+SHED_EVENT_NAMES = {
+    "shed",
+    "shed_found",
+    "molt",
+    "molting",
+}
+STIM_EVENT_NAMES = {
+    "electrical_stimulation",
+    "electric_stimulation",
+    "electrical_shock",
+    "electric_shock",
+}
+DEATH_EVENT_NAMES = {
+    "death",
+    "dead",
+}
+
+SHED_COLOR = "#d97706"
+STIM_COLOR = "#dc2626"
+DEATH_COLOR = "#111827"
+DEFAULT_POINT_COLOR = "#475569"
+INTERVAL_BAR_COLOR = "#8aa1c7"
+ROW_BAND_COLOR = "#f8fafc"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -364,6 +393,83 @@ def _event_duration_s(event: BehaviorEvent) -> float:
     return max((event.end_local - event.start_local).total_seconds(), 0.0)
 
 
+def normalize_event_name(event_name: str) -> str:
+    return event_name.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def get_point_event_style(event_name: str) -> tuple[str, float, str]:
+    normalized = normalize_event_name(event_name)
+
+    if normalized in SHED_EVENT_NAMES:
+        return "^", SHED_MARKER_SIZE, SHED_COLOR
+
+    if normalized in STIM_EVENT_NAMES:
+        return "*", STIM_MARKER_SIZE, STIM_COLOR
+
+    if normalized in DEATH_EVENT_NAMES:
+        return "X", DEATH_MARKER_SIZE, DEATH_COLOR
+
+    return "o", DEFAULT_POINT_MARKER_SIZE, DEFAULT_POINT_COLOR
+
+
+def event_bar_color(event: BehaviorEvent) -> str:
+    marker, _marker_size, color = get_point_event_style(event.event or event.kind)
+    normalized = normalize_event_name(event.event or event.kind)
+    if normalized in SHED_EVENT_NAMES | STIM_EVENT_NAMES | DEATH_EVENT_NAMES:
+        return color
+    return INTERVAL_BAR_COLOR
+
+
+def semantic_legend_handles() -> list[Line2D | Patch]:
+    return [
+        Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Duration / state"),
+        Line2D(
+            [0],
+            [0],
+            marker="^",
+            linestyle="None",
+            markersize=8,
+            markerfacecolor=SHED_COLOR,
+            markeredgecolor="black",
+            markeredgewidth=0.6,
+            label="Shed / molt",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="*",
+            linestyle="None",
+            markersize=11,
+            markerfacecolor=STIM_COLOR,
+            markeredgecolor="black",
+            markeredgewidth=0.6,
+            label="Electrical stimulation",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="X",
+            linestyle="None",
+            markersize=8,
+            markerfacecolor=DEATH_COLOR,
+            markeredgecolor="black",
+            markeredgewidth=0.6,
+            label="Death",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markersize=7,
+            markerfacecolor=DEFAULT_POINT_COLOR,
+            markeredgecolor="black",
+            markeredgewidth=0.6,
+            label="Other point event",
+        ),
+    ]
+
+
 def plot_recording_timeline(
     clips: list[RecordingClip],
     events: list[BehaviorEvent],
@@ -390,29 +496,57 @@ def plot_recording_timeline(
         elapsed_duration_s = 0.0
         recorded_fraction = 0.0
 
-    behavior_rows = animals or DEFAULT_ANIMALS
-    behavior_height = max(1.8, 0.42 * len(behavior_rows))
-    fig_height = 4.2 + behavior_height if behavior_rows else 4.2
-    fig = plt.figure(figsize=(17, fig_height), constrained_layout=False)
-    if behavior_rows:
-        gs = fig.add_gridspec(2, 1, height_ratios=[1.3, max(1.0, 0.45 * len(behavior_rows))], hspace=0.18)
-        ax_cov = fig.add_subplot(gs[0])
-        ax_beh = fig.add_subplot(gs[1], sharex=ax_cov)
-    else:
-        ax_cov = fig.add_subplot(1, 1, 1)
-        ax_beh = None
+    behavior_rows = list(ANIMAL_ORDER)
+    behavior_index = {animal: index for index, animal in enumerate(behavior_rows)}
+    unknown_animals = sorted({event.animal_id for event in events if event.animal_id not in behavior_index})
+    for animal_id in unknown_animals:
+        LOG.warning("Skipping behavior event for unknown animal ID: %s", animal_id)
+
+    fig_height = 7.6
+    fig = plt.figure(figsize=(18, fig_height), constrained_layout=False)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 4.5], hspace=0.12)
+    ax_cov = fig.add_subplot(gs[0])
+    ax_beh = fig.add_subplot(gs[1], sharex=ax_cov)
+    fig.subplots_adjust(top=0.86, bottom=0.12, left=0.08, right=0.985)
+    fig.patch.set_facecolor("white")
+
+    total_recorded_h = recorded_duration_s / 3600.0
+    elapsed_h = elapsed_duration_s / 3600.0
+    subtitle = (
+        f"Local time - {timezone_label(timezone)} | "
+        f"elapsed {elapsed_h:.1f} h | recorded {total_recorded_h:.1f} h | "
+        f"coverage {recorded_fraction:.1%}"
+    )
+    fig.suptitle(
+        "Monarch caterpillar recording + behavior timeline",
+        x=0.08,
+        y=0.975,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#0f172a",
+    )
+    fig.text(
+        0.08,
+        0.942,
+        subtitle,
+        ha="left",
+        va="top",
+        fontsize=10,
+        color="#475569",
+    )
 
     if clips:
-        colors = {"camera": "#3b82f6"}
+        colors = {"camera": "#0f766e"}
         for index, clip in enumerate(clips):
             left, width = _bar_left_width(clip.start_utc, clip.end_utc, timezone)
-            ax_cov.broken_barh([(left, width)], (0.25, 0.5), facecolors=colors["camera"], alpha=0.72)
+            ax_cov.broken_barh([(left, width)], (0.3, 0.42), facecolors=colors["camera"], alpha=0.82)
             if clip_annotations:
                 center = left + width / 2.0
                 duration_min = clip.duration_s / 60.0
                 ax_cov.text(
                     center,
-                    0.64,
+                    0.77,
                     f"{clip.camera_label}  {duration_min:.1f}m",
                     ha="center",
                     va="bottom",
@@ -423,26 +557,8 @@ def plot_recording_timeline(
 
         ax_cov.set_ylim(0, 1)
         ax_cov.set_yticks([])
-        ax_cov.set_ylabel("Recording", rotation=0, labelpad=46, va="center")
-        ax_cov.grid(True, axis="x", alpha=0.25)
-
-        summary_text = (
-            f"first recorded: {format_local(first_utc, timezone)}\n"
-            f"last recorded:  {format_local(last_utc, timezone)}\n"
-            f"total recorded: {recorded_duration_s / 60.0:.1f} min\n"
-            f"recorded / elapsed: {recorded_fraction:.1%}"
-        )
-        ax_cov.text(
-            0.01,
-            0.98,
-            summary_text,
-            transform=ax_cov.transAxes,
-            ha="left",
-            va="top",
-            fontsize=9,
-            family="monospace",
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.78, edgecolor="#cbd5e1"),
-        )
+        ax_cov.set_ylabel("Recording", rotation=0, labelpad=34, va="center", fontsize=10, color="#334155")
+        ax_cov.grid(True, axis="x", color="#cbd5e1", alpha=0.45, linewidth=0.6)
     else:
         ax_cov.text(
             0.5,
@@ -456,76 +572,88 @@ def plot_recording_timeline(
         ax_cov.set_yticks([])
         ax_cov.grid(False)
 
+    plot_starts: list[dt.datetime] = []
+    plot_ends: list[dt.datetime] = []
     if clips:
-        x_min = to_plot_local(first_utc, timezone)
-        x_max = to_plot_local(last_utc, timezone)
+        plot_starts.append(to_plot_local(first_utc, timezone))
+        plot_ends.append(to_plot_local(last_utc, timezone))
+    for event in events:
+        if event.animal_id in behavior_index:
+            plot_starts.append(event.start_local.replace(tzinfo=None))
+            plot_ends.append(event.end_local.replace(tzinfo=None))
+    if plot_starts and plot_ends:
+        x_min = min(plot_starts)
+        x_max = max(plot_ends)
         if x_max <= x_min:
             x_max = x_min + dt.timedelta(minutes=1)
         ax_cov.set_xlim(x_min, x_max)
-    ax_cov.set_title("Recording coverage")
+
+    ax_cov.set_title("Recording coverage", loc="left", fontsize=11, color="#0f172a", pad=8)
+    ax_cov.tick_params(axis="x", labelbottom=False)
+
+    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=18)
+    ax_beh.set_yticks(range(len(behavior_rows)))
+    ax_beh.set_yticklabels(behavior_rows)
+    ax_beh.set_ylabel("Animal")
+    ax_beh.set_ylim(-0.5, len(behavior_rows) - 0.5)
+    ax_beh.invert_yaxis()
+    ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.45, linewidth=0.6)
+    ax_beh.set_xlabel(f"Local time - {timezone_label(timezone)}")
+
+    for y in range(len(behavior_rows)):
+        ax_beh.axhspan(y - 0.46, y + 0.46, facecolor=ROW_BAND_COLOR, alpha=0.9, zorder=0)
+
     locator = mdates.AutoDateLocator()
-    ax_cov.xaxis.set_major_locator(locator)
-    ax_cov.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    ax_cov.set_xlabel(f"Local time ({timezone_label(timezone)})")
+    ax_beh.xaxis.set_major_locator(locator)
+    ax_beh.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
 
-    if ax_beh is not None:
-        ax_beh.set_title("Behavior annotations")
-        ax_beh.set_yticks(range(len(behavior_rows)))
-        ax_beh.set_yticklabels(behavior_rows)
-        ax_beh.set_ylabel("Animal")
-        ax_beh.grid(True, axis="x", alpha=0.2)
-        ax_beh.set_ylim(-0.5, len(behavior_rows) - 0.5)
-        ax_beh.invert_yaxis()
-
-        color_cycle = plt.get_cmap("tab20")
-        categories: dict[str, str] = {}
-        legend_handles: list[Patch] = []
-        for event in events:
-            if event.animal_id not in behavior_rows:
-                continue
-            y = behavior_rows.index(event.animal_id)
-            category = event.event or event.kind
-            if category not in categories:
-                categories[category] = color_cycle(len(categories) % color_cycle.N)
-            color = categories[category]
-            left = mdates.date2num(event.start_local.replace(tzinfo=None))
-            duration_s = _event_duration_s(event)
-            width = max(duration_s / 86400.0, 1.0 / 86400.0 / 24.0)
-            ax_beh.broken_barh([(left, width)], (y - 0.32, 0.64), facecolors=color, alpha=0.8)
-            if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS:
-                ax_beh.scatter(
-                    left,
-                    y,
-                    s=SHORT_EVENT_MARKER_SIZE,
-                    marker="D",
-                    color=color,
-                    edgecolors="black",
-                    linewidths=0.6,
-                    zorder=5,
-                )
-
-        if categories:
-            legend_handles = [Patch(facecolor=color, label=label, alpha=0.8) for label, color in categories.items()]
-            if len(legend_handles) <= 10:
-                ax_beh.legend(
-                    handles=legend_handles,
-                    loc="upper right",
-                    fontsize=8,
-                    frameon=True,
-                    title="Behavior",
-                    title_fontsize=8,
-                )
-    elif behavior_rows:
-        ax_cov.text(
-            0.99,
-            0.02,
-            "No behavior rows to display",
-            transform=ax_cov.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=8,
-            color="#6b7280",
+    for event in events:
+        if event.animal_id not in behavior_index:
+            continue
+        y = behavior_index[event.animal_id]
+        left = mdates.date2num(event.start_local.replace(tzinfo=None))
+        duration_s = _event_duration_s(event)
+        width = max(duration_s / 86400.0, 1e-9)
+        color = event_bar_color(event)
+        ax_beh.broken_barh(
+            [(left, width)],
+            (y - 0.33, 0.66),
+            facecolors=color,
+            alpha=0.74,
+            zorder=2,
         )
+        if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS:
+            marker, marker_size, point_color = get_point_event_style(event.event or event.kind)
+            ax_beh.scatter(
+                left,
+                y,
+                s=marker_size,
+                marker=marker,
+                color=point_color,
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=5,
+            )
+
+    ax_beh.legend(
+        handles=semantic_legend_handles(),
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.01),
+        ncol=5,
+        frameon=False,
+        fontsize=8,
+        handlelength=1.3,
+        handletextpad=0.5,
+        columnspacing=1.2,
+        borderaxespad=0.0,
+    )
+
+    for ax in (ax_cov, ax_beh):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#cbd5e1")
+        ax.spines["bottom"].set_color("#cbd5e1")
+        ax.tick_params(axis="both", colors="#334155")
 
     fig.autofmt_xdate()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
