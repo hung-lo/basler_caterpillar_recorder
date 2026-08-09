@@ -137,7 +137,11 @@ class FakeCamera:
         return self._device_info
 
 
-def make_fake_camera(modern: bool) -> tuple[FakeCamera, list[tuple[str, object]]]:
+def make_fake_camera(
+    modern: bool,
+    *,
+    include_white_balance_usage: bool = True,
+) -> tuple[FakeCamera, list[tuple[str, object]]]:
     log: list[tuple[str, object]] = []
     nodes = {
         "AcquisitionMode": FakeNode("AcquisitionMode", "SingleFrame", log=log),
@@ -198,6 +202,17 @@ def make_fake_camera(modern: bool) -> tuple[FakeCamera, list[tuple[str, object]]
                 "AutoFunctionROIWidth": FakeNode("AutoFunctionROIWidth", 1920, log=log),
                 "AutoFunctionROIHeight": FakeNode("AutoFunctionROIHeight", 1200, log=log),
                 "AutoFunctionROIUseBrightness": FakeNode("AutoFunctionROIUseBrightness", False, log=log),
+                **(
+                    {
+                        "AutoFunctionROIUseWhiteBalance": FakeNode(
+                            "AutoFunctionROIUseWhiteBalance",
+                            False,
+                            log=log,
+                        )
+                    }
+                    if include_white_balance_usage
+                    else {}
+                ),
             }
         )
     else:
@@ -233,13 +248,29 @@ def make_fake_camera(modern: bool) -> tuple[FakeCamera, list[tuple[str, object]]
                 "AutoFunctionAOIWidth": FakeNode("AutoFunctionAOIWidth", 1920, log=log),
                 "AutoFunctionAOIHeight": FakeNode("AutoFunctionAOIHeight", 1200, log=log),
                 "AutoFunctionAOIUsageIntensity": FakeNode("AutoFunctionAOIUsageIntensity", False, log=log),
+                **(
+                    {
+                        "AutoFunctionAOIUsageWhiteBalance": FakeNode(
+                            "AutoFunctionAOIUsageWhiteBalance",
+                            False,
+                            log=log,
+                        )
+                    }
+                    if include_white_balance_usage
+                    else {}
+                ),
             }
         )
     return FakeCamera(nodes), log
 
 
-def configure_fake_camera(camera_cfg: dict[str, object], *, modern: bool) -> tuple[record_basler.CameraBinding, list[tuple[str, object]]]:
-    camera, log = make_fake_camera(modern)
+def configure_fake_camera(
+    camera_cfg: dict[str, object],
+    *,
+    modern: bool,
+    include_white_balance_usage: bool = True,
+) -> tuple[record_basler.CameraBinding, list[tuple[str, object]]]:
+    camera, log = make_fake_camera(modern, include_white_balance_usage=include_white_balance_usage)
 
     class FakeFactory:
         def CreateDevice(self, device_info: object) -> object:
@@ -1006,6 +1037,7 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
                 ("ExposureAuto", "Continuous"),
             ],
         )
+        self.assertNotIn(("AutoFunctionROIUseWhiteBalance", True), log)
         self.assertEqual(binding.actual_settings["ExposureAuto"], "Continuous")
         self.assertEqual(binding.actual_settings["GainAuto"], "Off")
         self.assertEqual(binding.actual_settings["Gain"], 0.0)
@@ -1050,6 +1082,100 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
         )
         self.assertIn(("BalanceWhiteAuto", "Off"), off_log)
         self.assertEqual(off_binding.actual_settings["BalanceWhiteAuto"], "Off")
+
+    def test_modern_white_balance_uses_roi2(self) -> None:
+        binding, log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": True,
+                "auto_exposure_mode": "continuous",
+                "auto_exposure_lower_us": 6000,
+                "auto_exposure_upper_us": 180000,
+                "auto_target_brightness": 0.59,
+                "auto_exposure_roi": "full",
+                "auto_gain": False,
+                "balance_white_auto": True,
+            },
+            modern=True,
+        )
+
+        self.assertIn(("AutoFunctionROISelector", "ROI2"), log)
+        self.assertIn(("AutoFunctionROIUseWhiteBalance", True), log)
+        self.assertEqual(binding.actual_settings["AutoFunctionROISelector"], "ROI2")
+        self.assertEqual(binding.actual_settings["AutoFunctionROIUseWhiteBalance"], True)
+        self.assertEqual(binding.actual_settings["BalanceWhiteAuto"], "Continuous")
+
+    def test_legacy_white_balance_uses_aoi2(self) -> None:
+        binding, log = configure_fake_camera(
+            {
+                "label": "camera1",
+                "fps": 5,
+                "width": 1920,
+                "height": 1200,
+                "offset_x": 0,
+                "offset_y": 0,
+                "pixel_format": "auto",
+                "exposure_us": 30000,
+                "gain": 0,
+                "auto_exposure": True,
+                "auto_exposure_mode": "continuous",
+                "auto_exposure_lower_us": 6000,
+                "auto_exposure_upper_us": 180000,
+                "auto_target_brightness": 0.59,
+                "auto_exposure_roi": "full",
+                "auto_gain": False,
+                "balance_white_auto": True,
+            },
+            modern=False,
+        )
+
+        self.assertIn(("AutoFunctionAOISelector", "AOI2"), log)
+        self.assertIn(("AutoFunctionAOIUsageWhiteBalance", True), log)
+        self.assertEqual(binding.actual_settings["AutoFunctionAOISelector"], "AOI2")
+        self.assertEqual(binding.actual_settings["AutoFunctionAOIUsageWhiteBalance"], True)
+        self.assertEqual(binding.actual_settings["BalanceWhiteAuto"], "Continuous")
+
+    def test_white_balance_roi_unsupported_warns_and_continues(self) -> None:
+        with self.assertLogs(record_basler.LOG.name, level="WARNING") as captured:
+            binding, _ = configure_fake_camera(
+                {
+                    "label": "camera1",
+                    "fps": 5,
+                    "width": 1920,
+                    "height": 1200,
+                    "offset_x": 0,
+                    "offset_y": 0,
+                    "pixel_format": "auto",
+                    "exposure_us": 30000,
+                    "gain": 0,
+                    "auto_exposure": True,
+                    "auto_exposure_mode": "continuous",
+                    "auto_exposure_lower_us": 6000,
+                    "auto_exposure_upper_us": 180000,
+                    "auto_target_brightness": 0.59,
+                    "auto_exposure_roi": "full",
+                    "auto_gain": False,
+                    "balance_white_auto": True,
+                },
+                modern=True,
+                include_white_balance_usage=False,
+            )
+
+        self.assertTrue(
+            any(
+                "could not explicitly configure a white-balance auto-function ROI" in line
+                for line in captured.output
+            )
+        )
+        self.assertEqual(binding.actual_settings["BalanceWhiteAuto"], "Continuous")
 
     def test_legacy_auto_exposure_uses_raw_and_aoi_nodes(self) -> None:
         binding, log = configure_fake_camera(

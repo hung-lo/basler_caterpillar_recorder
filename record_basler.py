@@ -441,6 +441,88 @@ def enable_chunk_timestamp(camera: Any) -> bool:
     return ok
 
 
+def configure_auto_function_roi(
+    camera: Any,
+    *,
+    selector: str,
+    offset_x: int,
+    offset_y: int,
+    width: int,
+    height: int,
+    use_brightness: bool = False,
+    use_white_balance: bool = False,
+    label: str,
+    required: bool = False,
+) -> tuple[bool, Optional[str]]:
+    if use_brightness == use_white_balance:
+        raise ValueError("configure_auto_function_roi requires exactly one usage flag")
+
+    if get_node(camera, "AutoFunctionROISelector") is not None:
+        selector_name = "AutoFunctionROISelector"
+        offset_x_name = "AutoFunctionROIOffsetX"
+        offset_y_name = "AutoFunctionROIOffsetY"
+        width_name = "AutoFunctionROIWidth"
+        height_name = "AutoFunctionROIHeight"
+        usage_name = "AutoFunctionROIUseBrightness" if use_brightness else "AutoFunctionROIUseWhiteBalance"
+    elif get_node(camera, "AutoFunctionAOISelector") is not None:
+        selector_name = "AutoFunctionAOISelector"
+        offset_x_name = "AutoFunctionAOIOffsetX"
+        offset_y_name = "AutoFunctionAOIOffsetY"
+        width_name = "AutoFunctionAOIWidth"
+        height_name = "AutoFunctionAOIHeight"
+        usage_name = "AutoFunctionAOIUsageIntensity" if use_brightness else "AutoFunctionAOIUsageWhiteBalance"
+    else:
+        message = f"{label} auto function ROI: no ROI/AOI node family available"
+        if required:
+            raise RuntimeError(message)
+        LOG.warning(message)
+        return False, None
+
+    usage_label = "brightness" if use_brightness else "white balance"
+    ok = True
+    actual_selector: Optional[str] = None
+    for node_name, value in (
+        (selector_name, selector),
+        (offset_x_name, offset_x),
+        (offset_y_name, offset_y),
+        (width_name, width),
+        (height_name, height),
+    ):
+        step_ok, actual = try_set(camera, node_name, value, required=required)
+        ok = ok and step_ok
+        if node_name == selector_name and actual is not None:
+            actual_selector = str(actual)
+
+    usage_ok, _ = try_set(camera, usage_name, True, required=required)
+    ok = ok and usage_ok
+
+    if ok:
+        LOG.info(
+            "%s %s ROI: %s full-frame %dx%d at (%d,%d)",
+            label,
+            usage_label,
+            actual_selector or selector,
+            width,
+            height,
+            offset_x,
+            offset_y,
+        )
+    elif use_white_balance:
+        LOG.warning(
+            "%s could not explicitly configure a white-balance auto-function ROI; "
+            "BalanceWhiteAuto may depend on existing camera ROI state",
+            label,
+        )
+    else:
+        LOG.warning(
+            "%s could not fully configure %s auto-function ROI",
+            label,
+            usage_label,
+        )
+
+    return ok, actual_selector or selector
+
+
 def configure_white_balance(camera: Any, camera_cfg: dict[str, Any], *, label: str) -> Optional[str]:
     requested = camera_cfg.get("balance_white_auto")
     if requested is None:
@@ -958,6 +1040,16 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
         if not gain_ok:
             try_set(camera, "GainRaw", int(camera_cfg["gain"]))
 
+    white_balance_requested = camera_cfg.get("balance_white_auto")
+
+    if auto_exposure_settings is not None or white_balance_requested is not None:
+        image_offset_x = int(read_setting(camera, "OffsetX") or 0)
+        image_offset_y = int(read_setting(camera, "OffsetY") or 0)
+        image_width = int(read_setting(camera, "Width") or 0)
+        image_height = int(read_setting(camera, "Height") or 0)
+        if image_width <= 0 or image_height <= 0:
+            raise RuntimeError("Could not determine the configured camera ROI for auto exposure")
+
     if auto_exposure_settings is not None:
         exposure_ok, _ = try_set(camera, "ExposureTime", auto_exposure_settings.initial_us)
         if not exposure_ok:
@@ -991,30 +1083,30 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
                 required=True,
             )
 
-        image_offset_x = int(read_setting(camera, "OffsetX") or 0)
-        image_offset_y = int(read_setting(camera, "OffsetY") or 0)
-        image_width = int(read_setting(camera, "Width") or 0)
-        image_height = int(read_setting(camera, "Height") or 0)
-        if image_width <= 0 or image_height <= 0:
-            raise RuntimeError("Could not determine the configured camera ROI for auto exposure")
-
-        roi_family: str
         if get_node(camera, "AutoFunctionROISelector") is not None:
-            roi_family = "ROI"
-            try_set(camera, "AutoFunctionROISelector", "ROI1", required=True)
-            try_set(camera, "AutoFunctionROIOffsetX", image_offset_x, required=True)
-            try_set(camera, "AutoFunctionROIOffsetY", image_offset_y, required=True)
-            try_set(camera, "AutoFunctionROIWidth", image_width, required=True)
-            try_set(camera, "AutoFunctionROIHeight", image_height, required=True)
-            try_set(camera, "AutoFunctionROIUseBrightness", True, required=True)
+            configure_auto_function_roi(
+                camera,
+                selector="ROI1",
+                offset_x=image_offset_x,
+                offset_y=image_offset_y,
+                width=image_width,
+                height=image_height,
+                use_brightness=True,
+                label=label,
+                required=True,
+            )
         elif get_node(camera, "AutoFunctionAOISelector") is not None:
-            roi_family = "AOI"
-            try_set(camera, "AutoFunctionAOISelector", "AOI1", required=True)
-            try_set(camera, "AutoFunctionAOIOffsetX", image_offset_x, required=True)
-            try_set(camera, "AutoFunctionAOIOffsetY", image_offset_y, required=True)
-            try_set(camera, "AutoFunctionAOIWidth", image_width, required=True)
-            try_set(camera, "AutoFunctionAOIHeight", image_height, required=True)
-            try_set(camera, "AutoFunctionAOIUsageIntensity", True, required=True)
+            configure_auto_function_roi(
+                camera,
+                selector="AOI1",
+                offset_x=image_offset_x,
+                offset_y=image_offset_y,
+                width=image_width,
+                height=image_height,
+                use_brightness=True,
+                label=label,
+                required=True,
+            )
         else:
             raise RuntimeError("Auto exposure requires a complete AutoFunction ROI/AOI node family")
     else:
@@ -1043,6 +1135,19 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
             image_height,
             read_setting(camera, "GainAuto"),
             read_setting(camera, "Gain") if read_setting(camera, "Gain") is not None else read_setting(camera, "GainRaw"),
+        )
+
+    if bool(white_balance_requested):
+        configure_auto_function_roi(
+            camera,
+            selector="ROI2" if get_node(camera, "AutoFunctionROISelector") is not None else "AOI2",
+            offset_x=image_offset_x,
+            offset_y=image_offset_y,
+            width=image_width,
+            height=image_height,
+            use_white_balance=True,
+            label=label,
+            required=False,
         )
 
     configure_white_balance(camera, camera_cfg, label=label)
@@ -1094,12 +1199,14 @@ def configure_camera(camera_cfg: dict[str, Any], device_info: Any) -> CameraBind
         "AutoFunctionROIWidth",
         "AutoFunctionROIHeight",
         "AutoFunctionROIUseBrightness",
+        "AutoFunctionROIUseWhiteBalance",
         "AutoFunctionAOISelector",
         "AutoFunctionAOIOffsetX",
         "AutoFunctionAOIOffsetY",
         "AutoFunctionAOIWidth",
         "AutoFunctionAOIHeight",
         "AutoFunctionAOIUsageIntensity",
+        "AutoFunctionAOIUsageWhiteBalance",
         "BslEffectiveExposureTime",
         "AcquisitionFrameRate",
         "AcquisitionFrameRateAbs",

@@ -223,6 +223,27 @@ Keep these warnings in mind:
 - Do not treat raw RGB values or intensity as calibrated measurements while either auto exposure or white balance is enabled.
 - Run a blocked-light test before unattended recording.
 
+### Why continuous white balance is enabled
+
+The caterpillar recording arena is in an open lab space next to a large window. Illumination changes substantially during long recordings as daylight, room lighting, and IR illumination contribute different amounts of light.
+
+The main goal is behavioral tracking and pose estimation, not quantitative color or pixel-intensity measurement. Therefore continuous white balance is intentionally enabled:
+
+```yaml
+balance_white_auto: true
+```
+
+This maps to Basler `BalanceWhiteAuto=Continuous`.
+
+The camera may adjust RGB balance while frames are being acquired so that the caterpillars and background remain visually usable as illumination changes.
+
+This is a deliberate tradeoff:
+
+- preferred: visually consistent, trackable video across changing light;
+- not guaranteed: fixed RGB gains or photometrically calibrated color.
+
+The raw videos should not be treated as calibrated measurements of absolute color or intensity without accounting for the automatic camera controls.
+
 ## Schedule meaning
 
 The recorder now has two scheduling layers:
