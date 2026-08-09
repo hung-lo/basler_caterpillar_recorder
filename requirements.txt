@@ -2,3 +2,5 @@ pypylon>=26.6,<27
 opencv-python>=4.10
 numpy>=1.26
 PyYAML>=6.0
+matplotlib>=3.9,<4
+tzdata>=2024.1

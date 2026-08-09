@@ -21,6 +21,7 @@ If you use a different camera, copy a YAML template and update the model, serial
 
 - `record_basler.py` is the main CLI for listing cameras, previewing, dry runs, and scheduled recording.
 - `validate_session.py` checks clip structure, JSON sidecars, timing, and archive state.
+- `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars and `behavior_events.csv`.
 - `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
 - `config_smoke_test.yaml` is a short local test.
 - `config_multiclip_smoke_test.yaml` is a short repeated-clip test.
