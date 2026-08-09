@@ -211,7 +211,51 @@ class TimelinePlotTests(unittest.TestCase):
 
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].event, "electrical_stimulation")
-            self.assertEqual((events[0].end_local - events[0].start_local).total_seconds(), 1.0)
+            self.assertEqual(
+                (events[0].end_local - events[0].start_local).total_seconds(),
+                float(timeline.POINT_EVENT_DURATION_SECONDS),
+            )
+
+    def test_missing_start_local_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events_path = root / "behavior_events.csv"
+            with events_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C06", "", "", "shed", "development", "missing start"])
+
+            events = timeline.load_behavior_events(
+                events_path,
+                dt.timezone(dt.timedelta(hours=-4)),
+            )
+
+            self.assertEqual(events, [])
+
+    def test_bad_explicit_interval_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events_path = root / "behavior_events.csv"
+            with events_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(
+                    [
+                        "C06",
+                        "2026-08-07T14:32:00-04:00",
+                        "2026-08-07T14:32:00-04:00",
+                        "shed",
+                        "development",
+                        "bad interval",
+                    ]
+                )
+
+            events = timeline.load_behavior_events(
+                events_path,
+                dt.timezone(dt.timedelta(hours=-4)),
+            )
+
+            self.assertEqual(events, [])
 
     def test_short_events_draw_a_marker_without_changing_the_bar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

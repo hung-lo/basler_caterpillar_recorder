@@ -42,6 +42,7 @@ DEFAULT_ANIMALS = [f"C{index:02d}" for index in range(1, 9)]
 ANIMAL_ORDER = [f"C{index:02d}" for index in range(1, 9)]
 TIMESTAMP_SUFFIXES = (".timestamps.csv.gz", ".timestamps.csv")
 MAX_CLIP_ANNOTATIONS = 60
+POINT_EVENT_DURATION_SECONDS = 1
 SHORT_EVENT_THRESHOLD_SECONDS = 300
 DEFAULT_POINT_MARKER_SIZE = 70
 SHED_MARKER_SIZE = 100
@@ -357,7 +358,9 @@ def load_behavior_events(path: Optional[Path], tz: dt.tzinfo) -> list[BehaviorEv
                     if end_local <= start_local:
                         raise ValueError("end_local must be after start_local")
                 else:
-                    end_local = start_local + dt.timedelta(seconds=1)
+                    end_local = start_local + dt.timedelta(
+                        seconds=POINT_EVENT_DURATION_SECONDS
+                    )
                 events.append(
                     BehaviorEvent(
                         animal_id=animal_id,
