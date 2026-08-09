@@ -463,14 +463,16 @@ def configure_auto_function_roi(
         offset_y_name = "AutoFunctionROIOffsetY"
         width_name = "AutoFunctionROIWidth"
         height_name = "AutoFunctionROIHeight"
-        usage_name = "AutoFunctionROIUseBrightness" if use_brightness else "AutoFunctionROIUseWhiteBalance"
+        brightness_usage_name = "AutoFunctionROIUseBrightness"
+        white_balance_usage_name = "AutoFunctionROIUseWhiteBalance"
     elif get_node(camera, "AutoFunctionAOISelector") is not None:
         selector_name = "AutoFunctionAOISelector"
         offset_x_name = "AutoFunctionAOIOffsetX"
         offset_y_name = "AutoFunctionAOIOffsetY"
         width_name = "AutoFunctionAOIWidth"
         height_name = "AutoFunctionAOIHeight"
-        usage_name = "AutoFunctionAOIUsageIntensity" if use_brightness else "AutoFunctionAOIUsageWhiteBalance"
+        brightness_usage_name = "AutoFunctionAOIUsageIntensity"
+        white_balance_usage_name = "AutoFunctionAOIUsageWhiteBalance"
     else:
         message = f"{label} auto function ROI: no ROI/AOI node family available"
         if required:
@@ -493,8 +495,14 @@ def configure_auto_function_roi(
         if node_name == selector_name and actual is not None:
             actual_selector = str(actual)
 
+    usage_name = brightness_usage_name if use_brightness else white_balance_usage_name
     usage_ok, _ = try_set(camera, usage_name, True, required=required)
     ok = ok and usage_ok
+
+    opposite_usage_name = white_balance_usage_name if use_brightness else brightness_usage_name
+    if get_node(camera, opposite_usage_name) is not None:
+        opposite_ok, _ = try_set(camera, opposite_usage_name, False, required=False)
+        ok = ok and opposite_ok
 
     if ok:
         LOG.info(

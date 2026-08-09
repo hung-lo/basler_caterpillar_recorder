@@ -68,6 +68,9 @@ class FakeNode:
         maximum: float | None = None,
         increment: float | None = None,
         log: list[tuple[str, object]] | None = None,
+        camera: "FakeCamera" | None = None,
+        selector_family: str | None = None,
+        selector_states: dict[str, object] | None = None,
     ) -> None:
         self.name = name
         self.value = value
@@ -75,17 +78,46 @@ class FakeNode:
         self.maximum = maximum
         self.increment = increment
         self.log = log
+        self.camera = camera
+        self.selector_family = selector_family
+        self.selector_states = selector_states
 
     def TrySetValue(self, value: object) -> bool:
         self.SetValue(value)
         return True
 
     def SetValue(self, value: object) -> None:
-        self.value = value
+        if self.name == "AutoFunctionROISelector" and self.camera is not None:
+            self.camera.current_roi_selector = str(value)
+        elif self.name == "AutoFunctionAOISelector" and self.camera is not None:
+            self.camera.current_aoi_selector = str(value)
+
+        if self.selector_states is not None and self.camera is not None:
+            if self.selector_family == "ROI":
+                selector = self.camera.current_roi_selector
+            elif self.selector_family == "AOI":
+                selector = self.camera.current_aoi_selector
+            else:
+                selector = None
+            if selector is not None:
+                self.selector_states[selector] = value
+            else:
+                self.value = value
+        else:
+            self.value = value
         if self.log is not None:
             self.log.append((self.name, value))
 
     def GetValue(self) -> object:
+        if self.selector_states is not None and self.camera is not None:
+            if self.selector_family == "ROI":
+                selector = self.camera.current_roi_selector
+            elif self.selector_family == "AOI":
+                selector = self.camera.current_aoi_selector
+            else:
+                selector = None
+            if selector is not None and selector in self.selector_states:
+                return self.selector_states[selector]
         return self.value
 
     def GetMin(self) -> float:
@@ -125,9 +157,14 @@ class FakeDeviceInfo:
 
 
 class FakeCamera:
-    def __init__(self, nodes: dict[str, FakeNode]) -> None:
+    def __init__(self) -> None:
         self._device_info = FakeDeviceInfo()
+        self.current_roi_selector = "ROI1"
+        self.current_aoi_selector = "AOI1"
+
+    def install_nodes(self, nodes: dict[str, FakeNode]) -> None:
         for name, node in nodes.items():
+            node.camera = self
             setattr(self, name, node)
 
     def Open(self) -> None:
@@ -141,24 +178,41 @@ def make_fake_camera(
     modern: bool,
     *,
     include_white_balance_usage: bool = True,
+    roi_usage_state: dict[str, dict[str, object]] | None = None,
+    aoi_usage_state: dict[str, dict[str, object]] | None = None,
 ) -> tuple[FakeCamera, list[tuple[str, object]]]:
     log: list[tuple[str, object]] = []
+    camera = FakeCamera()
+    roi_usage_state = roi_usage_state or {}
+    aoi_usage_state = aoi_usage_state or {}
+    roi_brightness_states = {"ROI1": False, "ROI2": False}
+    roi_brightness_states.update({str(key): value for key, value in roi_usage_state.get("brightness", {}).items()})
+    roi_white_balance_states = {"ROI1": False, "ROI2": False}
+    roi_white_balance_states.update(
+        {str(key): value for key, value in roi_usage_state.get("white_balance", {}).items()}
+    )
+    aoi_intensity_states = {"AOI1": False, "AOI2": False}
+    aoi_intensity_states.update({str(key): value for key, value in aoi_usage_state.get("brightness", {}).items()})
+    aoi_white_balance_states = {"AOI1": False, "AOI2": False}
+    aoi_white_balance_states.update(
+        {str(key): value for key, value in aoi_usage_state.get("white_balance", {}).items()}
+    )
     nodes = {
-        "AcquisitionMode": FakeNode("AcquisitionMode", "SingleFrame", log=log),
-        "ExposureMode": FakeNode("ExposureMode", "TriggerWidth", log=log),
-        "TriggerSelector": FakeNode("TriggerSelector", "FrameStart", log=log),
-        "TriggerMode": FakeNode("TriggerMode", "On", log=log),
-        "Width": FakeNode("Width", 1920, minimum=16, maximum=1920, increment=1, log=log),
-        "Height": FakeNode("Height", 1200, minimum=16, maximum=1200, increment=1, log=log),
-        "OffsetX": FakeNode("OffsetX", 0, minimum=0, maximum=1919, increment=1, log=log),
-        "OffsetY": FakeNode("OffsetY", 0, minimum=0, maximum=1199, increment=1, log=log),
-        "PixelFormat": FakeNode("PixelFormat", "BayerRG8", log=log),
-        "ExposureAuto": FakeNode("ExposureAuto", "Off", log=log),
-        "ExposureTime": FakeNode("ExposureTime", 5000.0, minimum=50, maximum=500000, increment=1, log=log),
-        "GainAuto": FakeNode("GainAuto", "Off", log=log),
-        "Gain": FakeNode("Gain", 0.0, minimum=0, maximum=24, increment=1, log=log),
-        "BalanceWhiteAuto": FakeNode("BalanceWhiteAuto", "Off", log=log),
-        "AcquisitionFrameRateEnable": FakeNode("AcquisitionFrameRateEnable", False, log=log),
+        "AcquisitionMode": FakeNode("AcquisitionMode", "SingleFrame", log=log, camera=camera),
+        "ExposureMode": FakeNode("ExposureMode", "TriggerWidth", log=log, camera=camera),
+        "TriggerSelector": FakeNode("TriggerSelector", "FrameStart", log=log, camera=camera),
+        "TriggerMode": FakeNode("TriggerMode", "On", log=log, camera=camera),
+        "Width": FakeNode("Width", 1920, minimum=16, maximum=1920, increment=1, log=log, camera=camera),
+        "Height": FakeNode("Height", 1200, minimum=16, maximum=1200, increment=1, log=log, camera=camera),
+        "OffsetX": FakeNode("OffsetX", 0, minimum=0, maximum=1919, increment=1, log=log, camera=camera),
+        "OffsetY": FakeNode("OffsetY", 0, minimum=0, maximum=1199, increment=1, log=log, camera=camera),
+        "PixelFormat": FakeNode("PixelFormat", "BayerRG8", log=log, camera=camera),
+        "ExposureAuto": FakeNode("ExposureAuto", "Off", log=log, camera=camera),
+        "ExposureTime": FakeNode("ExposureTime", 5000.0, minimum=50, maximum=500000, increment=1, log=log, camera=camera),
+        "GainAuto": FakeNode("GainAuto", "Off", log=log, camera=camera),
+        "Gain": FakeNode("Gain", 0.0, minimum=0, maximum=24, increment=1, log=log, camera=camera),
+        "BalanceWhiteAuto": FakeNode("BalanceWhiteAuto", "Off", log=log, camera=camera),
+        "AcquisitionFrameRateEnable": FakeNode("AcquisitionFrameRateEnable", False, log=log, camera=camera),
         "AcquisitionFrameRate": FakeNode(
             "AcquisitionFrameRate",
             5.0,
@@ -166,8 +220,9 @@ def make_fake_camera(
             maximum=60,
             increment=0.01,
             log=log,
+            camera=camera,
         ),
-        "MaxNumBuffer": FakeNode("MaxNumBuffer", 20, minimum=1, maximum=100, increment=1, log=log),
+        "MaxNumBuffer": FakeNode("MaxNumBuffer", 20, minimum=1, maximum=100, increment=1, log=log, camera=camera),
     }
     if modern:
         nodes.update(
@@ -179,6 +234,7 @@ def make_fake_camera(
                     maximum=500000,
                     increment=1,
                     log=log,
+                    camera=camera,
                 ),
                 "AutoExposureTimeUpperLimit": FakeNode(
                     "AutoExposureTimeUpperLimit",
@@ -187,6 +243,7 @@ def make_fake_camera(
                     maximum=500000,
                     increment=1,
                     log=log,
+                    camera=camera,
                 ),
                 "AutoTargetBrightness": FakeNode(
                     "AutoTargetBrightness",
@@ -195,19 +252,30 @@ def make_fake_camera(
                     maximum=1.0,
                     increment=0.001,
                     log=log,
+                    camera=camera,
                 ),
-                "AutoFunctionROISelector": FakeNode("AutoFunctionROISelector", "ROI1", log=log),
-                "AutoFunctionROIOffsetX": FakeNode("AutoFunctionROIOffsetX", 0, log=log),
-                "AutoFunctionROIOffsetY": FakeNode("AutoFunctionROIOffsetY", 0, log=log),
-                "AutoFunctionROIWidth": FakeNode("AutoFunctionROIWidth", 1920, log=log),
-                "AutoFunctionROIHeight": FakeNode("AutoFunctionROIHeight", 1200, log=log),
-                "AutoFunctionROIUseBrightness": FakeNode("AutoFunctionROIUseBrightness", False, log=log),
+                "AutoFunctionROISelector": FakeNode("AutoFunctionROISelector", "ROI1", log=log, camera=camera),
+                "AutoFunctionROIOffsetX": FakeNode("AutoFunctionROIOffsetX", 0, log=log, camera=camera),
+                "AutoFunctionROIOffsetY": FakeNode("AutoFunctionROIOffsetY", 0, log=log, camera=camera),
+                "AutoFunctionROIWidth": FakeNode("AutoFunctionROIWidth", 1920, log=log, camera=camera),
+                "AutoFunctionROIHeight": FakeNode("AutoFunctionROIHeight", 1200, log=log, camera=camera),
+                "AutoFunctionROIUseBrightness": FakeNode(
+                    "AutoFunctionROIUseBrightness",
+                    roi_brightness_states["ROI1"],
+                    log=log,
+                    camera=camera,
+                    selector_family="ROI",
+                    selector_states=roi_brightness_states,
+                ),
                 **(
                     {
                         "AutoFunctionROIUseWhiteBalance": FakeNode(
                             "AutoFunctionROIUseWhiteBalance",
-                            False,
+                            roi_white_balance_states["ROI1"],
                             log=log,
+                            camera=camera,
+                            selector_family="ROI",
+                            selector_states=roi_white_balance_states,
                         )
                     }
                     if include_white_balance_usage
@@ -225,6 +293,7 @@ def make_fake_camera(
                     maximum=500000,
                     increment=1,
                     log=log,
+                    camera=camera,
                 ),
                 "AutoExposureTimeUpperLimitRaw": FakeNode(
                     "AutoExposureTimeUpperLimitRaw",
@@ -233,6 +302,7 @@ def make_fake_camera(
                     maximum=500000,
                     increment=1,
                     log=log,
+                    camera=camera,
                 ),
                 "AutoTargetValue": FakeNode(
                     "AutoTargetValue",
@@ -241,19 +311,30 @@ def make_fake_camera(
                     maximum=255,
                     increment=1,
                     log=log,
+                    camera=camera,
                 ),
-                "AutoFunctionAOISelector": FakeNode("AutoFunctionAOISelector", "AOI1", log=log),
-                "AutoFunctionAOIOffsetX": FakeNode("AutoFunctionAOIOffsetX", 0, log=log),
-                "AutoFunctionAOIOffsetY": FakeNode("AutoFunctionAOIOffsetY", 0, log=log),
-                "AutoFunctionAOIWidth": FakeNode("AutoFunctionAOIWidth", 1920, log=log),
-                "AutoFunctionAOIHeight": FakeNode("AutoFunctionAOIHeight", 1200, log=log),
-                "AutoFunctionAOIUsageIntensity": FakeNode("AutoFunctionAOIUsageIntensity", False, log=log),
+                "AutoFunctionAOISelector": FakeNode("AutoFunctionAOISelector", "AOI1", log=log, camera=camera),
+                "AutoFunctionAOIOffsetX": FakeNode("AutoFunctionAOIOffsetX", 0, log=log, camera=camera),
+                "AutoFunctionAOIOffsetY": FakeNode("AutoFunctionAOIOffsetY", 0, log=log, camera=camera),
+                "AutoFunctionAOIWidth": FakeNode("AutoFunctionAOIWidth", 1920, log=log, camera=camera),
+                "AutoFunctionAOIHeight": FakeNode("AutoFunctionAOIHeight", 1200, log=log, camera=camera),
+                "AutoFunctionAOIUsageIntensity": FakeNode(
+                    "AutoFunctionAOIUsageIntensity",
+                    aoi_intensity_states["AOI1"],
+                    log=log,
+                    camera=camera,
+                    selector_family="AOI",
+                    selector_states=aoi_intensity_states,
+                ),
                 **(
                     {
                         "AutoFunctionAOIUsageWhiteBalance": FakeNode(
                             "AutoFunctionAOIUsageWhiteBalance",
-                            False,
+                            aoi_white_balance_states["AOI1"],
                             log=log,
+                            camera=camera,
+                            selector_family="AOI",
+                            selector_states=aoi_white_balance_states,
                         )
                     }
                     if include_white_balance_usage
@@ -261,7 +342,8 @@ def make_fake_camera(
                 ),
             }
         )
-    return FakeCamera(nodes), log
+    camera.install_nodes(nodes)
+    return camera, log
 
 
 def configure_fake_camera(
@@ -269,8 +351,15 @@ def configure_fake_camera(
     *,
     modern: bool,
     include_white_balance_usage: bool = True,
+    roi_usage_state: dict[str, dict[str, object]] | None = None,
+    aoi_usage_state: dict[str, dict[str, object]] | None = None,
 ) -> tuple[record_basler.CameraBinding, list[tuple[str, object]]]:
-    camera, log = make_fake_camera(modern, include_white_balance_usage=include_white_balance_usage)
+    camera, log = make_fake_camera(
+        modern,
+        include_white_balance_usage=include_white_balance_usage,
+        roi_usage_state=roi_usage_state,
+        aoi_usage_state=aoi_usage_state,
+    )
 
     class FakeFactory:
         def CreateDevice(self, device_info: object) -> object:
@@ -1083,7 +1172,7 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
         self.assertIn(("BalanceWhiteAuto", "Off"), off_log)
         self.assertEqual(off_binding.actual_settings["BalanceWhiteAuto"], "Off")
 
-    def test_modern_white_balance_uses_roi2(self) -> None:
+    def test_modern_white_balance_normalizes_stale_roi_state(self) -> None:
         binding, log = configure_fake_camera(
             {
                 "label": "camera1",
@@ -1105,15 +1194,30 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
                 "balance_white_auto": True,
             },
             modern=True,
+            roi_usage_state={
+                "brightness": {"ROI1": False, "ROI2": True},
+                "white_balance": {"ROI1": True, "ROI2": False},
+            },
         )
 
         self.assertIn(("AutoFunctionROISelector", "ROI2"), log)
         self.assertIn(("AutoFunctionROIUseWhiteBalance", True), log)
+        self.assertIn(("AutoFunctionROIUseBrightness", False), log)
+
+        camera = binding.camera
+        record_basler.try_set(camera, "AutoFunctionROISelector", "ROI1", required=True)
+        self.assertTrue(record_basler.read_setting(camera, "AutoFunctionROIUseBrightness"))
+        self.assertFalse(record_basler.read_setting(camera, "AutoFunctionROIUseWhiteBalance"))
+
+        record_basler.try_set(camera, "AutoFunctionROISelector", "ROI2", required=True)
+        self.assertFalse(record_basler.read_setting(camera, "AutoFunctionROIUseBrightness"))
+        self.assertTrue(record_basler.read_setting(camera, "AutoFunctionROIUseWhiteBalance"))
+
         self.assertEqual(binding.actual_settings["AutoFunctionROISelector"], "ROI2")
-        self.assertEqual(binding.actual_settings["AutoFunctionROIUseWhiteBalance"], True)
+        self.assertTrue(binding.actual_settings["AutoFunctionROIUseWhiteBalance"])
         self.assertEqual(binding.actual_settings["BalanceWhiteAuto"], "Continuous")
 
-    def test_legacy_white_balance_uses_aoi2(self) -> None:
+    def test_legacy_white_balance_normalizes_stale_aoi_state(self) -> None:
         binding, log = configure_fake_camera(
             {
                 "label": "camera1",
@@ -1135,12 +1239,27 @@ class ConfigureCameraAutoExposureTests(unittest.TestCase):
                 "balance_white_auto": True,
             },
             modern=False,
+            aoi_usage_state={
+                "brightness": {"AOI1": False, "AOI2": True},
+                "white_balance": {"AOI1": True, "AOI2": False},
+            },
         )
 
         self.assertIn(("AutoFunctionAOISelector", "AOI2"), log)
         self.assertIn(("AutoFunctionAOIUsageWhiteBalance", True), log)
+        self.assertIn(("AutoFunctionAOIUsageIntensity", False), log)
+
+        camera = binding.camera
+        record_basler.try_set(camera, "AutoFunctionAOISelector", "AOI1", required=True)
+        self.assertTrue(record_basler.read_setting(camera, "AutoFunctionAOIUsageIntensity"))
+        self.assertFalse(record_basler.read_setting(camera, "AutoFunctionAOIUsageWhiteBalance"))
+
+        record_basler.try_set(camera, "AutoFunctionAOISelector", "AOI2", required=True)
+        self.assertFalse(record_basler.read_setting(camera, "AutoFunctionAOIUsageIntensity"))
+        self.assertTrue(record_basler.read_setting(camera, "AutoFunctionAOIUsageWhiteBalance"))
+
         self.assertEqual(binding.actual_settings["AutoFunctionAOISelector"], "AOI2")
-        self.assertEqual(binding.actual_settings["AutoFunctionAOIUsageWhiteBalance"], True)
+        self.assertTrue(binding.actual_settings["AutoFunctionAOIUsageWhiteBalance"])
         self.assertEqual(binding.actual_settings["BalanceWhiteAuto"], "Continuous")
 
     def test_white_balance_roi_unsupported_warns_and_continues(self) -> None:

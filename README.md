@@ -244,6 +244,8 @@ This is a deliberate tradeoff:
 
 The raw videos should not be treated as calibrated measurements of absolute color or intensity without accounting for the automatic camera controls.
 
+The recorder also explicitly disables the opposite auto-function assignment on each ROI/AOI where supported, so stale pylon Viewer settings cannot cause brightness and white balance to share unintended regions.
+
 ## Schedule meaning
 
 The recorder now has two scheduling layers:
