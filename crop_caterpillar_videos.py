@@ -25,12 +25,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from caterpillar_clip_naming import ClipParseError, resolve_source_naming
 
 VERSION = "MBL Caterpillar Cropper v3 TIMESTAMPED"
 DEFAULT_ROOT = Path(r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08")
@@ -57,15 +58,6 @@ VIDEO_CODEC = "libx264"
 PRESET = "veryfast"
 CRF = "18"
 ENCODER_THREADS_PER_OUTPUT = "1"
-
-SESSION_RE = re.compile(
-    r"^(?P<date>\d{8})_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$"
-)
-CLIP_RE = re.compile(
-    r"^clip_(?P<index>\d+)_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$",
-    re.IGNORECASE,
-)
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=VERSION)
@@ -115,62 +107,31 @@ def discover_sources(root: Path) -> list[Path]:
     return sorted(found, key=safe_sort_key)
 
 
-def recording_stem(source: Path) -> str:
-    r"""
-    Build the identifying portion of the cropped output filename.
-
-    Nested example:
-      source:
-        ...\20260809_134217-0400\clip_0000_134218-0400\camera1.mp4
-      result:
-        20260809_134218-0400_clip_0000
-
-    We intentionally use:
-      - DATE from the session directory
-      - TIME and timezone from the clip directory
-      - raw clip index from the clip directory
-
-    This makes filenames chronological while keeping raw-data provenance.
-    """
-    if (
-        source.name.lower() == "camera1.mp4"
-        and source.parent.name.lower().startswith("clip_")
-    ):
-        clip_match = CLIP_RE.match(source.parent.name)
-        session_match = SESSION_RE.match(source.parent.parent.name)
-
-        if clip_match and session_match:
-            date = session_match.group("date")
-            clip_time = clip_match.group("time")
-            clip_index = clip_match.group("index")
-
-            # Prefer the clip timezone because it belongs to the actual clip
-            # timestamp; fall back to the session timezone if needed.
-            tz = clip_match.group("tz") or session_match.group("tz") or ""
-
-            return f"{date}_{clip_time}{tz}_clip_{clip_index}"
-
-        # Defensive fallback for an unexpected recorder directory name.
-        return source.parent.name
-
-    # Flat legacy input does not contain a date in its path, so preserve its
-    # original stem rather than inventing a date.
-    return source.stem
+def output_path(
+    output_dir: Path,
+    caterpillar_id: str,
+    naming,
+) -> Path:
+    if naming.stem is None:
+        raise ClipParseError(naming.error or "missing canonical stem")
+    return output_dir / f"{caterpillar_id}_{naming.stem}.mp4"
 
 
-def output_path(output_dir: Path, caterpillar_id: str, source: Path) -> Path:
-    return output_dir / f"{caterpillar_id}_{recording_stem(source)}.mp4"
+def temp_path(
+    output_dir: Path,
+    caterpillar_id: str,
+    naming,
+) -> Path:
+    if naming.stem is None:
+        raise ClipParseError(naming.error or "missing canonical stem")
+    return output_dir / f".{caterpillar_id}_{naming.stem}.partial.mp4"
 
 
-def temp_path(output_dir: Path, caterpillar_id: str, source: Path) -> Path:
-    return output_dir / f".{caterpillar_id}_{recording_stem(source)}.partial.mp4"
-
-
-def missing_ids(output_dir: Path, source: Path) -> list[str]:
+def missing_ids(output_dir: Path, naming) -> list[str]:
     return [
         cid
         for cid in CROPS
-        if not output_path(output_dir, cid, source).exists()
+        if not output_path(output_dir, cid, naming).exists()
     ]
 
 
@@ -221,7 +182,7 @@ def font_for_ffmpeg() -> str | None:
     return None
 
 
-def build_ffmpeg(source: Path, output_dir: Path, ids: list[str]):
+def build_ffmpeg(source: Path, output_dir: Path, ids: list[str], naming):
     n = len(ids)
     font = font_for_ffmpeg()
     filters: list[str] = []
@@ -256,8 +217,8 @@ def build_ffmpeg(source: Path, output_dir: Path, ids: list[str]):
         )
         pairs.append(
             (
-                temp_path(output_dir, cid, source),
-                output_path(output_dir, cid, source),
+                temp_path(output_dir, cid, naming),
+                output_path(output_dir, cid, naming),
             )
         )
 
@@ -297,8 +258,7 @@ def build_ffmpeg(source: Path, output_dir: Path, ids: list[str]):
     return cmd, pairs
 
 
-def process_source(source: Path, output_dir: Path) -> bool:
-    ids = missing_ids(output_dir, source)
+def process_source(source: Path, output_dir: Path, naming, ids: list[str]) -> bool:
 
     if not ids:
         print(f"SKIP already complete: {source}")
@@ -321,19 +281,19 @@ def process_source(source: Path, output_dir: Path) -> bool:
     print(
         "  outputs: "
         + ", ".join(
-            output_path(output_dir, cid, source).name for cid in ids
+            output_path(output_dir, cid, naming).name for cid in ids
         )
     )
 
     for cid in ids:
-        tmp = temp_path(output_dir, cid, source)
+        tmp = temp_path(output_dir, cid, naming)
         try:
             if tmp.exists():
                 tmp.unlink()
         except OSError:
             pass
 
-    cmd, pairs = build_ffmpeg(source, output_dir, ids)
+    cmd, pairs = build_ffmpeg(source, output_dir, ids, naming)
     result = subprocess.run(cmd, creationflags=creation_flags())
 
     if result.returncode != 0:
@@ -351,7 +311,7 @@ def process_source(source: Path, output_dir: Path) -> bool:
             return False
         os.replace(tmp, final)
 
-    print(f"DONE {recording_stem(source)}")
+    print(f"DONE {naming.stem}")
     return True
 
 
@@ -378,13 +338,18 @@ def scan_once(
     processed = 0
 
     for source in sources:
-        age = age_seconds(source)
+        naming = resolve_source_naming(source)
+        if naming.error:
+            print(f"SKIP unparsable source: {source}")
+            print(f"  reason: {naming.error}")
+            continue
 
+        age = age_seconds(source)
         if age is None:
             print(f"SKIP cannot stat: {source}")
             continue
 
-        ids = missing_ids(output_dir, source)
+        ids = missing_ids(output_dir, naming)
 
         if not ids:
             print(f"SKIP already complete: {source}")
@@ -402,13 +367,13 @@ def scan_once(
             print(
                 "  would create: "
                 + ", ".join(
-                    output_path(output_dir, cid, source).name
+                    output_path(output_dir, cid, naming).name
                     for cid in ids
                 )
             )
             processed += 1
         else:
-            if process_source(source, output_dir):
+            if process_source(source, output_dir, naming, ids):
                 processed += 1
 
         if max_process is not None and processed >= max_process:
@@ -426,9 +391,9 @@ def main() -> int:
     print("=" * 68)
     print(f"Source: {root}")
     print(f"Output: {root / 'cropped_by_caterpillar'}")
-    print(
-        "Naming: C01_YYYYMMDD_HHMMSS-TZ_clip_0000.mp4"
-    )
+    print("Naming: CXX_YYYYMMDD_HHMMSS-TZ_clip_NNNN.mp4")
+    print("Current timestamps: already local")
+    print("oldcommit timestamps: UTC -> Woods Hole local")
     print(
         r"Input search: clip_*.mp4 plus recursive clip_*\camera1.mp4"
     )

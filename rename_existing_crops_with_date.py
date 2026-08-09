@@ -22,24 +22,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 from collections import defaultdict
 from pathlib import Path
+
+from caterpillar_clip_naming import resolve_source_naming
 
 DEFAULT_ROOT = Path(
     r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08"
 )
 
 CATERPILLAR_IDS = [f"C{i:02d}" for i in range(1, 9)]
-
-SESSION_RE = re.compile(
-    r"^(?P<date>\d{8})_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$"
-)
-CLIP_RE = re.compile(
-    r"^clip_(?P<index>\d+)_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$",
-    re.IGNORECASE,
-)
-
 
 def discover_sources(root: Path) -> list[Path]:
     found = []
@@ -58,28 +50,13 @@ def legacy_stem(source: Path) -> str:
     return source.parent.name
 
 
-def new_stem(source: Path) -> str | None:
-    clip_match = CLIP_RE.match(source.parent.name)
-    session_match = SESSION_RE.match(source.parent.parent.name)
-
-    if not clip_match or not session_match:
-        return None
-
-    date = session_match.group("date")
-    clip_time = clip_match.group("time")
-    clip_index = clip_match.group("index")
-    tz = clip_match.group("tz") or session_match.group("tz") or ""
-
-    return f"{date}_{clip_time}{tz}_clip_{clip_index}"
-
-
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Rename existing legacy crops without re-encoding."
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     root = args.root.resolve()
     output_dir = root / "cropped_by_caterpillar"
@@ -90,6 +67,7 @@ def main() -> int:
     print(f"Root: {root}")
     print(f"Crop folder: {output_dir}")
     print(f"Mode: {'DRY RUN' if args.dry_run else 'RENAME'}")
+    print("Naming: CXX_YYYYMMDD_HHMMSS-TZ_clip_NNNN.mp4")
 
     if not root.exists():
         print(f"ERROR root does not exist: {root}")
@@ -135,15 +113,18 @@ def main() -> int:
             continue
 
         source = matching_sources[0]
-        stem = new_stem(source)
+        naming = resolve_source_naming(source)
 
-        if stem is None:
+        if naming.error or naming.stem is None:
             unmatched += len(existing_legacy)
             print(
                 f"UNPARSED raw directory names; leaving old crop(s): "
                 f"{source}"
             )
+            print(f"  reason: {naming.error or 'missing canonical stem'}")
             continue
+
+        stem = naming.stem
 
         for old_path in existing_legacy:
             cid = old_path.name.split("_", 1)[0]
