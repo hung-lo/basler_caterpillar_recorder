@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-MBL Caterpillar Cropper v5 - unified timestamped output names.
+MBL Caterpillar video cropper with unified timestamped output names.
 
 Supports flat legacy clips:
     ROOT\clip_0000_152652.mp4
@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "MBL Caterpillar Cropper v5 UNIFIED TIMESTAMPS"
+VERSION = "MBL Caterpillar Video Cropper"
 DEFAULT_ROOT = Path(r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08")
 
 EXPECTED_WIDTH = 1200
