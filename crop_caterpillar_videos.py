@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 r"""
-MBL Caterpillar Cropper v3 - timestamped output names.
+MBL Caterpillar Cropper v5 - unified timestamped output names.
 
-Supports both:
+Supports flat legacy clips:
     ROOT\clip_0000_152652.mp4
 
-and the recorder layout:
+and nested recorder layouts:
     ROOT\20260809_134217-0400\clip_0000_134218-0400\camera1.mp4
+    ROOT\20260806_133944_oldcommit\clip_0000_133946\camera1.mp4
+    ROOT\20260804_145301\clip_0000_145302\camera1.mp4
 
-For the nested recorder layout, output names use:
-    caterpillar ID + clip date + actual clip start time + timezone + raw clip index
+Canonical nested output names use:
+    caterpillar ID + final clip date + final clip time + timezone + raw clip index
 
 Example:
     C01_20260809_134218-0400_clip_0000.mp4
 
-The date is taken from the session directory.
-The time/timezone and clip index are taken from the clip directory.
+Nested current-offset timestamps stay local.
+Legacy `_oldcommit` and no-offset nested recorder layouts are treated as UTC
+and converted to Woods Hole local time.
 
 Original videos are never modified or deleted.
 """
@@ -23,23 +26,66 @@ Original videos are never modified or deleted.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from caterpillar_clip_naming import ClipParseError, resolve_source_naming
-
-VERSION = "MBL Caterpillar Cropper v3 TIMESTAMPED"
+VERSION = "MBL Caterpillar Cropper v5 UNIFIED TIMESTAMPS"
 DEFAULT_ROOT = Path(r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08")
 
 EXPECTED_WIDTH = 1200
 EXPECTED_HEIGHT = 1920
 DEFAULT_MIN_AGE_SECONDS = 180
 DEFAULT_POLL_SECONDS = 60
+
+SESSION_CURRENT_RE = re.compile(
+    r"^(?P<date>\d{8})_(?P<time>\d{6})(?P<tz>[+-]\d{4})$"
+)
+SESSION_OLDCOMMIT_RE = re.compile(
+    r"^(?P<date>\d{8})_(?P<time>\d{6})(?:[_-]old(?:[_-]?commit))$",
+    re.IGNORECASE,
+)
+SESSION_LEGACY_UTC_RE = re.compile(
+    r"^(?P<date>\d{8})_(?P<time>\d{6})$"
+)
+CLIP_RE = re.compile(
+    r"^clip_(?P<index>\d+)_(?P<time>\d{6})(?P<tz>[+-]\d{4})?$",
+    re.IGNORECASE,
+)
+
+WOODS_HOLE_LEGACY_TZ = dt.timezone(dt.timedelta(hours=-4))
+
+
+@dataclass(frozen=True)
+class ClipMetadata:
+    local_datetime: dt.datetime
+    clip_index: str
+    source_format: str
+
+    @property
+    def stem(self) -> str:
+        return f"{self.local_datetime.strftime('%Y%m%d_%H%M%S%z')}_clip_{self.clip_index}"
+
+
+@dataclass(frozen=True)
+class SourceNaming:
+    stem: str | None
+    layout: str | None = None
+    error: str | None = None
+    session_name: str | None = None
+    clip_name: str | None = None
+    metadata: ClipMetadata | None = None
+
+
+class ClipParseError(ValueError):
+    """Raised when a nested clip path cannot be interpreted safely."""
 
 # Fixed 512x512 crops measured from the supplied sample frame.
 # (x, y, width, height)
@@ -105,6 +151,172 @@ def discover_sources(root: Path) -> list[Path]:
             return (float("inf"), str(p).lower())
 
     return sorted(found, key=safe_sort_key)
+
+
+def _parse_datetime(date_text: str, time_text: str, tzinfo: dt.tzinfo) -> dt.datetime | None:
+    try:
+        return dt.datetime.strptime(
+            f"{date_text}{time_text}", "%Y%m%d%H%M%S"
+        ).replace(tzinfo=tzinfo)
+    except ValueError:
+        return None
+
+
+def _parse_offset(text: str | None) -> dt.tzinfo | None:
+    if not text or len(text) != 5 or text[0] not in "+-":
+        return None
+
+    try:
+        hours = int(text[1:3])
+        minutes = int(text[3:5])
+    except ValueError:
+        return None
+
+    sign = 1 if text[0] == "+" else -1
+    return dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
+
+
+def _session_layout(session_name: str) -> str | None:
+    if SESSION_CURRENT_RE.fullmatch(session_name):
+        return "current"
+    if SESSION_OLDCOMMIT_RE.fullmatch(session_name):
+        return "oldcommit"
+    if SESSION_LEGACY_UTC_RE.fullmatch(session_name):
+        return "legacy_utc"
+    return None
+
+
+def parse_clip_metadata(source: Path) -> ClipMetadata:
+    """Parse a nested recorder source into canonical local clip metadata."""
+
+    if source.name.lower() != "camera1.mp4":
+        raise ClipParseError(f"not a nested camera1.mp4 source: {source}")
+
+    if not source.parent.name.lower().startswith("clip_"):
+        raise ClipParseError(
+            f"nested camera1.mp4 is not inside a clip_ folder: {source}"
+        )
+
+    clip_match = CLIP_RE.fullmatch(source.parent.name)
+    if not clip_match:
+        raise ClipParseError(f"unrecognized clip folder name: {source.parent.name}")
+
+    session_name = source.parent.parent.name
+    session_match = (
+        SESSION_CURRENT_RE.fullmatch(session_name)
+        or SESSION_OLDCOMMIT_RE.fullmatch(session_name)
+        or SESSION_LEGACY_UTC_RE.fullmatch(session_name)
+    )
+    if not session_match:
+        raise ClipParseError(f"unrecognized session folder name: {session_name}")
+
+    clip_index = clip_match.group("index")
+    clip_time = clip_match.group("time")
+    clip_tz = clip_match.group("tz")
+    session_date = session_match.group("date")
+    session_time = session_match.group("time")
+
+    layout = _session_layout(session_name)
+    if layout is None:
+        raise ClipParseError(f"unrecognized session folder name: {session_name}")
+
+    if layout == "current":
+        session_tz_text = session_match.group("tz")
+        if session_tz_text is None:
+            raise ClipParseError(
+                f"missing timezone offset in session folder: {session_name}"
+            )
+        session_tz = _parse_offset(session_tz_text)
+        if session_tz is None:
+            raise ClipParseError(
+                f"invalid timezone offset in session folder: {session_name}"
+            )
+        clip_tz_text = clip_tz or session_tz_text
+        clip_tzinfo = _parse_offset(clip_tz_text)
+        if clip_tzinfo is None:
+            raise ClipParseError(
+                f"invalid timezone offset in clip folder: {source.parent.name}"
+            )
+        session_dt = _parse_datetime(session_date, session_time, session_tz)
+        clip_dt = _parse_datetime(session_date, clip_time, clip_tzinfo)
+        if session_dt is None or clip_dt is None:
+            raise ClipParseError(
+                f"invalid numeric timestamp in nested source: {source}"
+            )
+        if clip_dt < session_dt:
+            clip_dt += dt.timedelta(days=1)
+        return ClipMetadata(local_datetime=clip_dt, clip_index=clip_index, source_format="current")
+
+    if layout in {"oldcommit", "legacy_utc"}:
+        session_dt = _parse_datetime(session_date, session_time, dt.timezone.utc)
+        clip_dt = _parse_datetime(session_date, clip_time, dt.timezone.utc)
+        if session_dt is None or clip_dt is None:
+            raise ClipParseError(
+                f"invalid numeric timestamp in nested source: {source}"
+            )
+        if clip_dt < session_dt:
+            clip_dt += dt.timedelta(days=1)
+        local_dt = clip_dt.astimezone(WOODS_HOLE_LEGACY_TZ)
+        return ClipMetadata(
+            local_datetime=local_dt,
+            clip_index=clip_index,
+            source_format=layout,
+        )
+
+    raise ClipParseError(f"unrecognized session folder name: {session_name}")
+
+
+def source_metadata(source: Path) -> ClipMetadata | None:
+    """Return parsed nested metadata or None when the layout is unsafe."""
+
+    if source.name.lower() != "camera1.mp4" or not source.parent.name.lower().startswith("clip_"):
+        return None
+    try:
+        return parse_clip_metadata(source)
+    except ClipParseError:
+        return None
+
+
+def canonical_nested_recording_stem(source: Path) -> str | None:
+    metadata = source_metadata(source)
+    return None if metadata is None else metadata.stem
+
+
+def resolve_source_naming(source: Path) -> SourceNaming:
+    if source.name.lower() != "camera1.mp4":
+        return SourceNaming(stem=source.stem, layout="flat_legacy")
+
+    session_name = source.parent.parent.name
+    clip_name = source.parent.name
+
+    if not source.parent.name.lower().startswith("clip_"):
+        return SourceNaming(
+            stem=None,
+            layout=None,
+            error=f"nested camera1.mp4 is not inside a clip_ folder: {source}",
+            session_name=session_name,
+            clip_name=clip_name,
+        )
+
+    try:
+        metadata = parse_clip_metadata(source)
+    except ClipParseError as exc:
+        layout = _session_layout(session_name)
+        return SourceNaming(
+            stem=None,
+            layout=layout,
+            error=str(exc),
+            session_name=session_name,
+            clip_name=clip_name,
+        )
+
+    return SourceNaming(
+        stem=metadata.stem,
+        layout=metadata.source_format,
+        metadata=metadata,
+        session_name=session_name,
+        clip_name=clip_name,
+    )
 
 
 def output_path(
@@ -277,7 +489,8 @@ def process_source(source: Path, output_dir: Path, naming, ids: list[str]) -> bo
         )
         return False
 
-    print(f"PROCESS {source}")
+    layout_tag = f"[{naming.layout}] " if naming.layout and naming.layout != "flat_legacy" else ""
+    print(f"PROCESS {layout_tag}{source}")
     print(
         "  outputs: "
         + ", ".join(
@@ -340,7 +553,11 @@ def scan_once(
     for source in sources:
         naming = resolve_source_naming(source)
         if naming.error:
-            print(f"SKIP unparsable source: {source}")
+            print(f"SKIP unrecognized recorder timestamp layout: {source}")
+            if naming.session_name is not None:
+                print(f"  session: {naming.session_name}")
+            if naming.clip_name is not None:
+                print(f"  clip: {naming.clip_name}")
             print(f"  reason: {naming.error}")
             continue
 
@@ -363,7 +580,8 @@ def scan_once(
             continue
 
         if dry_run:
-            print(f"WOULD PROCESS ({age:.0f}s old): {source}")
+            layout_tag = f"[{naming.layout}] " if naming.layout and naming.layout != "flat_legacy" else ""
+            print(f"WOULD PROCESS {layout_tag}({age:.0f}s old): {source}")
             print(
                 "  would create: "
                 + ", ".join(
@@ -392,8 +610,10 @@ def main() -> int:
     print(f"Source: {root}")
     print(f"Output: {root / 'cropped_by_caterpillar'}")
     print("Naming: CXX_YYYYMMDD_HHMMSS-TZ_clip_NNNN.mp4")
-    print("Current timestamps: already local")
-    print("oldcommit timestamps: UTC -> Woods Hole local")
+    print(
+        "Timestamp rules: current offset timestamps preserved; "
+        "legacy/oldcommit UTC -> Woods Hole -0400"
+    )
     print(
         r"Input search: clip_*.mp4 plus recursive clip_*\camera1.mp4"
     )

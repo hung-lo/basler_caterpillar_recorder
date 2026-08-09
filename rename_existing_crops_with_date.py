@@ -25,7 +25,7 @@ import os
 from collections import defaultdict
 from pathlib import Path
 
-from caterpillar_clip_naming import resolve_source_naming
+from crop_caterpillar_videos import resolve_source_naming
 
 DEFAULT_ROOT = Path(
     r"D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-08"
@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     if ambiguous:
         print(
             "Ambiguous legacy names are intentionally not guessed. "
-            "The v3 cropper can regenerate those raw clips with unique "
+            "The canonical cropper can regenerate those raw clips with unique "
             "timestamped names if needed."
         )
 

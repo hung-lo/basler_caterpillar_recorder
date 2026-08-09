@@ -114,7 +114,7 @@ class CropNamingTests(unittest.TestCase):
                 count = cropper.scan_once(root, min_age=0, dry_run=True)
 
             self.assertEqual(count, 0)
-            self.assertIn("SKIP unparsable source:", buf.getvalue())
+            self.assertIn("SKIP unrecognized recorder timestamp layout:", buf.getvalue())
             self.assertNotIn("C01_clip_", buf.getvalue())
 
     def test_renamer_rejects_ambiguous_legacy_names(self) -> None:
