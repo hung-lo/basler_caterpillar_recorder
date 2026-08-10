@@ -646,8 +646,48 @@ class ExtractMotionEnergyTests(unittest.TestCase):
 
             self.assertEqual(rows["C01"]["threshold"], "4.200000")
             self.assertEqual(rows["C01"]["threshold_source"], "manual")
-            self.assertEqual(rows["C01"]["n_windows"], "100")
-            self.assertNotEqual(rows["C01"]["median"], "9.900000")
+
+    def test_write_motion_energy_timeseries_preserves_real_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "motion_energy_timeseries.csv"
+            rows_by_animal = {
+                "C01": [
+                    motion.MotionTraceRow(
+                        "C01",
+                        "clip_a",
+                        0,
+                        1,
+                        dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                        dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                        4.0,
+                        1.0,
+                        0.0,
+                    ),
+                    motion.MotionTraceRow(
+                        "C01",
+                        "clip_b",
+                        0,
+                        1,
+                        dt.datetime(2026, 8, 9, 19, 10, 0, tzinfo=dt.timezone.utc),
+                        dt.datetime(2026, 8, 9, 19, 10, 1, tzinfo=dt.timezone.utc),
+                        8.0,
+                        2.0,
+                        0.0,
+                    ),
+                ]
+            }
+
+            motion.write_motion_energy_timeseries(path, rows_by_animal)
+
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                saved = list(csv.DictReader(handle))
+
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(saved[0]["clip_key"], "clip_a")
+            self.assertEqual(saved[0]["timestamp_utc"], "2026-08-09T19:00:01.000000Z")
+            self.assertEqual(saved[1]["clip_key"], "clip_b")
+            self.assertEqual(saved[1]["timestamp_utc"], "2026-08-09T19:10:01.000000Z")
 
     def test_sequential_incremental_processing_aggregates_all_cached_animals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

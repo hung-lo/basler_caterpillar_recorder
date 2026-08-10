@@ -29,18 +29,18 @@ matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 
-from plot_recording_timeline import (
-    ANIMAL_ORDER,
+from analysis_timing import (
     DEFAULT_TIMEZONE,
     UTC,
     format_local,
     format_utc,
+    load_timestamp_series,
     load_timezone,
-    open_text_file,
-    parse_timestamp_row,
     parse_utc_value,
     timezone_label,
 )
+
+ANIMAL_ORDER = [f"C{index:02d}" for index in range(1, 9)]
 
 LOG = logging.getLogger("extract_motion_energy")
 
@@ -92,6 +92,18 @@ SUMMARY_FIELDS = [
     "sample_windows",
     "status",
     "error",
+]
+TIMESERIES_FIELDS = [
+    "animal_id",
+    "clip_key",
+    "frame_index_start",
+    "frame_index_end",
+    "start_utc",
+    "end_utc",
+    "timestamp_utc",
+    "motion_energy",
+    "motion_mean",
+    "global_luminance_shift",
 ]
 TRACE_HEADER_REQUIRED = set(TRACE_FIELDS)
 MOTION_WIDTH = 96
@@ -464,23 +476,6 @@ def load_manifest_entries(
     if limit_clips is not None:
         entries = entries[: max(limit_clips, 0)]
     return entries
-
-
-def load_timestamp_series(path: Path) -> list[dt.datetime]:
-    timestamps: list[dt.datetime] = []
-    with open_text_file(path) as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            raise ValueError(f"missing CSV header in {path}")
-        for row_index, row in enumerate(reader, start=2):
-            try:
-                timestamps.append(parse_timestamp_row(row))
-            except Exception as exc:
-                raise ValueError(f"row {row_index}: {exc}") from exc
-    if not timestamps:
-        raise ValueError(f"no timestamp rows in {path}")
-    return timestamps
-
 
 def preprocess_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1116,6 +1111,33 @@ def load_cached_trace_inventory(root: Path) -> CachedTraceInventory:
     )
 
 
+def write_motion_energy_timeseries(
+    path: Path,
+    trace_rows_by_animal: dict[str, list[MotionTraceRow]],
+) -> None:
+    rows: list[dict[str, str]] = []
+    for animal_id in ANIMAL_ORDER:
+        for row in sorted(
+            trace_rows_by_animal.get(animal_id, []),
+            key=lambda item: (item.end_utc, item.clip_key, item.frame_index_end),
+        ):
+            rows.append(
+                {
+                    "animal_id": row.animal_id,
+                    "clip_key": row.clip_key,
+                    "frame_index_start": str(row.frame_index_start),
+                    "frame_index_end": str(row.frame_index_end),
+                    "start_utc": format_utc(row.start_utc),
+                    "end_utc": format_utc(row.end_utc),
+                    "timestamp_utc": format_utc(row.end_utc),
+                    "motion_energy": f"{row.motion_energy:.6f}",
+                    "motion_mean": f"{row.motion_mean:.6f}",
+                    "global_luminance_shift": f"{row.global_luminance_shift:.6f}",
+                }
+            )
+    write_csv(path, TIMESERIES_FIELDS, rows)
+
+
 def log_cached_trace_inventory(inventory: CachedTraceInventory) -> None:
     availability = ", ".join(
         f"{animal_id}={inventory.valid_windows_by_animal.get(animal_id, 0)}"
@@ -1242,6 +1264,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     states_path = motion_root / "motion_states.csv"
     summary_path = motion_root / "motion_summary.csv"
     diagnostics_path = motion_root / "motion_energy_diagnostics.png"
+    timeseries_path = motion_root / "motion_energy_timeseries.csv"
 
     summary_rows: list[dict[str, str]] = []
     if not args.classify_only:
@@ -1271,6 +1294,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             parser.error("no cached motion trace files were found under cropped_by_caterpillar/motion_energy/traces")
         LOG.warning("No cached motion trace files were found under %s", motion_root / "traces")
     log_cached_trace_inventory(inventory)
+    write_motion_energy_timeseries(timeseries_path, inventory.trace_rows_by_animal)
+    LOG.info("Wrote consolidated motion-energy timeseries: %s", timeseries_path)
 
     auto_thresholds = compute_auto_thresholds(inventory.trace_rows_by_animal)
     thresholds = merge_thresholds(

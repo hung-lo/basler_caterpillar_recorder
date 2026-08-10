@@ -15,11 +15,10 @@ import os
 import tempfile
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
 MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
@@ -39,14 +38,29 @@ except ImportError as exc:  # pragma: no cover - import-time guard for missing o
         "`python -m pip install -r requirements.txt`."
     ) from exc
 
+import numpy as np
+
+from analysis_timing import (
+    DEFAULT_TIMEZONE,
+    TIMESTAMP_SUFFIXES,
+    UTC,
+    coerce_int,
+    format_local,
+    format_utc,
+    load_timezone,
+    open_text_file,
+    parse_iso_datetime,
+    parse_timestamp_row,
+    parse_utc_value,
+    timezone_label,
+    to_plot_local,
+    utc_from_ns,
+)
 
 LOG = logging.getLogger("plot_recording_timeline")
 
-UTC = dt.timezone.utc
-DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_ANIMALS = [f"C{index:02d}" for index in range(1, 9)]
 ANIMAL_ORDER = [f"C{index:02d}" for index in range(1, 9)]
-TIMESTAMP_SUFFIXES = (".timestamps.csv.gz", ".timestamps.csv")
 MAX_CLIP_ANNOTATIONS = 60
 POINT_EVENT_DURATION_SECONDS = 1
 SHORT_EVENT_THRESHOLD_SECONDS = 300
@@ -147,6 +161,14 @@ class MotionState:
 
 
 @dataclasses.dataclass(frozen=True)
+class MotionEnergySample:
+    animal_id: str
+    clip_key: str
+    timestamp_utc: dt.datetime
+    motion_energy: float
+
+
+@dataclasses.dataclass(frozen=True)
 class GlobalEvent:
     start_local: dt.datetime
     end_local: dt.datetime
@@ -163,70 +185,6 @@ class GoogleSheetSource:
     gid: str
     export_url: str
 
-
-def utc_from_ns(value_ns: int) -> dt.datetime:
-    return dt.datetime.fromtimestamp(value_ns / 1e9, tz=UTC)
-
-
-def coerce_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_iso_datetime(value: str) -> dt.datetime:
-    text = value.strip()
-    if not text:
-        raise ValueError("timestamp is empty")
-    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
-    parsed = dt.datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        raise ValueError("timestamp is missing a timezone offset")
-    return parsed
-
-
-def parse_utc_value(value: Any) -> dt.datetime:
-    if value is None:
-        raise ValueError("missing UTC timestamp")
-    if isinstance(value, dt.datetime):
-        parsed = value
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        parsed = utc_from_ns(int(value))
-    else:
-        text = str(value).strip()
-        if not text:
-            raise ValueError("missing UTC timestamp")
-        try:
-            parsed = utc_from_ns(int(text))
-        except ValueError:
-            parsed = parse_iso_datetime(text)
-    return parsed.astimezone(UTC)
-
-
-def parse_timestamp_row(row: dict[str, Any]) -> dt.datetime:
-    for field in ("host_utc_ns", "utc_ns", "timestamp_ns"):
-        value = row.get(field)
-        if value not in (None, ""):
-            parsed_ns = coerce_int(value)
-            if parsed_ns is None:
-                raise ValueError(f"{field} is not an integer")
-            return utc_from_ns(parsed_ns)
-    for field in ("host_utc_iso", "utc_iso", "timestamp_iso"):
-        value = row.get(field)
-        if value not in (None, ""):
-            return parse_utc_value(value)
-    raise ValueError("missing UTC timestamp columns")
-
-
-def open_text_file(path: Path):
-    if path.name.endswith(".gz"):
-        return gzip.open(path, "rt", newline="", encoding="utf-8")
-    return path.open("r", newline="", encoding="utf-8")
-
-
 def strip_timestamp_suffix(name: str) -> str:
     for suffix in TIMESTAMP_SUFFIXES:
         if name.endswith(suffix):
@@ -239,44 +197,6 @@ def video_file_for_timestamp_file(timestamp_file: Path) -> Path:
     return timestamp_file.with_name(f"{base}.mp4")
 
 
-def timezone_label(tz: dt.tzinfo) -> str:
-    label = getattr(tz, "key", None)
-    if label:
-        return str(label)
-    sample = dt.datetime.now(UTC).astimezone(tz)
-    name = sample.tzname()
-    return name or str(tz)
-
-
-def load_timezone(name: str) -> dt.tzinfo:
-    try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError:
-        local_tz = dt.datetime.now().astimezone().tzinfo
-        if local_tz is None:
-            LOG.warning(
-                "Could not load timezone %s and the local timezone is unavailable; falling back to UTC",
-                name,
-            )
-            return UTC
-        LOG.warning(
-            "Could not load timezone %s; falling back to the local system timezone (%s)",
-            name,
-            timezone_label(local_tz),
-        )
-        return local_tz
-
-
-def to_plot_local(value_utc: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
-    return value_utc.astimezone(tz).replace(tzinfo=None)
-
-
-def format_utc(value_utc: dt.datetime) -> str:
-    return value_utc.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-def format_local(value_utc: dt.datetime, tz: dt.tzinfo) -> str:
-    return value_utc.astimezone(tz).isoformat(sep=" ", timespec="microseconds")
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -510,6 +430,22 @@ def parse_local_datetime(value: str, tz: dt.tzinfo) -> dt.datetime:
     return parsed.astimezone(tz)
 
 
+def parse_event_time_fields(
+    row: dict[str, Any],
+    *,
+    local_field: str,
+    utc_field: str,
+    tz: dt.tzinfo,
+) -> Optional[dt.datetime]:
+    utc_text = str(row.get(utc_field) or "").strip()
+    if utc_text:
+        return parse_utc_value(utc_text).astimezone(tz)
+    local_text = str(row.get(local_field) or "").strip()
+    if local_text:
+        return parse_local_datetime(local_text, tz)
+    return None
+
+
 def parse_boolish(value: Any) -> bool:
     if value is None:
         return False
@@ -536,19 +472,27 @@ def load_event_tables_from_text(
                 animal_id = str(row.get("animal_id") or "").strip()
                 if not animal_id:
                     raise ValueError("missing animal_id")
-                start_text = str(row.get("start_local") or "").strip()
-                end_text = str(row.get("end_local") or "").strip()
-                if not start_text:
+                start_local = parse_event_time_fields(
+                    row,
+                    local_field="start_local",
+                    utc_field="start_utc",
+                    tz=tz,
+                )
+                end_local = parse_event_time_fields(
+                    row,
+                    local_field="end_local",
+                    utc_field="end_utc",
+                    tz=tz,
+                )
+                if start_local is None:
                     raise ValueError("missing start_local")
-                start_local = parse_local_datetime(start_text, tz)
                 event_name = str(row.get("event") or "").strip() or "event"
                 kind_name = str(row.get("kind") or "").strip() or "event"
                 notes = str(row.get("notes") or "").strip()
                 approximate = parse_boolish(row.get("approximate"))
                 if is_global_event_alias(animal_id):
-                    if not end_text:
+                    if end_local is None:
                         raise ValueError("global event intervals require end_local")
-                    end_local = parse_local_datetime(end_text, tz)
                     if end_local <= start_local:
                         raise ValueError("end_local must be after start_local")
                     global_events.append(
@@ -562,8 +506,7 @@ def load_event_tables_from_text(
                         )
                     )
                     continue
-                if end_text:
-                    end_local = parse_local_datetime(end_text, tz)
+                if end_local is not None:
                     if end_local <= start_local:
                         raise ValueError("end_local must be after start_local")
                 else:
@@ -973,6 +916,13 @@ def is_death_event(event: BehaviorEvent) -> bool:
     )
 
 
+def is_feeding_event(event: BehaviorEvent) -> bool:
+    return (
+        normalize_event_name(event.event) == "feeding"
+        or normalize_event_name(event.kind) == "feeding"
+    )
+
+
 def death_cutoffs_local(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetime]:
     cutoffs: dict[str, dt.datetime] = {}
     for event in events:
@@ -982,6 +932,66 @@ def death_cutoffs_local(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetim
         if cutoff is None or event.start_local < cutoff:
             cutoffs[event.animal_id] = event.start_local
     return cutoffs
+
+
+def load_motion_energy_samples(path: Optional[Path]) -> list[MotionEnergySample]:
+    if path is None or not path.exists():
+        return []
+    samples: list[MotionEnergySample] = []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                if animal_id not in ANIMAL_ORDER:
+                    raise ValueError(f"unknown animal_id {animal_id!r}")
+                samples.append(
+                    MotionEnergySample(
+                        animal_id=animal_id,
+                        clip_key=str(row.get("clip_key") or "").strip(),
+                        timestamp_utc=parse_utc_value(row.get("timestamp_utc") or row.get("end_utc")),
+                        motion_energy=float(str(row.get("motion_energy") or "").strip()),
+                    )
+                )
+            except Exception as exc:
+                LOG.warning("Skipping malformed motion-energy row %d in %s: %s", row_index, path, exc)
+    return samples
+
+
+def aggregate_motion_energy_samples(
+    samples: Sequence[MotionEnergySample],
+    *,
+    bin_minutes: int,
+    stat: str,
+) -> dict[str, list[tuple[dt.datetime, float, str]]]:
+    if bin_minutes <= 0:
+        raise ValueError("bin_minutes must be > 0")
+    groups: dict[str, dict[tuple[dt.datetime, str], list[float]]] = {animal_id: {} for animal_id in ANIMAL_ORDER}
+    bin_delta = dt.timedelta(minutes=bin_minutes)
+    for sample in samples:
+        seconds = int(sample.timestamp_utc.timestamp())
+        bin_seconds = bin_minutes * 60
+        bucket = dt.datetime.fromtimestamp((seconds // bin_seconds) * bin_seconds, tz=UTC)
+        groups[sample.animal_id].setdefault((bucket, sample.clip_key), []).append(sample.motion_energy)
+
+    def reduce_values(values: list[float]) -> float:
+        if stat == "median":
+            return float(np.median(values))
+        if stat == "mean":
+            return float(np.mean(values))
+        if stat == "p90":
+            return float(np.percentile(values, 90))
+        if stat == "max":
+            return float(np.max(values))
+        raise ValueError(f"unsupported motion plot stat: {stat}")
+
+    aggregated: dict[str, list[tuple[dt.datetime, float, str]]] = {}
+    for animal_id in ANIMAL_ORDER:
+        rows: list[tuple[dt.datetime, float, str]] = []
+        for (bucket, clip_key), values in sorted(groups[animal_id].items()):
+            rows.append((bucket + bin_delta, reduce_values(values), clip_key))
+        aggregated[animal_id] = rows
+    return aggregated
 
 
 def motion_legend_handles() -> list[Patch]:
@@ -1058,12 +1068,16 @@ def plot_recording_timeline(
     animals: list[str],
     *,
     global_events: Optional[list[GlobalEvent]] = None,
+    motion_energy_samples: Optional[list[MotionEnergySample]] = None,
+    motion_plot_bin_minutes: int = 1,
+    motion_plot_stat: str = "p90",
     timezone: dt.tzinfo,
     output_path: Path,
     annotate_clips: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     global_events = list(global_events or [])
+    motion_energy_samples = list(motion_energy_samples or [])
     clip_annotations = annotate_clips and len(clips) <= MAX_CLIP_ANNOTATIONS
     if annotate_clips and not clip_annotations:
         LOG.info("Too many clips for per-clip annotations; disabling clip labels")
@@ -1097,14 +1111,21 @@ def plot_recording_timeline(
     for animal_id in unknown_animals:
         LOG.warning("Skipping timeline row for unknown animal ID: %s", animal_id)
 
-    fig = plt.figure(figsize=(17, 9), constrained_layout=False)
-    gs = fig.add_gridspec(3, 1, height_ratios=[1.05, 0.75, 5.5], hspace=0.04)
+    has_motion_plot = bool(motion_energy_samples)
+    fig = plt.figure(figsize=(17, 10 if has_motion_plot else 9), constrained_layout=False)
+    if has_motion_plot:
+        gs = fig.add_gridspec(4, 1, height_ratios=[1.05, 2.2, 0.75, 5.5], hspace=0.06)
+    else:
+        gs = fig.add_gridspec(3, 1, height_ratios=[1.05, 0.75, 5.5], hspace=0.04)
     ax_cov = fig.add_subplot(gs[0])
-    ax_legend = fig.add_subplot(gs[1])
-    ax_beh = fig.add_subplot(gs[2], sharex=ax_cov)
+    ax_motion = fig.add_subplot(gs[1], sharex=ax_cov) if has_motion_plot else None
+    ax_legend = fig.add_subplot(gs[2] if has_motion_plot else gs[1])
+    ax_beh = fig.add_subplot(gs[3] if has_motion_plot else gs[2], sharex=ax_cov)
     fig.subplots_adjust(top=0.87, bottom=0.11, left=0.08, right=0.985)
     fig.patch.set_facecolor("white")
     ax_cov.set_facecolor("white")
+    if ax_motion is not None:
+        ax_motion.set_facecolor("white")
     ax_legend.set_facecolor("white")
     ax_beh.set_facecolor("white")
     ax_legend.axis("off")
@@ -1151,6 +1172,11 @@ def plot_recording_timeline(
     for event in global_events:
         plot_starts.append(event.start_local.replace(tzinfo=None))
         plot_ends.append(event.end_local.replace(tzinfo=None))
+    for sample in motion_energy_samples:
+        if sample.animal_id in behavior_index:
+            sample_local = to_plot_local(sample.timestamp_utc, timezone)
+            plot_starts.append(sample_local)
+            plot_ends.append(sample_local)
 
     x_min: Optional[dt.datetime] = None
     x_max: Optional[dt.datetime] = None
@@ -1249,6 +1275,55 @@ def plot_recording_timeline(
 
     ax_cov.set_title("Recording coverage", loc="left", fontsize=11, color="#0f172a", pad=8)
     ax_cov.tick_params(axis="x", labelbottom=False)
+
+    if ax_motion is not None:
+        aggregated_motion = aggregate_motion_energy_samples(
+            motion_energy_samples,
+            bin_minutes=motion_plot_bin_minutes,
+            stat=motion_plot_stat,
+        )
+        ax_motion.set_title("Motion energy", loc="left", fontsize=11, color="#0f172a", pad=8)
+        ax_motion.set_yticks(range(len(behavior_rows)))
+        ax_motion.set_yticklabels(behavior_rows)
+        ax_motion.set_ylabel("Animal")
+        ax_motion.set_ylim(-0.5, len(behavior_rows) - 0.5)
+        ax_motion.invert_yaxis()
+        ax_motion.grid(True, axis="x", color="#cbd5e1", alpha=0.35, linewidth=0.6)
+        ax_motion.tick_params(axis="x", labelbottom=False)
+        for y in range(len(behavior_rows) + 1):
+            ax_motion.axhline(y - 0.5, color=ROW_SEPARATOR_COLOR, linewidth=0.7, zorder=0.2)
+        for animal_id, y in behavior_index.items():
+            rows = aggregated_motion.get(animal_id, [])
+            if not rows:
+                continue
+            values = np.array([value for _bucket, value, _clip_key in rows], dtype=np.float64)
+            p5 = float(np.percentile(values, 5))
+            p95 = float(np.percentile(values, 95))
+            if p95 <= p5:
+                normalized_values = np.full(values.shape, 0.5, dtype=np.float64)
+            else:
+                normalized_values = np.clip((values - p5) / (p95 - p5), 0.0, 1.0)
+            bin_delta = dt.timedelta(minutes=motion_plot_bin_minutes)
+            current_segment_x: list[dt.datetime] = []
+            current_segment_y: list[float] = []
+            previous_bucket: Optional[dt.datetime] = None
+            previous_clip_key: Optional[str] = None
+            tolerance = dt.timedelta(seconds=10)
+            for (bucket_utc, _raw_value, clip_key), normalized in zip(rows, normalized_values):
+                if (
+                    previous_bucket is not None
+                    and (clip_key != previous_clip_key or bucket_utc - previous_bucket > bin_delta + tolerance)
+                    and current_segment_x
+                ):
+                    ax_motion.plot(current_segment_x, current_segment_y, color="#0f766e", linewidth=1.2, zorder=2)
+                    current_segment_x = []
+                    current_segment_y = []
+                current_segment_x.append(to_plot_local(bucket_utc, timezone))
+                current_segment_y.append(y + 0.35 - (0.7 * float(normalized)))
+                previous_bucket = bucket_utc
+                previous_clip_key = clip_key
+            if current_segment_x:
+                ax_motion.plot(current_segment_x, current_segment_y, color="#0f766e", linewidth=1.2, zorder=2)
 
     if motion_states:
         motion_legend = ax_legend.legend(
@@ -1397,7 +1472,7 @@ def plot_recording_timeline(
             alpha=0.74,
             zorder=3,
         )
-        if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS:
+        if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS and not is_feeding_event(event):
             marker, marker_size, point_color = get_point_event_style(event.event or event.kind)
             ax_beh.scatter(
                 left,
@@ -1410,7 +1485,10 @@ def plot_recording_timeline(
                 zorder=6,
             )
 
-    for ax in (ax_cov, ax_beh):
+    axes_to_style = [ax_cov, ax_beh]
+    if ax_motion is not None:
+        axes_to_style.append(ax_motion)
+    for ax in axes_to_style:
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#cbd5e1")
@@ -1447,12 +1525,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--feeding-events",
+        help="Optional local CSV of automatic feeding events to overlay without modifying manual events.",
+    )
+    parser.add_argument(
         "--motion-states",
         type=Path,
         help=(
             "Path to motion_states.csv. Defaults to "
             "<root>/cropped_by_caterpillar/motion_energy/motion_states.csv when present."
         ),
+    )
+    parser.add_argument(
+        "--motion-energy",
+        type=Path,
+        help="Optional motion_energy_timeseries.csv for a quantitative motion panel.",
+    )
+    parser.add_argument(
+        "--motion-plot-bin-minutes",
+        type=int,
+        default=1,
+        help="Bin size in minutes for the optional motion-energy panel (default: 1).",
+    )
+    parser.add_argument(
+        "--motion-plot-stat",
+        choices=["median", "mean", "p90", "max"],
+        default="p90",
+        help="Aggregation statistic for the optional motion-energy panel (default: p90).",
     )
     parser.add_argument(
         "--no-motion-states",
@@ -1517,6 +1616,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             root=root,
             tz=local_tz,
         )
+        if args.feeding_events:
+            feeding_events, feeding_global_events = load_event_tables(
+                Path(args.feeding_events).expanduser().resolve(),
+                local_tz,
+            )
+            events.extend(feeding_events)
+            global_events.extend(feeding_global_events)
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return 1
@@ -1531,6 +1637,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             auto_motion_states = root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
             motion_states_path = auto_motion_states if auto_motion_states.exists() else None
     motion_states = load_motion_states(motion_states_path)
+    motion_energy_path = args.motion_energy
+    motion_energy_samples = load_motion_energy_samples(motion_energy_path)
 
     animals = args.animals if args.animals else (infer_animals(events) or DEFAULT_ANIMALS)
     if not clips:
@@ -1542,6 +1650,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         motion_states,
         animals,
         global_events=global_events,
+        motion_energy_samples=motion_energy_samples,
+        motion_plot_bin_minutes=args.motion_plot_bin_minutes,
+        motion_plot_stat=args.motion_plot_stat,
         timezone=local_tz,
         output_path=output_png,
         annotate_clips=args.annotate_clips,

@@ -22,8 +22,10 @@ If you use a different camera, copy a YAML template and update the model, serial
 - `record_basler.py` is the main CLI for listing cameras, previewing, dry runs, and scheduled recording.
 - `validate_session.py` checks clip structure, JSON sidecars, timing, and archive state.
 - `prepare_cropped_timestamps.py` copies one authoritative timestamp sidecar per raw source clip into `cropped_by_caterpillar/timestamps/` and writes `crop_manifest.csv`.
-- `extract_motion_energy.py` builds cached per-crop motion traces, editable thresholds, diagnostics, and `motion_states.csv`.
-- `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars, `behavior_events.csv`, and optional motion states.
+- `analysis_timing.py` holds the shared UTC/timestamp parsing helpers used by the analysis scripts.
+- `extract_motion_energy.py` builds cached per-crop motion traces, a consolidated `motion_energy_timeseries.csv`, editable thresholds, diagnostics, and `motion_states.csv`.
+- `analyze_leaf_feeding.py` derives minute-level leaf-area proxy traces and automatic feeding bouts from the same `crop_manifest.csv` plus copied timestamp sidecars.
+- `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars, behavior events, optional motion states, optional feeding events, and an optional quantitative motion panel.
 - `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
 - `config_smoke_test.yaml` is a short local test.
 - `config_multiclip_smoke_test.yaml` is a short repeated-clip test.
@@ -82,6 +84,7 @@ This writes:
 ```text
 cropped_by_caterpillar/motion_energy/
     traces/
+    motion_energy_timeseries.csv
     motion_thresholds.csv
     motion_summary.csv
     motion_states.csv
@@ -138,6 +141,35 @@ python plot_recording_timeline.py `
   --events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\animal_event_log.csv" `
   --motion-states "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_states.csv"
 ```
+
+Leaf-area feeding analysis reuses the same `crop_manifest.csv` and copied timestamp files, so motion and feeding stay aligned to the same authoritative UTC timing:
+
+```powershell
+python analyze_leaf_feeding.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08"
+```
+
+This writes:
+
+```text
+cropped_by_caterpillar/leaf_feeding/
+    leaf_area_timeseries.csv
+    feeding_events.csv
+    leaf_feeding_summary.csv
+    qc/
+```
+
+To overlay those automatic feeding bouts on the main timeline without changing your manual event log:
+
+```powershell
+python plot_recording_timeline.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\animal_event_log.csv" `
+  --feeding-events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\leaf_feeding\feeding_events.csv" `
+  --motion-energy "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_energy_timeseries.csv"
+```
+
+`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers.
 
 ## New computer workflow
 

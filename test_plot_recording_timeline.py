@@ -945,7 +945,7 @@ class TimelinePlotTests(unittest.TestCase):
 
         scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
         self.assertIn("X", scatter_markers)
-        self.assertEqual(scatter_markers.count("o"), 1)
+        self.assertNotIn("o", scatter_markers)
 
     def test_load_motion_states_parses_mobile_and_immobile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1169,6 +1169,86 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(events[0].animal_id, "C02")
         self.assertEqual(len(global_events), 1)
         self.assertTrue(timeline.is_video_quality_global_event(global_events[0]))
+
+    def test_event_loader_prefers_utc_fields_when_present(self) -> None:
+        csv_text = (
+            "animal_id,start_local,end_local,start_utc,end_utc,event,kind,notes\n"
+            "C01,2026-08-09 00:00:00,2026-08-09 00:01:00,2026-08-09T19:00:00Z,2026-08-09T19:05:00Z,feeding,feeding,\n"
+        )
+
+        events, _global_events = timeline.load_event_tables_from_text(
+            csv_text,
+            dt.timezone(dt.timedelta(hours=-4)),
+            source_name="inline.csv",
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].start_local.isoformat(sep=" "), "2026-08-09 15:00:00-04:00")
+        self.assertEqual(events[0].end_local.isoformat(sep=" "), "2026-08-09 15:05:00-04:00")
+
+    def test_feeding_intervals_do_not_get_point_markers(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 2, 0),
+            event="feeding",
+            kind="feeding",
+            notes="",
+        )
+
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[event],
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        self.assertEqual(mock_scatter.call_count, 0)
+
+    def test_quantitative_motion_panel_is_added_only_when_samples_are_supplied(self) -> None:
+        samples = [
+            timeline.MotionEnergySample(
+                animal_id="C01",
+                clip_key="clip_a",
+                timestamp_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                motion_energy=1.0,
+            ),
+            timeline.MotionEnergySample(
+                animal_id="C01",
+                clip_key="clip_a",
+                timestamp_utc=dt.datetime(2026, 8, 9, 19, 0, 30, tzinfo=dt.timezone.utc),
+                motion_energy=3.0,
+            ),
+        ]
+
+        fig = self.capture_timeline_figure(clips=[], events=[], global_events=[], motion_states=[], animals=timeline.ANIMAL_ORDER)
+        self.assertEqual(len(fig.axes), 3)
+
+        captured: dict[str, object] = {}
+
+        def fake_savefig(fig_obj, *args, **kwargs):
+            captured["fig"] = fig_obj
+
+        with mock.patch("matplotlib.figure.Figure.savefig", new=fake_savefig):
+            with mock.patch("matplotlib.pyplot.close"):
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=[],
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    motion_energy_samples=samples,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        fig_with_motion = captured["fig"]
+        self.addCleanup(timeline.plt.close, fig_with_motion)
+        self.assertEqual(len(fig_with_motion.axes), 4)
 
     def test_google_sheet_html_response_fails_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
