@@ -116,6 +116,49 @@ class ExtractMotionEnergyTests(unittest.TestCase):
         with path.open("r", newline="", encoding="utf-8") as handle:
             return list(csv.DictReader(handle))
 
+    def read_threshold_rows(self, path: Path) -> dict[str, dict[str, str]]:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        return {row["animal_id"]: row for row in rows}
+
+    def build_trace_rows(
+        self,
+        *,
+        animal_id: str,
+        clip_key: str,
+        start_utc: dt.datetime,
+        count: int,
+        motion_energy: float,
+    ) -> list[motion.MotionTraceRow]:
+        rows: list[motion.MotionTraceRow] = []
+        for index in range(count):
+            window_start = start_utc + dt.timedelta(seconds=index)
+            window_end = window_start + dt.timedelta(seconds=1)
+            rows.append(
+                motion.MotionTraceRow(
+                    animal_id=animal_id,
+                    clip_key=clip_key,
+                    frame_index_start=index,
+                    frame_index_end=index + 1,
+                    start_utc=window_start,
+                    end_utc=window_end,
+                    motion_energy=motion_energy,
+                    motion_mean=1.0,
+                    global_luminance_shift=0.0,
+                )
+            )
+        return rows
+
+    def write_threshold_table(self, path: Path, overrides: dict[str, motion.MotionThreshold]) -> None:
+        thresholds = {
+            animal_id: overrides.get(
+                animal_id,
+                motion.MotionThreshold(animal_id, None, "auto", None, None, None, None, None, 0),
+            )
+            for animal_id in motion.ANIMAL_ORDER
+        }
+        motion.write_thresholds(path, thresholds)
+
     def build_video_dataset(
         self,
         root: Path,
@@ -507,6 +550,147 @@ class ExtractMotionEnergyTests(unittest.TestCase):
 
             self.assertEqual(len([state for state in states if state.animal_id == "C01"]), 2)
             self.assertEqual({state.clip_key for state in states if state.animal_id == "C01"}, {"clip_a", "clip_b"})
+
+    def test_stale_blank_auto_row_is_refreshed_from_cached_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            timezone = dt.timezone(dt.timedelta(hours=-4))
+            traces_dir = root / "cropped_by_caterpillar" / "motion_energy" / "traces"
+            self.make_trace_file(
+                traces_dir / "C02_clip_a.motion.csv.gz",
+                self.build_trace_rows(
+                    animal_id="C02",
+                    clip_key="clip_a",
+                    start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    count=12,
+                    motion_energy=2.3,
+                ),
+                timezone,
+            )
+            self.write_threshold_table(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv",
+                {
+                    "C02": motion.MotionThreshold("C02", None, "auto", None, None, None, None, None, 0),
+                },
+            )
+
+            self.assertEqual(motion.main([str(root), "--classify-only"]), 0)
+            rows = self.read_threshold_rows(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv"
+            )
+
+            self.assertEqual(rows["C02"]["threshold_source"], "auto")
+            self.assertEqual(rows["C02"]["n_windows"], "12")
+            self.assertNotEqual(rows["C02"]["threshold"], "")
+            self.assertNotEqual(rows["C02"]["median"], "")
+
+    def test_stale_nonempty_auto_row_is_recomputed_from_current_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            timezone = dt.timezone(dt.timedelta(hours=-4))
+            traces_dir = root / "cropped_by_caterpillar" / "motion_energy" / "traces"
+            self.make_trace_file(
+                traces_dir / "C01_clip_a.motion.csv.gz",
+                self.build_trace_rows(
+                    animal_id="C01",
+                    clip_key="clip_a",
+                    start_utc=dt.datetime(2026, 8, 9, 20, 0, 0, tzinfo=dt.timezone.utc),
+                    count=100,
+                    motion_energy=1.5,
+                ),
+                timezone,
+            )
+            self.write_threshold_table(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv",
+                {
+                    "C01": motion.MotionThreshold("C01", 9.9, "auto", 9.9, 9.9, 9.9, 9.9, 9.9, 10),
+                },
+            )
+
+            self.assertEqual(motion.main([str(root), "--classify-only"]), 0)
+            rows = self.read_threshold_rows(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv"
+            )
+
+            self.assertEqual(rows["C01"]["threshold_source"], "auto")
+            self.assertEqual(rows["C01"]["n_windows"], "100")
+            self.assertNotEqual(rows["C01"]["median"], "9.900000")
+
+    def test_manual_threshold_is_preserved_while_stats_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            timezone = dt.timezone(dt.timedelta(hours=-4))
+            traces_dir = root / "cropped_by_caterpillar" / "motion_energy" / "traces"
+            self.make_trace_file(
+                traces_dir / "C01_clip_a.motion.csv.gz",
+                self.build_trace_rows(
+                    animal_id="C01",
+                    clip_key="clip_a",
+                    start_utc=dt.datetime(2026, 8, 9, 21, 0, 0, tzinfo=dt.timezone.utc),
+                    count=100,
+                    motion_energy=1.8,
+                ),
+                timezone,
+            )
+            self.write_threshold_table(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv",
+                {
+                    "C01": motion.MotionThreshold("C01", 4.2, "manual", 9.9, 9.9, 9.9, 9.9, 9.9, 10),
+                },
+            )
+
+            self.assertEqual(motion.main([str(root), "--classify-only"]), 0)
+            rows = self.read_threshold_rows(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv"
+            )
+
+            self.assertEqual(rows["C01"]["threshold"], "4.200000")
+            self.assertEqual(rows["C01"]["threshold_source"], "manual")
+            self.assertEqual(rows["C01"]["n_windows"], "100")
+            self.assertNotEqual(rows["C01"]["median"], "9.900000")
+
+    def test_sequential_incremental_processing_aggregates_all_cached_animals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            timezone = dt.timezone(dt.timedelta(hours=-4))
+            traces_dir = root / "cropped_by_caterpillar" / "motion_energy" / "traces"
+            thresholds_path = root / "cropped_by_caterpillar" / "motion_energy" / "motion_thresholds.csv"
+
+            self.make_trace_file(
+                traces_dir / "C01_clip_a.motion.csv.gz",
+                self.build_trace_rows(
+                    animal_id="C01",
+                    clip_key="clip_a",
+                    start_utc=dt.datetime(2026, 8, 9, 22, 0, 0, tzinfo=dt.timezone.utc),
+                    count=5,
+                    motion_energy=2.0,
+                ),
+                timezone,
+            )
+            self.assertEqual(motion.main([str(root), "--classify-only"]), 0)
+
+            self.make_trace_file(
+                traces_dir / "C02_clip_b.motion.csv.gz",
+                self.build_trace_rows(
+                    animal_id="C02",
+                    clip_key="clip_b",
+                    start_utc=dt.datetime(2026, 8, 9, 23, 0, 0, tzinfo=dt.timezone.utc),
+                    count=7,
+                    motion_energy=3.0,
+                ),
+                timezone,
+            )
+            self.assertEqual(motion.main([str(root), "--classify-only"]), 0)
+
+            rows = self.read_threshold_rows(thresholds_path)
+            states = motion.load_motion_states(
+                root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
+            )
+
+            self.assertEqual(rows["C01"]["n_windows"], "5")
+            self.assertEqual(rows["C02"]["n_windows"], "7")
+            self.assertIn("C01", {state.animal_id for state in states})
+            self.assertIn("C02", {state.animal_id for state in states})
 
     def test_progress_line_includes_clip_percent_and_status(self) -> None:
         entry = motion.ManifestEntry(

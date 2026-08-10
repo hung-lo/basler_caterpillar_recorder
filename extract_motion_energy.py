@@ -308,6 +308,13 @@ class ProgressReporter:
             self.stream.flush()
 
 
+@dataclasses.dataclass(frozen=True)
+class CachedTraceInventory:
+    trace_rows_by_animal: dict[str, list[MotionTraceRow]]
+    trace_files_by_animal: dict[str, int]
+    valid_windows_by_animal: dict[str, int]
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -826,25 +833,50 @@ def merge_thresholds(
     reset_thresholds: bool,
     threshold_override: Optional[float],
 ) -> dict[str, MotionThreshold]:
-    if threshold_override is not None:
-        return {
-            animal_id: dataclasses.replace(
-                auto_thresholds[animal_id],
+    existing: dict[str, MotionThreshold] = {}
+    if threshold_path.exists() and not reset_thresholds:
+        existing = load_thresholds(threshold_path)
+
+    merged: dict[str, MotionThreshold] = {}
+    for animal_id in ANIMAL_ORDER:
+        fresh = auto_thresholds[animal_id]
+
+        if threshold_override is not None:
+            merged[animal_id] = dataclasses.replace(
+                fresh,
                 threshold=threshold_override,
                 threshold_source="override",
             )
-            for animal_id in ANIMAL_ORDER
-        }
+            continue
 
-    if threshold_path.exists() and not reset_thresholds:
-        existing = load_thresholds(threshold_path)
-        merged: dict[str, MotionThreshold] = {}
-        for animal_id in ANIMAL_ORDER:
-            merged[animal_id] = existing.get(animal_id, auto_thresholds[animal_id])
-        return merged
+        if reset_thresholds:
+            merged[animal_id] = fresh
+            continue
 
-    write_thresholds(threshold_path, auto_thresholds)
-    return auto_thresholds
+        old = existing.get(animal_id)
+        if old is not None and old.threshold_source == "manual" and old.threshold is not None:
+            merged[animal_id] = dataclasses.replace(
+                fresh,
+                threshold=old.threshold,
+                threshold_source="manual",
+            )
+            continue
+
+        merged[animal_id] = fresh
+
+    return merged
+
+
+def log_threshold_summary(thresholds: dict[str, MotionThreshold]) -> None:
+    summary = ", ".join(
+        (
+            f"{animal_id}="
+            f"{'NA' if thresholds[animal_id].threshold is None else f'{thresholds[animal_id].threshold:.6f}'} "
+            f"({thresholds[animal_id].threshold_source}, n={thresholds[animal_id].n_windows})"
+        )
+        for animal_id in ANIMAL_ORDER
+    )
+    LOG.info("Motion thresholds: %s", summary)
 
 
 def collapse_segments(segments: list[_StateAccumulator]) -> list[_StateAccumulator]:
@@ -1035,17 +1067,77 @@ def load_motion_states(path: Optional[Path]) -> list[MotionState]:
     return states
 
 
-def load_trace_rows_for_entries(root: Path, entries: list[ManifestEntry]) -> dict[str, list[MotionTraceRow]]:
+def discover_cached_trace_files(root: Path) -> list[Path]:
+    trace_dir = root / "cropped_by_caterpillar" / "motion_energy" / "traces"
+    if not trace_dir.exists():
+        return []
+    return sorted(trace_dir.glob("*.motion.csv.gz"))
+
+
+def infer_animal_id_from_trace_path(path: Path) -> str:
+    prefix = path.name.split("_", 1)[0].strip()
+    return prefix
+
+
+def load_cached_trace_inventory(root: Path) -> CachedTraceInventory:
     grouped: dict[str, list[MotionTraceRow]] = defaultdict(list)
-    for entry in entries:
-        trace_path = trace_path_for_entry(root, entry)
-        if not trace_path.exists():
+    trace_files_by_animal: dict[str, int] = {animal_id: 0 for animal_id in ANIMAL_ORDER}
+    valid_windows_by_animal: dict[str, int] = {animal_id: 0 for animal_id in ANIMAL_ORDER}
+
+    for trace_path in discover_cached_trace_files(root):
+        inferred_animal_id = infer_animal_id_from_trace_path(trace_path)
+        if inferred_animal_id in trace_files_by_animal:
+            trace_files_by_animal[inferred_animal_id] += 1
+
+        try:
+            rows = load_motion_trace_rows(trace_path)
+        except Exception as exc:
+            LOG.warning("Ignoring invalid cached trace %s: %s", trace_path, exc)
             continue
-        for row in load_motion_trace_rows(trace_path):
-            grouped[row.animal_id].append(row)
+
+        if not rows:
+            continue
+
+        animal_id = rows[0].animal_id
+        grouped[animal_id].extend(rows)
+        if animal_id in valid_windows_by_animal:
+            valid_windows_by_animal[animal_id] += len(rows)
+        else:
+            valid_windows_by_animal[animal_id] = len(rows)
+            trace_files_by_animal.setdefault(animal_id, 0)
+
     for animal_id in grouped:
         grouped[animal_id].sort(key=lambda row: (row.start_utc, row.end_utc, row.clip_key))
-    return grouped
+
+    return CachedTraceInventory(
+        trace_rows_by_animal=dict(grouped),
+        trace_files_by_animal=trace_files_by_animal,
+        valid_windows_by_animal=valid_windows_by_animal,
+    )
+
+
+def log_cached_trace_inventory(inventory: CachedTraceInventory) -> None:
+    availability = ", ".join(
+        f"{animal_id}={inventory.valid_windows_by_animal.get(animal_id, 0)}"
+        for animal_id in ANIMAL_ORDER
+    )
+    LOG.info("Motion windows available: %s", availability)
+
+    thresholds_summary = ", ".join(
+        f"{animal_id} files={inventory.trace_files_by_animal.get(animal_id, 0)}"
+        for animal_id in ANIMAL_ORDER
+    )
+    LOG.info("Cached trace files discovered: %s", thresholds_summary)
+
+    for animal_id in ANIMAL_ORDER:
+        file_count = inventory.trace_files_by_animal.get(animal_id, 0)
+        window_count = inventory.valid_windows_by_animal.get(animal_id, 0)
+        if file_count > 0 and window_count == 0:
+            LOG.warning(
+                "%s has %d cached trace files but zero valid motion windows after parsing",
+                animal_id,
+                file_count,
+            )
 
 
 def downsample_trace_rows(rows: list[MotionTraceRow], max_points: int) -> list[MotionTraceRow]:
@@ -1134,13 +1226,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     timezone = load_timezone(args.timezone)
     animal_filter = set(args.animals) if args.animals else None
-    entries = load_manifest_entries(
-        root,
-        animals=animal_filter,
-        limit_clips=args.limit_clips,
-    )
-    if not entries:
-        parser.error("no cropped manifest rows with copied timestamps were found")
+    entries: list[ManifestEntry] = []
+    if not args.classify_only:
+        entries = load_manifest_entries(
+            root,
+            animals=animal_filter,
+            limit_clips=args.limit_clips,
+        )
+        if not entries:
+            parser.error("no cropped manifest rows with copied timestamps were found")
 
     motion_root = root / "cropped_by_caterpillar" / "motion_energy"
     motion_root.mkdir(parents=True, exist_ok=True)
@@ -1171,21 +1265,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         write_csv(summary_path, SUMMARY_FIELDS, summary_rows)
         LOG.info("Wrote motion summary: %s", summary_path)
 
-    trace_rows_by_animal = load_trace_rows_for_entries(root, entries)
-    LOG.info("Loaded cached motion traces for %d manifest entr%s", len(entries), "y" if len(entries) == 1 else "ies")
-    auto_thresholds = compute_auto_thresholds(trace_rows_by_animal)
+    inventory = load_cached_trace_inventory(root)
+    if not any(inventory.trace_files_by_animal.values()):
+        if args.classify_only:
+            parser.error("no cached motion trace files were found under cropped_by_caterpillar/motion_energy/traces")
+        LOG.warning("No cached motion trace files were found under %s", motion_root / "traces")
+    log_cached_trace_inventory(inventory)
+
+    auto_thresholds = compute_auto_thresholds(inventory.trace_rows_by_animal)
     thresholds = merge_thresholds(
         auto_thresholds=auto_thresholds,
         threshold_path=thresholds_path,
         reset_thresholds=args.reset_thresholds,
         threshold_override=args.threshold,
     )
-    if not thresholds_path.exists() and args.threshold is None:
-        write_thresholds(thresholds_path, thresholds)
-    LOG.info("Wrote or reused thresholds: %s", thresholds_path)
+    write_thresholds(thresholds_path, thresholds)
+    log_threshold_summary(thresholds)
+    LOG.info("Wrote refreshed thresholds: %s", thresholds_path)
 
     LOG.info("Rendering motion-energy diagnostics...")
-    write_motion_diagnostics(diagnostics_path, trace_rows_by_animal, thresholds, timezone)
+    write_motion_diagnostics(diagnostics_path, inventory.trace_rows_by_animal, thresholds, timezone)
     LOG.info("Wrote diagnostics PNG: %s", diagnostics_path)
 
     LOG.info("Classifying motion-derived states...")
@@ -1193,7 +1292,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     for animal_id in ANIMAL_ORDER:
         all_states.extend(
             classify_motion_states(
-                trace_rows_by_animal.get(animal_id, []),
+                inventory.trace_rows_by_animal.get(animal_id, []),
                 threshold=thresholds[animal_id],
                 merge_gap_s=args.merge_gap_s,
                 min_mobile_s=args.min_mobile_s,
