@@ -819,7 +819,7 @@ class TimelinePlotTests(unittest.TestCase):
         manual_calls = [
             call
             for call in mock_broken_barh.call_args_list
-            if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR
+            if call.kwargs.get("facecolors") in {timeline.INTERVAL_BAR_COLOR, timeline.FEEDING_COLOR}
         ]
         self.assertEqual(len(manual_calls), 1)
         rendered_left, rendered_width = manual_calls[0].args[0][0]
@@ -932,11 +932,11 @@ class TimelinePlotTests(unittest.TestCase):
         manual_calls = [
             call
             for call in mock_broken_barh.call_args_list
-            if call.kwargs.get("facecolors") in {timeline.INTERVAL_BAR_COLOR, timeline.DEATH_COLOR}
+            if call.kwargs.get("facecolors") in {timeline.INTERVAL_BAR_COLOR, timeline.FEEDING_COLOR}
         ]
-        self.assertEqual(len(manual_calls), 2)
+        self.assertEqual(len(manual_calls), 1)
 
-        feeding_call = next(call for call in manual_calls if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR)
+        feeding_call = manual_calls[0]
         feeding_left, feeding_width = feeding_call.args[0][0]
         expected_left = timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 55, 0))
         expected_width = 5 * 60 / 86400.0
@@ -1209,6 +1209,18 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(mock_scatter.call_count, 0)
 
+    def test_feeding_events_use_dedicated_color(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 2, 0),
+            event="feeding",
+            kind="feeding",
+            notes="",
+        )
+
+        self.assertEqual(timeline.event_bar_color(event), timeline.FEEDING_COLOR)
+
     def test_quantitative_motion_panel_is_added_only_when_samples_are_supplied(self) -> None:
         samples = [
             timeline.MotionEnergySample(
@@ -1249,6 +1261,82 @@ class TimelinePlotTests(unittest.TestCase):
         fig_with_motion = captured["fig"]
         self.addCleanup(timeline.plt.close, fig_with_motion)
         self.assertEqual(len(fig_with_motion.axes), 4)
+
+    def test_main_auto_discovers_feeding_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            feeding_path = root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv"
+            feeding_path.parent.mkdir(parents=True, exist_ok=True)
+            with feeding_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_utc", "end_utc", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C01", "2026-08-09T19:00:00Z", "2026-08-09T19:05:00Z", "", "", "feeding", "feeding", "automatic"])
+
+            with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                timeline.main([str(root)])
+
+            events = mock_plot.call_args.args[1]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].event, "feeding")
+
+    def test_main_explicit_feeding_events_override_auto_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            auto_path = root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv"
+            auto_path.parent.mkdir(parents=True, exist_ok=True)
+            with auto_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_utc", "end_utc", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C01", "2026-08-09T19:00:00Z", "2026-08-09T19:05:00Z", "", "", "feeding", "feeding", "auto"])
+            explicit_path = root / "custom_feeding.csv"
+            with explicit_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_utc", "end_utc", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C02", "2026-08-09T19:10:00Z", "2026-08-09T19:15:00Z", "", "", "feeding", "feeding", "explicit"])
+
+            with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                timeline.main([str(root), "--feeding-events", str(explicit_path)])
+
+            events = mock_plot.call_args.args[1]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].animal_id, "C02")
+
+    def test_main_no_feeding_events_ignores_auto_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            feeding_path = root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv"
+            feeding_path.parent.mkdir(parents=True, exist_ok=True)
+            with feeding_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_utc", "end_utc", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["C01", "2026-08-09T19:00:00Z", "2026-08-09T19:05:00Z", "", "", "feeding", "feeding", "automatic"])
+
+            with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                timeline.main([str(root), "--no-feeding-events"])
+
+            events = mock_plot.call_args.args[1]
+            self.assertEqual(events, [])
 
     def test_google_sheet_html_response_fails_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

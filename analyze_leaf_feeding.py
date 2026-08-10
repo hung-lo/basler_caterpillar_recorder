@@ -537,9 +537,10 @@ def finalize_leaf_rows(
     leaf_reset_increase_pct: float,
     explicit_resets: Optional[dict[str, list[dt.datetime]]] = None,
 ) -> list[LeafAreaRow]:
+    consolidated_estimates = consolidate_minute_estimates(estimates)
     explicit_resets = explicit_resets or {}
     grouped: dict[str, list[MinuteLeafEstimate]] = defaultdict(list)
-    for estimate in estimates:
+    for estimate in consolidated_estimates:
         grouped[estimate.animal_id].append(estimate)
     rows: list[LeafAreaRow] = []
     allowed_gap = dt.timedelta(minutes=allowed_gap_minutes)
@@ -563,7 +564,7 @@ def finalize_leaf_rows(
                 baseline_area = estimate.leaf_area_proxy_px
             loss_prev_min_pct: Optional[float] = None
             if previous is not None:
-                if estimate.timestamp_utc - previous.timestamp_utc > allowed_gap or estimate.clip_key != previous.clip_key:
+                if estimate.timestamp_utc - previous.timestamp_utc > allowed_gap:
                     current_epoch += 1
                     baseline_area = estimate.leaf_area_proxy_px
                     previous = None
@@ -615,6 +616,31 @@ def finalize_leaf_rows(
                 rows.append(dataclasses.replace(row, feeding_raw=raw, feeding_final=final))
     rows.sort(key=lambda row: (ANIMAL_ORDER.index(row.animal_id), row.timestamp_utc))
     return rows
+
+
+def consolidate_minute_estimates(estimates: list[MinuteLeafEstimate]) -> list[MinuteLeafEstimate]:
+    grouped: dict[tuple[str, dt.datetime], list[MinuteLeafEstimate]] = defaultdict(list)
+    for estimate in estimates:
+        grouped[(estimate.animal_id, estimate.timestamp_utc)].append(estimate)
+
+    consolidated: list[MinuteLeafEstimate] = []
+    for _key, duplicates in sorted(grouped.items(), key=lambda item: (ANIMAL_ORDER.index(item[0][0]), item[0][1])):
+        if len(duplicates) == 1:
+            consolidated.append(duplicates[0])
+            continue
+        chosen = max(duplicates, key=lambda row: (row.leaf_area_proxy_px, row.timestamp_utc, row.clip_key))
+        consolidated.append(
+            MinuteLeafEstimate(
+                animal_id=chosen.animal_id,
+                clip_key=chosen.clip_key,
+                timestamp_utc=chosen.timestamp_utc,
+                leaf_area_proxy_px=max(row.leaf_area_proxy_px for row in duplicates),
+                n_sampled_frames=sum(row.n_sampled_frames for row in duplicates),
+                n_valid_frames=sum(row.n_valid_frames for row in duplicates),
+                qc_flag=";".join(sorted({row.qc_flag for row in duplicates if row.qc_flag})),
+            )
+        )
+    return consolidated
 
 
 def leaf_rows_to_dicts(rows: list[LeafAreaRow], timezone: dt.tzinfo) -> list[dict[str, str]]:
@@ -771,6 +797,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     root = Path(args.root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         parser.error(f"root must be an existing directory: {root}")
+    if args.sample_minutes != 1:
+        parser.error("--sample-minutes currently supports only 1-minute estimates in v1")
     timezone = load_timezone(args.timezone)
     animal_filter = set(args.animals) if args.animals else None
     entries = load_manifest_entries(root, animals=animal_filter)
@@ -781,9 +809,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     all_estimates: list[MinuteLeafEstimate] = []
     summary_rows: list[dict[str, str]] = []
-    for entry in entries:
+    progress_reporter = ProgressReporter(total_clips=len(entries))
+    status_counts: dict[str, int] = defaultdict(int)
+    for clip_index, entry in enumerate(entries, start=1):
         result = extract_clip_leaf_estimates(
             entry,
+            clip_index=clip_index,
             timezone=timezone,
             burst_step_seconds=args.burst_step_seconds,
             leaf_area_percentile=args.leaf_area_percentile,
@@ -794,11 +825,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             value_min=args.value_min,
             min_component_px=args.min_component_px,
             morph_kernel=args.morph_kernel,
+            progress_reporter=progress_reporter,
         )
         if result.error:
             LOG.error(result.error)
         all_estimates.extend(result.estimates)
         summary_rows.append(summary_row(root, entry, result))
+        status_counts[result.status] += 1
 
     explicit_resets = load_leaf_reset_events(args.leaf_events, timezone)
     finalized_rows = finalize_leaf_rows(
@@ -812,11 +845,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         leaf_reset_increase_pct=args.leaf_reset_increase_pct,
         explicit_resets=explicit_resets,
     )
+    feeding_events = feeding_event_dicts(finalized_rows, timezone, sample_minutes=args.sample_minutes)
     write_csv(output_root / "leaf_area_timeseries.csv", LEAF_AREA_FIELDS, leaf_rows_to_dicts(finalized_rows, timezone))
-    write_csv(output_root / "feeding_events.csv", FEEDING_EVENT_FIELDS, feeding_event_dicts(finalized_rows, timezone, sample_minutes=args.sample_minutes))
+    write_csv(output_root / "feeding_events.csv", FEEDING_EVENT_FIELDS, feeding_events)
     write_csv(output_root / "leaf_feeding_summary.csv", SUMMARY_FIELDS, summary_rows)
     if args.qc:
         write_leaf_qc(root, finalized_rows, timezone)
+    LOG.info("Leaf feeding analysis complete")
+    LOG.info("  clips selected: %d", len(entries))
+    LOG.info("  clips analyzed: %d", status_counts.get("computed", 0))
+    LOG.info("  frame mismatches: %d", status_counts.get("frame_mismatch", 0))
+    LOG.info("  failed opens: %d", status_counts.get("failed", 0))
+    LOG.info("  minute estimates: %d", len(finalized_rows))
+    LOG.info("  feeding events: %d", len(feeding_events))
     LOG.info("Wrote leaf area timeseries: %s", output_root / "leaf_area_timeseries.csv")
     LOG.info("Wrote feeding events: %s", output_root / "feeding_events.csv")
     LOG.info("Wrote leaf feeding summary: %s", output_root / "leaf_feeding_summary.csv")

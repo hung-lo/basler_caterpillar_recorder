@@ -6,6 +6,7 @@ import datetime as dt
 import io
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -212,6 +213,71 @@ class LeafFeedingLogicTests(unittest.TestCase):
         events = leaf.feeding_event_dicts(rows, dt.timezone.utc, sample_minutes=1)
 
         self.assertEqual(events[0]["end_utc"], "2026-08-09T14:05:00.000000Z")
+
+    def test_consolidate_minute_estimates_merges_duplicate_boundary_minutes(self) -> None:
+        timestamp = dt.datetime(2026, 8, 9, 12, 31, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.MinuteLeafEstimate("C01", "clip_0010", timestamp, 9500, 3, 3),
+            leaf.MinuteLeafEstimate("C01", "clip_0011", timestamp, 9600, 4, 4),
+        ]
+
+        consolidated = leaf.consolidate_minute_estimates(estimates)
+
+        self.assertEqual(len(consolidated), 1)
+        self.assertEqual(consolidated[0].leaf_area_proxy_px, 9600)
+        self.assertEqual(consolidated[0].n_sampled_frames, 7)
+        self.assertEqual(consolidated[0].n_valid_frames, 7)
+
+    def test_cross_clip_continuity_does_not_force_new_leaf_epoch(self) -> None:
+        base = dt.datetime(2026, 8, 9, 12, 28, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.MinuteLeafEstimate("C01", "clip_0010", base + dt.timedelta(minutes=1), 10000, 6, 6),
+            leaf.MinuteLeafEstimate("C01", "clip_0010", base + dt.timedelta(minutes=2), 9700, 6, 6),
+            leaf.MinuteLeafEstimate("C01", "clip_0011", base + dt.timedelta(minutes=3), 9400, 6, 6),
+            leaf.MinuteLeafEstimate("C01", "clip_0011", base + dt.timedelta(minutes=4), 9100, 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            allowed_gap_minutes=2,
+            start_loss_pct=2.0,
+            continue_loss_pct=1.0,
+            merge_gap_minutes=2,
+            min_bout_minutes=2,
+            leaf_reset_increase_pct=20.0,
+        )
+
+        self.assertEqual([row.leaf_epoch for row in rows], [1, 1, 1, 1])
+
+    def test_main_wires_progress_reporter_into_clip_extraction(self) -> None:
+        repo_root = Path.cwd()
+        entry_a = leaf.ManifestEntry("C01", "clip_a", repo_root / "a.mp4", repo_root / "a.timestamps.csv")
+        entry_b = leaf.ManifestEntry("C02", "clip_b", repo_root / "b.mp4", repo_root / "b.timestamps.csv")
+
+        with mock.patch.object(leaf, "load_manifest_entries", return_value=[entry_a, entry_b]):
+            with mock.patch.object(leaf, "load_leaf_reset_events", return_value={}):
+                with mock.patch.object(leaf, "finalize_leaf_rows", return_value=[]):
+                    with mock.patch.object(leaf, "feeding_event_dicts", return_value=[]):
+                        with mock.patch.object(leaf, "leaf_rows_to_dicts", return_value=[]):
+                            with mock.patch.object(leaf, "write_csv"):
+                                with mock.patch.object(leaf, "load_timezone", return_value=dt.timezone.utc):
+                                    with mock.patch.object(
+                                        leaf,
+                                        "extract_clip_leaf_estimates",
+                                        side_effect=[
+                                            leaf.ClipFeedingResult([], "computed", 10, 10, 2),
+                                            leaf.ClipFeedingResult([], "computed", 12, 12, 3),
+                                        ],
+                                    ) as mock_extract:
+                                        rc = leaf.main(["."])
+
+        self.assertEqual(rc, 0)
+        first_call = mock_extract.call_args_list[0]
+        second_call = mock_extract.call_args_list[1]
+        self.assertEqual(first_call.kwargs["clip_index"], 1)
+        self.assertEqual(second_call.kwargs["clip_index"], 2)
+        self.assertIs(first_call.kwargs["progress_reporter"], second_call.kwargs["progress_reporter"])
 
 
 if __name__ == "__main__":

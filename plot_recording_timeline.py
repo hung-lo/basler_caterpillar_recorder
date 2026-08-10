@@ -114,6 +114,7 @@ STIM_COLOR = "#dc2626"
 DEATH_COLOR = "#111827"
 DEFAULT_POINT_COLOR = "#475569"
 INTERVAL_BAR_COLOR = "#8aa1c7"
+FEEDING_COLOR = "#7c3aed"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -902,6 +903,8 @@ def get_point_event_style(event_name: str) -> tuple[str, float, str]:
 
 
 def event_bar_color(event: BehaviorEvent) -> str:
+    if is_feeding_event(event):
+        return FEEDING_COLOR
     marker, _marker_size, color = get_point_event_style(event.event or event.kind)
     normalized = normalize_event_name(event.event or event.kind)
     if normalized in SHED_EVENT_NAMES | STIM_EVENT_NAMES | DEATH_EVENT_NAMES:
@@ -1058,6 +1061,19 @@ def manual_annotation_legend_handles() -> list[Line2D | Patch]:
             markeredgewidth=0.6,
             label="Other point event",
         ),
+    ]
+
+
+def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
+    if not any(is_feeding_event(event) for event in events):
+        return []
+    return [
+        Patch(
+            facecolor=FEEDING_COLOR,
+            alpha=0.82,
+            edgecolor="none",
+            label="Automatic feeding",
+        )
     ]
 
 
@@ -1360,10 +1376,38 @@ def plot_recording_timeline(
         )
         ax_legend.add_artist(global_legend)
 
+    feeding_handles = feeding_legend_handles(events)
+    if feeding_handles:
+        feeding_legend = ax_legend.legend(
+            handles=feeding_handles,
+            loc="upper left",
+            bbox_to_anchor=(
+                0.58 if motion_states and global_handles else
+                0.26 if global_handles else
+                0.32 if motion_states else
+                0.0,
+                1.0,
+            ),
+            ncol=1,
+            frameon=False,
+            fontsize=8,
+            title="Feeding",
+            title_fontsize=9,
+            handlelength=1.3,
+            handletextpad=0.5,
+            columnspacing=1.2,
+            borderaxespad=0.0,
+        )
+        ax_legend.add_artist(feeding_legend)
+
     ax_legend.legend(
         handles=manual_annotation_legend_handles(),
         loc="upper left",
         bbox_to_anchor=(
+            0.72 if feeding_handles and motion_states and global_handles else
+            0.42 if feeding_handles and global_handles else
+            0.46 if feeding_handles and motion_states else
+            0.14 if feeding_handles else
             0.58 if motion_states and global_handles else
             0.26 if global_handles else
             0.32 if motion_states else
@@ -1412,6 +1456,8 @@ def plot_recording_timeline(
         state_start_utc = state.start_utc
         state_end_utc = state.end_utc
         if death_cutoff_local is not None:
+            if death_cutoff_local.tzinfo is None:
+                death_cutoff_local = death_cutoff_local.replace(tzinfo=timezone)
             death_cutoff_utc = death_cutoff_local.astimezone(UTC)
             if state_start_utc >= death_cutoff_utc:
                 suppressed_motion_spans += 1
@@ -1529,6 +1575,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional local CSV of automatic feeding events to overlay without modifying manual events.",
     )
     parser.add_argument(
+        "--no-feeding-events",
+        action="store_true",
+        help="Disable automatic feeding_events.csv loading even when the default file exists.",
+    )
+    parser.add_argument(
         "--motion-states",
         type=Path,
         help=(
@@ -1616,13 +1667,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             root=root,
             tz=local_tz,
         )
-        if args.feeding_events:
-            feeding_events, feeding_global_events = load_event_tables(
-                Path(args.feeding_events).expanduser().resolve(),
-                local_tz,
+        feeding_events_path: Optional[Path] = None
+        if args.feeding_events is not None:
+            feeding_events_path = Path(args.feeding_events).expanduser().resolve()
+            if not feeding_events_path.exists():
+                parser.error(f"feeding events file does not exist: {feeding_events_path}")
+        elif not args.no_feeding_events:
+            auto_feeding_events = (
+                root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv"
             )
+            if auto_feeding_events.exists():
+                feeding_events_path = auto_feeding_events
+
+        if feeding_events_path is not None:
+            feeding_events, feeding_global_events = load_event_tables(feeding_events_path, local_tz)
             events.extend(feeding_events)
             global_events.extend(feeding_global_events)
+            LOG.info(
+                "Loaded %d automatic feeding event(s) from %s",
+                len(feeding_events),
+                feeding_events_path,
+            )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return 1
