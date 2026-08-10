@@ -487,6 +487,39 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(marker, "X")
 
+    def test_death_cutoffs_use_earliest_death_per_animal(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 1),
+                event="death",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 10, 1),
+                event="dead",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C02",
+                start_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 0, 1),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        self.assertEqual(
+            timeline.death_cutoffs_local(events),
+            {"C01": dt.datetime(2026, 8, 9, 15, 10, 0)},
+        )
+
     def test_unknown_point_event_uses_generic_circle(self) -> None:
         marker, size, _color = timeline.get_point_event_style("feeding_resumed")
 
@@ -794,6 +827,125 @@ class TimelinePlotTests(unittest.TestCase):
         expected_width = 15 * 60 / 86400.0
         self.assertAlmostEqual(rendered_left, expected_left)
         self.assertAlmostEqual(rendered_width, expected_width)
+
+    def test_motion_states_stop_at_death_time(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 18, 50, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 20, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_2",
+                start_utc=dt.datetime(2026, 8, 9, 19, 21, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 30, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=1.5,
+                n_windows=300,
+            ),
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+                event="death",
+                kind="event",
+                notes="",
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=events,
+                motion_states=motion_states,
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        state_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") in {timeline.MOTION_MOBILE_COLOR, timeline.MOTION_IMMOBILE_COLOR}
+        ]
+        self.assertEqual(len(state_calls), 1)
+        rendered_left, rendered_width = state_calls[0].args[0][0]
+        expected_left = timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 50, 0))
+        expected_width = 10 * 60 / 86400.0
+        self.assertAlmostEqual(rendered_left, expected_left)
+        self.assertAlmostEqual(rendered_width, expected_width)
+
+    def test_events_after_death_are_not_plotted_but_death_marker_is_kept(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 14, 55, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+                event="death",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                event="feeding_resumed",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=events,
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        manual_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") in {timeline.INTERVAL_BAR_COLOR, timeline.DEATH_COLOR}
+        ]
+        self.assertEqual(len(manual_calls), 2)
+
+        feeding_call = next(call for call in manual_calls if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR)
+        feeding_left, feeding_width = feeding_call.args[0][0]
+        expected_left = timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 55, 0))
+        expected_width = 5 * 60 / 86400.0
+        self.assertAlmostEqual(feeding_left, expected_left)
+        self.assertAlmostEqual(feeding_width, expected_width)
+
+        scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
+        self.assertIn("X", scatter_markers)
+        self.assertEqual(scatter_markers.count("o"), 1)
 
     def test_load_motion_states_parses_mobile_and_immobile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

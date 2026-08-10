@@ -1322,6 +1322,7 @@ def plot_recording_timeline(
         configure_time_axis(ax_beh, x_min, x_max)
 
     video_quality_masks_utc = video_quality_mask_intervals_utc(global_events)
+    death_cutoffs = death_cutoffs_local(events)
     if video_quality_masks_utc:
         LOG.info(
             "Applying %d video-quality visualization mask(s) to motion-derived states",
@@ -1332,13 +1333,23 @@ def plot_recording_timeline(
     for state in motion_states:
         if state.animal_id not in behavior_index:
             continue
+        death_cutoff_local = death_cutoffs.get(state.animal_id)
+        state_start_utc = state.start_utc
+        state_end_utc = state.end_utc
+        if death_cutoff_local is not None:
+            death_cutoff_utc = death_cutoff_local.astimezone(UTC)
+            if state_start_utc >= death_cutoff_utc:
+                suppressed_motion_spans += 1
+                continue
+            if state_end_utc > death_cutoff_utc:
+                state_end_utc = death_cutoff_utc
         y = behavior_index[state.animal_id]
         color = MOTION_MOBILE_COLOR if state.state == "mobile" else MOTION_IMMOBILE_COLOR
-        visible_segments = subtract_intervals(state.start_utc, state.end_utc, video_quality_masks_utc)
+        visible_segments = subtract_intervals(state_start_utc, state_end_utc, video_quality_masks_utc)
         if not visible_segments:
             suppressed_motion_spans += 1
             continue
-        if len(visible_segments) != 1 or visible_segments[0] != (state.start_utc, state.end_utc):
+        if len(visible_segments) != 1 or visible_segments[0] != (state_start_utc, state_end_utc):
             clipped_motion_spans += 1
         for segment_start_utc, segment_end_utc in visible_segments:
             left = mdates.date2num(to_plot_local(segment_start_utc, timezone))
@@ -1361,9 +1372,22 @@ def plot_recording_timeline(
     for event in events:
         if event.animal_id not in behavior_index:
             continue
+        death_cutoff_local = death_cutoffs.get(event.animal_id)
+        if death_cutoff_local is not None:
+            if is_death_event(event):
+                if event.start_local != death_cutoff_local:
+                    continue
+            else:
+                if event.start_local >= death_cutoff_local:
+                    continue
         y = behavior_index[event.animal_id]
+        event_end_local = event.end_local
+        if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
+            event_end_local = death_cutoff_local
+        duration_s = max((event_end_local - event.start_local).total_seconds(), 0.0)
+        if duration_s <= 0:
+            continue
         left = mdates.date2num(event.start_local.replace(tzinfo=None))
-        duration_s = _event_duration_s(event)
         width = max(duration_s / 86400.0, 1e-9)
         color = event_bar_color(event)
         ax_beh.broken_barh(
