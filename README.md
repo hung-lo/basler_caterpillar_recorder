@@ -121,6 +121,15 @@ behavior_events_source.json
 
 This keeps the plot reproducible even though the live sheet can change between runs.
 
+To mark an experiment-wide interval instead of a single animal row, set `animal_id` to `All`, `Global`, or `*`. For example:
+
+```text
+animal_id,start_local,end_local,event,kind,notes
+All,2026-08-09 15:00:00,2026-08-09 15:30:00,video_quality_low,video_quality,brief focus drift
+```
+
+These global intervals draw as background spans across both the recording coverage panel and all animal rows. Video-quality aliases such as `video_quality_low`, `poor_video_quality`, `bad_video_quality`, `bad_lighting`, and `poor_lighting` render with a dedicated low-quality highlight. Global rows must include both `start_local` and `end_local`.
+
 If you want to point at a specific motion-state file explicitly:
 
 ```powershell

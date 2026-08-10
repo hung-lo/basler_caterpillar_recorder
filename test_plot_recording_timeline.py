@@ -35,6 +35,7 @@ class TimelinePlotTests(unittest.TestCase):
         clips: list[timeline.RecordingClip],
         events: list[timeline.BehaviorEvent],
         motion_states: list[timeline.MotionState] | None = None,
+        global_events: list[timeline.GlobalEvent] | None = None,
         animals: list[str] | None = None,
     ):
         captured: dict[str, object] = {}
@@ -49,6 +50,7 @@ class TimelinePlotTests(unittest.TestCase):
                     events=events,
                     motion_states=motion_states or [],
                     animals=animals or timeline.ANIMAL_ORDER,
+                    global_events=global_events or [],
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                     output_path=Path("ignored.png"),
                     annotate_clips=False,
@@ -259,6 +261,44 @@ class TimelinePlotTests(unittest.TestCase):
                 float(timeline.POINT_EVENT_DURATION_SECONDS),
             )
 
+    def test_global_event_aliases_are_recognized_case_insensitively(self) -> None:
+        csv_text = (
+            "animal_id,start_local,end_local,event,kind,approximate,notes\n"
+            "All,2026-08-09 15:00:00,2026-08-09 15:10:00,video_quality_low,video_quality,TRUE,first\n"
+            "global,2026-08-09 15:20:00,2026-08-09 15:30:00,bad_lighting,video_quality,FALSE,second\n"
+            "*,2026-08-09 15:40:00,2026-08-09 15:50:00,lights_back_on,event,,third\n"
+        )
+
+        events, global_events = timeline.load_event_tables_from_text(
+            csv_text,
+            dt.timezone(dt.timedelta(hours=-4)),
+            source_name="inline.csv",
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(global_events), 3)
+        self.assertTrue(global_events[0].approximate)
+        self.assertFalse(global_events[1].approximate)
+
+    def test_global_interval_requires_end_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events_path = root / "behavior_events.csv"
+            with events_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["animal_id", "start_local", "end_local", "event", "kind", "notes"])
+                writer.writerow(["All", "2026-08-09 15:00:00", "", "video_quality_low", "video_quality", ""])
+                writer.writerow(["C01", "2026-08-09 15:10:00", "", "shed", "event", ""])
+
+            events, global_events = timeline.load_event_tables(
+                events_path,
+                dt.timezone(dt.timedelta(hours=-4)),
+            )
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].animal_id, "C01")
+            self.assertEqual(global_events, [])
+
     def test_missing_start_local_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -378,6 +418,25 @@ class TimelinePlotTests(unittest.TestCase):
             timeline.ANIMAL_ORDER,
         )
 
+    def test_global_events_do_not_create_a_ninth_animal_row(self) -> None:
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            )
+        ]
+
+        fig = self.capture_timeline_figure(clips=[], events=[], global_events=global_events)
+        ax_beh = self.behavior_axis(fig)
+        labels = [tick.get_text() for tick in ax_beh.get_yticklabels()]
+
+        self.assertEqual(labels, timeline.ANIMAL_ORDER)
+        self.assertEqual(len(labels), 8)
+        self.assertNotIn("All", labels)
+
     def test_empty_animal_rows_remain_visible(self) -> None:
         events = [
             timeline.BehaviorEvent(
@@ -427,6 +486,34 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(marker, "o")
         self.assertEqual(size, timeline.DEFAULT_POINT_MARKER_SIZE)
 
+    def test_video_quality_aliases_and_kind_share_the_same_global_style(self) -> None:
+        events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 1, 0, tzinfo=dt.timezone.utc),
+                event="video_quality_low",
+                kind="event",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 2, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 3, 0, tzinfo=dt.timezone.utc),
+                event="bad_lighting",
+                kind="event",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 4, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 5, 0, tzinfo=dt.timezone.utc),
+                event="custom_interval",
+                kind="video_quality",
+                notes="",
+            ),
+        ]
+
+        styles = [timeline.global_event_band_style(event) for event in events]
+        self.assertEqual(styles, [(timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA)] * 3)
+
     def test_long_interval_does_not_create_point_marker(self) -> None:
         event = timeline.BehaviorEvent(
             animal_id="C01",
@@ -450,6 +537,115 @@ class TimelinePlotTests(unittest.TestCase):
                 )
 
         self.assertEqual(mock_scatter.call_count, 0)
+        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
+
+    def test_global_spans_are_drawn_on_coverage_and_behavior_axes(self) -> None:
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="poor_video_quality",
+                kind="event",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 45, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="lights_repositioned",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.axvspan") as mock_axvspan:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[],
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                global_events=global_events,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        self.assertEqual(mock_axvspan.call_count, 4)
+        facecolors = [call.kwargs["facecolor"] for call in mock_axvspan.call_args_list]
+        self.assertEqual(facecolors.count(timeline.VIDEO_QUALITY_LOW_COLOR), 2)
+        self.assertEqual(facecolors.count(timeline.GENERIC_GLOBAL_EVENT_COLOR), 2)
+
+    def test_manual_markers_survive_global_quality_spans(self) -> None:
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            )
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 5, 1),
+                event="shed",
+                kind="event",
+                notes="",
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=events,
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                global_events=global_events,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        self.assertEqual(mock_scatter.call_count, 1)
+
+    def test_motion_states_survive_global_quality_spans(self) -> None:
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="bad_lighting",
+                kind="event",
+                notes="",
+            )
+        ]
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[],
+                motion_states=motion_states,
+                animals=timeline.ANIMAL_ORDER,
+                global_events=global_events,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
         self.assertGreaterEqual(mock_broken_barh.call_count, 1)
 
     def test_load_motion_states_parses_mobile_and_immobile(self) -> None:
@@ -649,6 +845,31 @@ class TimelinePlotTests(unittest.TestCase):
             self.assertEqual(metadata["source_type"], "google_sheet")
             self.assertEqual(metadata["gid"], "1696022641")
             self.assertEqual(metadata["rows"], 2)
+
+    def test_google_sheet_global_rows_become_global_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+            csv_bytes = (
+                "animal_id,start_local,end_local,event,kind,notes\n"
+                "All,2026-08-09T15:00:00-04:00,2026-08-09T15:30:00-04:00,video_quality_low,video_quality,dim light\n"
+                "C02,2026-08-09T15:05:00-04:00,,shed,event,\n"
+            ).encode("utf-8")
+
+            with mock.patch(
+                "plot_recording_timeline.urllib_request.urlopen",
+                return_value=self.FakeHTTPResponse(csv_bytes),
+            ):
+                events, global_events = timeline.load_event_tables_source(
+                    url,
+                    root=root,
+                    tz=dt.timezone(dt.timedelta(hours=-4)),
+                )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].animal_id, "C02")
+        self.assertEqual(len(global_events), 1)
+        self.assertTrue(timeline.is_video_quality_global_event(global_events[0]))
 
     def test_google_sheet_html_response_fails_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

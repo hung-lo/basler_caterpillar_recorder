@@ -64,6 +64,12 @@ MAX_MAJOR_GAP_LABELS = 6
 GOOGLE_SHEETS_HOST = "docs.google.com"
 GOOGLE_SHEETS_TIMEOUT_SECONDS = 30
 GOOGLE_SHEETS_USER_AGENT = "basler-caterpillar-recorder/1.0"
+GLOBAL_EVENT_ALIASES = {"all", "global", "*"}
+VIDEO_QUALITY_LOW_COLOR = "#F59E0B"
+VIDEO_QUALITY_LOW_ALPHA = 0.12
+GENERIC_GLOBAL_EVENT_COLOR = "#94a3b8"
+GENERIC_GLOBAL_EVENT_ALPHA = 0.1
+MIN_GLOBAL_EVENT_LABEL_SECONDS = 5 * 60
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -80,6 +86,13 @@ STIM_EVENT_NAMES = {
 DEATH_EVENT_NAMES = {
     "death",
     "dead",
+}
+VIDEO_QUALITY_GLOBAL_EVENT_NAMES = {
+    "video_quality_low",
+    "poor_video_quality",
+    "bad_video_quality",
+    "bad_lighting",
+    "poor_lighting",
 }
 
 SHED_COLOR = "#d97706"
@@ -131,6 +144,16 @@ class MotionState:
     mean_motion_energy: float
     peak_motion_energy: float
     n_windows: int
+
+
+@dataclasses.dataclass(frozen=True)
+class GlobalEvent:
+    start_local: dt.datetime
+    end_local: dt.datetime
+    event: str
+    kind: str
+    notes: str
+    approximate: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -341,59 +364,13 @@ def fetch_google_sheet_csv(source: GoogleSheetSource) -> bytes:
     return csv_bytes
 
 
-def load_behavior_events_from_text(
-    text: str,
-    tz: dt.tzinfo,
-    *,
-    source_name: str,
-) -> list[BehaviorEvent]:
-    events: list[BehaviorEvent] = []
-    with io.StringIO(text) as handle:
-        reader = csv.DictReader(handle)
-        for row_index, row in enumerate(reader, start=2):
-            try:
-                animal_id = str(row.get("animal_id") or "").strip()
-                if not animal_id:
-                    raise ValueError("missing animal_id")
-                start_text = str(row.get("start_local") or "").strip()
-                end_text = str(row.get("end_local") or "").strip()
-                if not start_text:
-                    raise ValueError("missing start_local")
-                start_local = parse_local_datetime(start_text, tz)
-                if end_text:
-                    end_local = parse_local_datetime(end_text, tz)
-                    if end_local <= start_local:
-                        raise ValueError("end_local must be after start_local")
-                else:
-                    end_local = start_local + dt.timedelta(
-                        seconds=POINT_EVENT_DURATION_SECONDS
-                    )
-                events.append(
-                    BehaviorEvent(
-                        animal_id=animal_id,
-                        start_local=start_local,
-                        end_local=end_local,
-                        event=str(row.get("event") or "").strip() or "event",
-                        kind=str(row.get("kind") or "").strip() or "event",
-                        notes=str(row.get("notes") or "").strip(),
-                    )
-                )
-            except Exception as exc:
-                LOG.warning(
-                    "Skipping malformed behavior event row %d in %s: %s",
-                    row_index,
-                    source_name,
-                    exc,
-                )
-    return events
-
-
 def write_google_sheet_event_snapshot(
     *,
     root: Path,
     source: GoogleSheetSource,
     csv_bytes: bytes,
-    events: list[BehaviorEvent],
+    behavior_events: list[BehaviorEvent],
+    global_events: list[GlobalEvent],
 ) -> None:
     snapshot_path = root / "behavior_events_used.csv"
     metadata_path = root / "behavior_events_source.json"
@@ -406,7 +383,9 @@ def write_google_sheet_event_snapshot(
         "export_url": source.export_url,
         "fetched_at_utc": format_utc(dt.datetime.now(UTC)),
         "sha256": hashlib.sha256(csv_bytes).hexdigest(),
-        "rows": len(events),
+        "rows": len(behavior_events) + len(global_events),
+        "behavior_events": len(behavior_events),
+        "global_events": len(global_events),
         "snapshot_csv": relative_to_root(snapshot_path, root),
     }
     atomic_write_text(metadata_path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -531,21 +510,114 @@ def parse_local_datetime(value: str, tz: dt.tzinfo) -> dt.datetime:
     return parsed.astimezone(tz)
 
 
+def parse_boolish(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "yes", "y"}
+
+
+def is_global_event_alias(animal_id: str) -> bool:
+    return animal_id.strip().lower() in GLOBAL_EVENT_ALIASES
+
+
+def load_event_tables_from_text(
+    text: str,
+    tz: dt.tzinfo,
+    *,
+    source_name: str,
+) -> tuple[list[BehaviorEvent], list[GlobalEvent]]:
+    events: list[BehaviorEvent] = []
+    global_events: list[GlobalEvent] = []
+    with io.StringIO(text) as handle:
+        reader = csv.DictReader(handle)
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                if not animal_id:
+                    raise ValueError("missing animal_id")
+                start_text = str(row.get("start_local") or "").strip()
+                end_text = str(row.get("end_local") or "").strip()
+                if not start_text:
+                    raise ValueError("missing start_local")
+                start_local = parse_local_datetime(start_text, tz)
+                event_name = str(row.get("event") or "").strip() or "event"
+                kind_name = str(row.get("kind") or "").strip() or "event"
+                notes = str(row.get("notes") or "").strip()
+                approximate = parse_boolish(row.get("approximate"))
+                if is_global_event_alias(animal_id):
+                    if not end_text:
+                        raise ValueError("global event intervals require end_local")
+                    end_local = parse_local_datetime(end_text, tz)
+                    if end_local <= start_local:
+                        raise ValueError("end_local must be after start_local")
+                    global_events.append(
+                        GlobalEvent(
+                            start_local=start_local,
+                            end_local=end_local,
+                            event=event_name,
+                            kind=kind_name,
+                            notes=notes,
+                            approximate=approximate,
+                        )
+                    )
+                    continue
+                if end_text:
+                    end_local = parse_local_datetime(end_text, tz)
+                    if end_local <= start_local:
+                        raise ValueError("end_local must be after start_local")
+                else:
+                    end_local = start_local + dt.timedelta(
+                        seconds=POINT_EVENT_DURATION_SECONDS
+                    )
+                events.append(
+                    BehaviorEvent(
+                        animal_id=animal_id,
+                        start_local=start_local,
+                        end_local=end_local,
+                        event=event_name,
+                        kind=kind_name,
+                        notes=notes,
+                    )
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Skipping malformed behavior event row %d in %s: %s",
+                    row_index,
+                    source_name,
+                    exc,
+                )
+    return events, global_events
+
+
 def load_behavior_events(path: Optional[Path], tz: dt.tzinfo) -> list[BehaviorEvent]:
     if path is None or not path.exists():
         return []
     text = path.read_text(encoding="utf-8-sig")
-    return load_behavior_events_from_text(text, tz, source_name=str(path))
+    events, _global_events = load_event_tables_from_text(text, tz, source_name=str(path))
+    return events
 
 
-def load_behavior_events_source(
+def load_event_tables(
+    path: Optional[Path],
+    tz: dt.tzinfo,
+) -> tuple[list[BehaviorEvent], list[GlobalEvent]]:
+    if path is None or not path.exists():
+        return [], []
+    text = path.read_text(encoding="utf-8-sig")
+    return load_event_tables_from_text(text, tz, source_name=str(path))
+
+
+def load_event_tables_source(
     source: Optional[str],
     *,
     root: Path,
     tz: dt.tzinfo,
-) -> list[BehaviorEvent]:
+) -> tuple[list[BehaviorEvent], list[GlobalEvent]]:
     if source is None:
-        return []
+        LOG.info("Loaded 0 per-animal behavior event(s)")
+        LOG.info("Loaded 0 global event interval(s)")
+        return [], []
 
     parsed = urllib_parse.urlparse(source)
     if parsed.scheme in {"http", "https"}:
@@ -553,15 +625,21 @@ def load_behavior_events_source(
         LOG.info("Fetching behavior events from Google Sheet gid=%s", google_source.gid)
         csv_bytes = fetch_google_sheet_csv(google_source)
         text = csv_bytes.decode("utf-8-sig")
-        events = load_behavior_events_from_text(text, tz, source_name=google_source.source_url)
+        events, global_events = load_event_tables_from_text(
+            text,
+            tz,
+            source_name=google_source.source_url,
+        )
         write_google_sheet_event_snapshot(
             root=root,
             source=google_source,
             csv_bytes=csv_bytes,
-            events=events,
+            behavior_events=events,
+            global_events=global_events,
         )
-        LOG.info("Loaded %d behavior event(s)", len(events))
-        return events
+        LOG.info("Loaded %d per-animal behavior event(s)", len(events))
+        LOG.info("Loaded %d global event interval(s)", len(global_events))
+        return events, global_events
 
     if "://" in source:
         raise ValueError(
@@ -571,8 +649,19 @@ def load_behavior_events_source(
     path = Path(source).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"behavior event CSV does not exist: {path}")
-    events = load_behavior_events(path, tz)
-    LOG.info("Loaded %d behavior event(s)", len(events))
+    events, global_events = load_event_tables(path, tz)
+    LOG.info("Loaded %d per-animal behavior event(s)", len(events))
+    LOG.info("Loaded %d global event interval(s)", len(global_events))
+    return events, global_events
+
+
+def load_behavior_events_source(
+    source: Optional[str],
+    *,
+    root: Path,
+    tz: dt.tzinfo,
+) -> list[BehaviorEvent]:
+    events, _global_events = load_event_tables_source(source, root=root, tz=tz)
     return events
 
 
@@ -723,6 +812,78 @@ def normalize_event_name(event_name: str) -> str:
     return event_name.strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def is_video_quality_global_event(event: GlobalEvent) -> bool:
+    normalized_event = normalize_event_name(event.event)
+    normalized_kind = normalize_event_name(event.kind)
+    return (
+        normalized_event in VIDEO_QUALITY_GLOBAL_EVENT_NAMES
+        or normalized_kind == "video_quality"
+    )
+
+
+def global_event_band_style(event: GlobalEvent) -> tuple[str, float]:
+    if is_video_quality_global_event(event):
+        return VIDEO_QUALITY_LOW_COLOR, VIDEO_QUALITY_LOW_ALPHA
+    return GENERIC_GLOBAL_EVENT_COLOR, GENERIC_GLOBAL_EVENT_ALPHA
+
+
+def global_event_label(event: GlobalEvent) -> Optional[str]:
+    if not is_video_quality_global_event(event):
+        return None
+    normalized_event = normalize_event_name(event.event)
+    if normalized_event in {"bad_lighting", "poor_lighting"}:
+        return "Poor lighting"
+    return "Low video quality"
+
+
+def global_annotation_legend_handles(global_events: list[GlobalEvent]) -> list[Patch]:
+    handles: list[Patch] = []
+    if any(is_video_quality_global_event(event) for event in global_events):
+        handles.append(
+            Patch(
+                facecolor=VIDEO_QUALITY_LOW_COLOR,
+                alpha=VIDEO_QUALITY_LOW_ALPHA,
+                edgecolor="none",
+                label="Low video quality",
+            )
+        )
+    if any(not is_video_quality_global_event(event) for event in global_events):
+        handles.append(
+            Patch(
+                facecolor=GENERIC_GLOBAL_EVENT_COLOR,
+                alpha=GENERIC_GLOBAL_EVENT_ALPHA,
+                edgecolor="none",
+                label="Global interval",
+            )
+        )
+    return handles
+
+
+def timeline_bounds_utc(
+    clips: list[RecordingClip],
+    events: list[BehaviorEvent],
+    motion_states: list[MotionState],
+    global_events: list[GlobalEvent],
+) -> Optional[tuple[dt.datetime, dt.datetime]]:
+    starts_utc: list[dt.datetime] = []
+    ends_utc: list[dt.datetime] = []
+    for clip in clips:
+        starts_utc.append(clip.start_utc)
+        ends_utc.append(clip.end_utc)
+    for event in events:
+        starts_utc.append(event.start_local.astimezone(UTC))
+        ends_utc.append(event.end_local.astimezone(UTC))
+    for state in motion_states:
+        starts_utc.append(state.start_utc)
+        ends_utc.append(state.end_utc)
+    for event in global_events:
+        starts_utc.append(event.start_local.astimezone(UTC))
+        ends_utc.append(event.end_local.astimezone(UTC))
+    if not starts_utc or not ends_utc:
+        return None
+    return min(starts_utc), max(ends_utc)
+
+
 def get_point_event_style(event_name: str) -> tuple[str, float, str]:
     normalized = normalize_event_name(event_name)
 
@@ -819,21 +980,29 @@ def plot_recording_timeline(
     motion_states: list[MotionState],
     animals: list[str],
     *,
+    global_events: Optional[list[GlobalEvent]] = None,
     timezone: dt.tzinfo,
     output_path: Path,
     annotate_clips: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    global_events = list(global_events or [])
     clip_annotations = annotate_clips and len(clips) <= MAX_CLIP_ANNOTATIONS
     if annotate_clips and not clip_annotations:
         LOG.info("Too many clips for per-clip annotations; disabling clip labels")
 
+    bounds = timeline_bounds_utc(clips, events, motion_states, global_events)
     if clips:
         first_utc = min(clip.start_utc for clip in clips)
         last_utc = max(clip.end_utc for clip in clips)
         recorded_duration_s = sum(clip.duration_s for clip in clips)
         elapsed_duration_s = max((last_utc - first_utc).total_seconds(), 0.0)
         recorded_fraction = recorded_duration_s / elapsed_duration_s if elapsed_duration_s > 0 else 1.0
+    elif bounds is not None:
+        first_utc, last_utc = bounds
+        recorded_duration_s = 0.0
+        elapsed_duration_s = max((last_utc - first_utc).total_seconds(), 0.0)
+        recorded_fraction = 0.0
     else:
         first_utc = last_utc = dt.datetime.now(UTC)
         recorded_duration_s = 0.0
@@ -902,6 +1071,9 @@ def plot_recording_timeline(
         if state.animal_id in behavior_index:
             plot_starts.append(to_plot_local(state.start_utc, timezone))
             plot_ends.append(to_plot_local(state.end_utc, timezone))
+    for event in global_events:
+        plot_starts.append(event.start_local.replace(tzinfo=None))
+        plot_ends.append(event.end_local.replace(tzinfo=None))
 
     x_min: Optional[dt.datetime] = None
     x_max: Optional[dt.datetime] = None
@@ -918,6 +1090,28 @@ def plot_recording_timeline(
         gap_end = to_plot_local(gap_end_utc, timezone)
         ax_cov.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
         ax_beh.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
+
+    for event in global_events:
+        band_start = event.start_local.replace(tzinfo=None)
+        band_end = event.end_local.replace(tzinfo=None)
+        facecolor, alpha = global_event_band_style(event)
+        ax_cov.axvspan(band_start, band_end, facecolor=facecolor, alpha=alpha, zorder=0.35)
+        ax_beh.axvspan(band_start, band_end, facecolor=facecolor, alpha=alpha, zorder=0.45)
+        label = global_event_label(event)
+        if (
+            label
+            and (event.end_local - event.start_local).total_seconds() >= MIN_GLOBAL_EVENT_LABEL_SECONDS
+        ):
+            ax_cov.text(
+                mdates.date2num(band_start + (band_end - band_start) / 2),
+                0.5,
+                label,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="#92400e",
+                zorder=3,
+            )
 
     if clips:
         for clip in clips:
@@ -996,10 +1190,34 @@ def plot_recording_timeline(
         )
         ax_legend.add_artist(motion_legend)
 
+    global_handles = global_annotation_legend_handles(global_events)
+    if global_handles:
+        global_legend = ax_legend.legend(
+            handles=global_handles,
+            loc="upper left",
+            bbox_to_anchor=(0.34 if motion_states else 0.0, 1.0),
+            ncol=len(global_handles),
+            frameon=False,
+            fontsize=8,
+            title="Global intervals",
+            title_fontsize=9,
+            handlelength=1.3,
+            handletextpad=0.5,
+            columnspacing=1.2,
+            borderaxespad=0.0,
+        )
+        ax_legend.add_artist(global_legend)
+
     ax_legend.legend(
         handles=manual_annotation_legend_handles(),
         loc="upper left",
-        bbox_to_anchor=(0.32 if motion_states else 0.0, 1.0),
+        bbox_to_anchor=(
+            0.58 if motion_states and global_handles else
+            0.26 if global_handles else
+            0.32 if motion_states else
+            0.0,
+            1.0,
+        ),
         ncol=5,
         frameon=False,
         fontsize=8,
@@ -1171,7 +1389,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         default_events = root / "behavior_events.csv"
         events_source = str(default_events) if default_events.exists() else None
     try:
-        events = load_behavior_events_source(
+        events, global_events = load_event_tables_source(
             events_source,
             root=root,
             tz=local_tz,
@@ -1200,6 +1418,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         events,
         motion_states,
         animals,
+        global_events=global_events,
         timezone=local_tz,
         output_path=output_png,
         annotate_clips=args.annotate_clips,
