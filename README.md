@@ -128,7 +128,7 @@ animal_id,start_local,end_local,event,kind,notes
 All,2026-08-09 15:00:00,2026-08-09 15:30:00,video_quality_low,video_quality,brief focus drift
 ```
 
-These global intervals draw as background spans across both the recording coverage panel and all animal rows. Video-quality aliases such as `video_quality_low`, `poor_video_quality`, `bad_video_quality`, `bad_lighting`, and `poor_lighting` render with a dedicated low-quality highlight. Global rows must include both `start_local` and `end_local`.
+These global intervals draw as background spans across both the recording coverage panel and all animal rows. Video-quality aliases such as `video_quality_low`, `poor_video_quality`, `bad_video_quality`, `bad_lighting`, and `poor_lighting` render with a dedicated low-quality highlight. During those highlighted intervals, motion-derived mobile/immobile bands are intentionally omitted from the plot so that interval reads as unknown rather than trusted classifier output. Global rows must include both `start_local` and `end_local`.
 
 If you want to point at a specific motion-state file explicitly:
 

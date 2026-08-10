@@ -884,6 +884,65 @@ def timeline_bounds_utc(
     return min(starts_utc), max(ends_utc)
 
 
+def merge_intervals(
+    intervals: Iterable[tuple[dt.datetime, dt.datetime]],
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    normalized = sorted(
+        ((start, end) for start, end in intervals if end > start),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    if not normalized:
+        return []
+
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    current_start, current_end = normalized[0]
+    for start, end in normalized[1:]:
+        if start < current_end:
+            if end > current_end:
+                current_end = end
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def subtract_intervals(
+    start: dt.datetime,
+    end: dt.datetime,
+    exclusions: Iterable[tuple[dt.datetime, dt.datetime]],
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    if end <= start:
+        return []
+
+    remaining: list[tuple[dt.datetime, dt.datetime]] = [(start, end)]
+    for exclusion_start, exclusion_end in merge_intervals(exclusions):
+        next_remaining: list[tuple[dt.datetime, dt.datetime]] = []
+        for piece_start, piece_end in remaining:
+            if exclusion_end <= piece_start or exclusion_start >= piece_end:
+                next_remaining.append((piece_start, piece_end))
+                continue
+            if exclusion_start > piece_start:
+                next_remaining.append((piece_start, exclusion_start))
+            if exclusion_end < piece_end:
+                next_remaining.append((exclusion_end, piece_end))
+        remaining = next_remaining
+        if not remaining:
+            break
+    return [(piece_start, piece_end) for piece_start, piece_end in remaining if piece_end > piece_start]
+
+
+def video_quality_mask_intervals_utc(
+    global_events: Iterable[GlobalEvent],
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    intervals = [
+        (event.start_local.astimezone(UTC), event.end_local.astimezone(UTC))
+        for event in global_events
+        if is_video_quality_global_event(event)
+    ]
+    return merge_intervals(intervals)
+
+
 def get_point_event_style(event_name: str) -> tuple[str, float, str]:
     normalized = normalize_event_name(event_name)
 
@@ -1244,19 +1303,41 @@ def plot_recording_timeline(
     if x_min is not None and x_max is not None:
         configure_time_axis(ax_beh, x_min, x_max)
 
+    video_quality_masks_utc = video_quality_mask_intervals_utc(global_events)
+    if video_quality_masks_utc:
+        LOG.info(
+            "Applying %d video-quality visualization mask(s) to motion-derived states",
+            len(video_quality_masks_utc),
+        )
+    suppressed_motion_spans = 0
+    clipped_motion_spans = 0
     for state in motion_states:
         if state.animal_id not in behavior_index:
             continue
         y = behavior_index[state.animal_id]
-        left = mdates.date2num(to_plot_local(state.start_utc, timezone))
-        width = max((state.end_utc - state.start_utc).total_seconds() / 86400.0, 1e-9)
         color = MOTION_MOBILE_COLOR if state.state == "mobile" else MOTION_IMMOBILE_COLOR
-        ax_beh.broken_barh(
-            [(left, width)],
-            (y - 0.31, 0.62),
-            facecolors=color,
-            alpha=0.68,
-            zorder=1,
+        visible_segments = subtract_intervals(state.start_utc, state.end_utc, video_quality_masks_utc)
+        if not visible_segments:
+            suppressed_motion_spans += 1
+            continue
+        if len(visible_segments) != 1 or visible_segments[0] != (state.start_utc, state.end_utc):
+            clipped_motion_spans += 1
+        for segment_start_utc, segment_end_utc in visible_segments:
+            left = mdates.date2num(to_plot_local(segment_start_utc, timezone))
+            width = max((segment_end_utc - segment_start_utc).total_seconds() / 86400.0, 1e-9)
+            ax_beh.broken_barh(
+                [(left, width)],
+                (y - 0.31, 0.62),
+                facecolors=color,
+                alpha=0.68,
+                zorder=1,
+            )
+
+    if video_quality_masks_utc:
+        LOG.info(
+            "Suppressed %d motion state span(s) and clipped %d span(s) due to video-quality masks",
+            suppressed_motion_spans,
+            clipped_motion_spans,
         )
 
     for event in events:

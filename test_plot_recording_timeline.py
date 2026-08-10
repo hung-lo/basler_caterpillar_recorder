@@ -265,8 +265,10 @@ class TimelinePlotTests(unittest.TestCase):
         csv_text = (
             "animal_id,start_local,end_local,event,kind,approximate,notes\n"
             "All,2026-08-09 15:00:00,2026-08-09 15:10:00,video_quality_low,video_quality,TRUE,first\n"
+            "ALL,2026-08-09 15:12:00,2026-08-09 15:14:00,video_quality_low,video_quality,FALSE,third\n"
             "global,2026-08-09 15:20:00,2026-08-09 15:30:00,bad_lighting,video_quality,FALSE,second\n"
-            "*,2026-08-09 15:40:00,2026-08-09 15:50:00,lights_back_on,event,,third\n"
+            "GLOBAL,2026-08-09 15:32:00,2026-08-09 15:34:00,bad_lighting,video_quality,FALSE,fourth\n"
+            "*,2026-08-09 15:40:00,2026-08-09 15:50:00,lights_back_on,event,,fifth\n"
         )
 
         events, global_events = timeline.load_event_tables_from_text(
@@ -276,9 +278,14 @@ class TimelinePlotTests(unittest.TestCase):
         )
 
         self.assertEqual(events, [])
-        self.assertEqual(len(global_events), 3)
+        self.assertEqual(len(global_events), 5)
         self.assertTrue(global_events[0].approximate)
         self.assertFalse(global_events[1].approximate)
+
+    def test_is_global_event_alias_handles_all_supported_values(self) -> None:
+        for alias in ["All", "ALL", "all", "Global", "GLOBAL", "global", "*"]:
+            self.assertTrue(timeline.is_global_event_alias(alias))
+        self.assertFalse(timeline.is_global_event_alias("C01"))
 
     def test_global_interval_requires_end_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -514,6 +521,77 @@ class TimelinePlotTests(unittest.TestCase):
         styles = [timeline.global_event_band_style(event) for event in events]
         self.assertEqual(styles, [(timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA)] * 3)
 
+    def test_subtract_intervals_no_overlap_returns_original_interval(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 13, 0, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(timeline.subtract_intervals(start, end, exclusions), [(start, end)])
+
+    def test_subtract_intervals_full_coverage_returns_empty(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 9, 0, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(timeline.subtract_intervals(start, end, exclusions), [])
+
+    def test_subtract_intervals_clips_overlap_at_start(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 9, 30, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 10, 15, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(
+            timeline.subtract_intervals(start, end, exclusions),
+            [(dt.datetime(2026, 8, 9, 10, 15, 0, tzinfo=dt.timezone.utc), end)],
+        )
+
+    def test_subtract_intervals_clips_overlap_at_end(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 10, 45, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(
+            timeline.subtract_intervals(start, end, exclusions),
+            [(start, dt.datetime(2026, 8, 9, 10, 45, 0, tzinfo=dt.timezone.utc))],
+        )
+
+    def test_subtract_intervals_splits_middle_overlap(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 10, 20, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 10, 40, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(
+            timeline.subtract_intervals(start, end, exclusions),
+            [
+                (start, dt.datetime(2026, 8, 9, 10, 20, 0, tzinfo=dt.timezone.utc)),
+                (dt.datetime(2026, 8, 9, 10, 40, 0, tzinfo=dt.timezone.utc), end),
+            ],
+        )
+
+    def test_subtract_intervals_handles_multiple_masks(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [
+            (dt.datetime(2026, 8, 9, 10, 15, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 10, 30, 0, tzinfo=dt.timezone.utc)),
+            (dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 11, 15, 0, tzinfo=dt.timezone.utc)),
+        ]
+
+        self.assertEqual(
+            timeline.subtract_intervals(start, end, exclusions),
+            [
+                (start, dt.datetime(2026, 8, 9, 10, 15, 0, tzinfo=dt.timezone.utc)),
+                (dt.datetime(2026, 8, 9, 10, 30, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)),
+                (dt.datetime(2026, 8, 9, 11, 15, 0, tzinfo=dt.timezone.utc), end),
+            ],
+        )
+
+    def test_subtract_intervals_touching_boundary_does_not_clip(self) -> None:
+        start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        end = dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc)
+        exclusions = [(dt.datetime(2026, 8, 9, 11, 0, 0, tzinfo=dt.timezone.utc), dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc))]
+
+        self.assertEqual(timeline.subtract_intervals(start, end, exclusions), [(start, end)])
+
     def test_long_interval_does_not_create_point_marker(self) -> None:
         event = timeline.BehaviorEvent(
             animal_id="C01",
@@ -609,7 +687,7 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(mock_scatter.call_count, 1)
 
-    def test_motion_states_survive_global_quality_spans(self) -> None:
+    def test_motion_states_are_masked_inside_global_quality_spans(self) -> None:
         global_events = [
             timeline.GlobalEvent(
                 start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
@@ -623,13 +701,25 @@ class TimelinePlotTests(unittest.TestCase):
             timeline.MotionState(
                 animal_id="C01",
                 clip_key="clip_1",
-                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                start_utc=dt.datetime(2026, 8, 9, 18, 55, 0, tzinfo=dt.timezone.utc),
                 end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
                 state="mobile",
                 threshold=4.0,
                 threshold_source="manual",
                 mean_motion_energy=5.0,
                 peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C02",
+                clip_key="clip_2",
+                start_utc=dt.datetime(2026, 8, 9, 19, 10, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 20, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=1.5,
                 n_windows=300,
             )
         ]
@@ -646,7 +736,64 @@ class TimelinePlotTests(unittest.TestCase):
                 annotate_clips=False,
             )
 
-        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
+        state_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") in {timeline.MOTION_MOBILE_COLOR, timeline.MOTION_IMMOBILE_COLOR}
+        ]
+        self.assertEqual(len(state_calls), 1)
+        segments = state_calls[0].args[0]
+        self.assertEqual(len(segments), 1)
+        rendered_left, rendered_width = segments[0]
+        expected_left = timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 55, 0))
+        expected_width = 5 * 60 / 86400.0
+        self.assertAlmostEqual(rendered_left, expected_left)
+        self.assertAlmostEqual(rendered_width, expected_width)
+
+    def test_manual_duration_events_are_not_masked_by_global_quality_spans(self) -> None:
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            )
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C03",
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=events,
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                global_events=global_events,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        manual_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR
+        ]
+        self.assertEqual(len(manual_calls), 1)
+        rendered_left, rendered_width = manual_calls[0].args[0][0]
+        expected_left = timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 5, 0))
+        expected_width = 15 * 60 / 86400.0
+        self.assertAlmostEqual(rendered_left, expected_left)
+        self.assertAlmostEqual(rendered_width, expected_width)
 
     def test_load_motion_states_parses_mobile_and_immobile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
