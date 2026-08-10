@@ -48,6 +48,8 @@ DEFAULT_POINT_MARKER_SIZE = 70
 SHED_MARKER_SIZE = 100
 STIM_MARKER_SIZE = 180
 DEATH_MARKER_SIZE = 120
+MOTION_IMMOBILE_COLOR = "#d4d4d8"
+MOTION_MOBILE_COLOR = "#86a87a"
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -102,6 +104,20 @@ class BehaviorEvent:
     event: str
     kind: str
     notes: str
+
+
+@dataclasses.dataclass(frozen=True)
+class MotionState:
+    animal_id: str
+    clip_key: str
+    start_utc: dt.datetime
+    end_utc: dt.datetime
+    state: str
+    threshold: float
+    threshold_source: str
+    mean_motion_energy: float
+    peak_motion_energy: float
+    n_windows: int
 
 
 def utc_from_ns(value_ns: int) -> dt.datetime:
@@ -376,6 +392,44 @@ def load_behavior_events(path: Optional[Path], tz: dt.tzinfo) -> list[BehaviorEv
     return events
 
 
+def load_motion_states(path: Optional[Path]) -> list[MotionState]:
+    if path is None or not path.exists():
+        return []
+
+    states: list[MotionState] = []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                if not animal_id:
+                    raise ValueError("missing animal_id")
+                state_name = str(row.get("state") or "").strip().lower()
+                if state_name not in {"mobile", "immobile"}:
+                    raise ValueError(f"invalid state {state_name!r}")
+                start_utc = parse_utc_value(row.get("start_utc"))
+                end_utc = parse_utc_value(row.get("end_utc"))
+                if end_utc <= start_utc:
+                    raise ValueError("end_utc must be after start_utc")
+                states.append(
+                    MotionState(
+                        animal_id=animal_id,
+                        clip_key=str(row.get("clip_key") or "").strip(),
+                        start_utc=start_utc,
+                        end_utc=end_utc,
+                        state=state_name,
+                        threshold=float(str(row.get("threshold") or "").strip()),
+                        threshold_source=str(row.get("threshold_source") or "").strip() or "manual",
+                        mean_motion_energy=float(str(row.get("mean_motion_energy") or "").strip()),
+                        peak_motion_energy=float(str(row.get("peak_motion_energy") or "").strip()),
+                        n_windows=int(str(row.get("n_windows") or "").strip()),
+                    )
+                )
+            except Exception as exc:
+                LOG.warning("Skipping malformed motion state row %d in %s: %s", row_index, path, exc)
+    return states
+
+
 def infer_animals(events: Iterable[BehaviorEvent]) -> list[str]:
     animals: list[str] = []
     seen: set[str] = set()
@@ -423,8 +477,27 @@ def event_bar_color(event: BehaviorEvent) -> str:
     return INTERVAL_BAR_COLOR
 
 
-def semantic_legend_handles() -> list[Line2D | Patch]:
-    return [
+def semantic_legend_handles(*, include_motion_states: bool) -> list[Line2D | Patch]:
+    handles: list[Line2D | Patch] = []
+    if include_motion_states:
+        handles.extend(
+            [
+                Patch(
+                    facecolor=MOTION_IMMOBILE_COLOR,
+                    alpha=0.62,
+                    edgecolor="none",
+                    label="Motion-derived immobile",
+                ),
+                Patch(
+                    facecolor=MOTION_MOBILE_COLOR,
+                    alpha=0.62,
+                    edgecolor="none",
+                    label="Motion-derived mobile",
+                ),
+            ]
+        )
+    handles.extend(
+        [
         Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Duration / state"),
         Line2D(
             [0],
@@ -470,12 +543,15 @@ def semantic_legend_handles() -> list[Line2D | Patch]:
             markeredgewidth=0.6,
             label="Other point event",
         ),
-    ]
+        ]
+    )
+    return handles
 
 
 def plot_recording_timeline(
     clips: list[RecordingClip],
     events: list[BehaviorEvent],
+    motion_states: list[MotionState],
     animals: list[str],
     *,
     timezone: dt.tzinfo,
@@ -501,9 +577,14 @@ def plot_recording_timeline(
 
     behavior_rows = list(ANIMAL_ORDER)
     behavior_index = {animal: index for index, animal in enumerate(behavior_rows)}
-    unknown_animals = sorted({event.animal_id for event in events if event.animal_id not in behavior_index})
+    unknown_animals = sorted(
+        {
+            *(event.animal_id for event in events if event.animal_id not in behavior_index),
+            *(state.animal_id for state in motion_states if state.animal_id not in behavior_index),
+        }
+    )
     for animal_id in unknown_animals:
-        LOG.warning("Skipping behavior event for unknown animal ID: %s", animal_id)
+        LOG.warning("Skipping timeline row for unknown animal ID: %s", animal_id)
 
     fig_height = 7.6
     fig = plt.figure(figsize=(18, fig_height), constrained_layout=False)
@@ -584,6 +665,10 @@ def plot_recording_timeline(
         if event.animal_id in behavior_index:
             plot_starts.append(event.start_local.replace(tzinfo=None))
             plot_ends.append(event.end_local.replace(tzinfo=None))
+    for state in motion_states:
+        if state.animal_id in behavior_index:
+            plot_starts.append(to_plot_local(state.start_utc, timezone))
+            plot_ends.append(to_plot_local(state.end_utc, timezone))
     if plot_starts and plot_ends:
         x_min = min(plot_starts)
         x_max = max(plot_ends)
@@ -594,7 +679,10 @@ def plot_recording_timeline(
     ax_cov.set_title("Recording coverage", loc="left", fontsize=11, color="#0f172a", pad=8)
     ax_cov.tick_params(axis="x", labelbottom=False)
 
-    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=18)
+    behavior_title = "Behavior annotations"
+    if motion_states:
+        behavior_title = "Behavior annotations and motion-derived states"
+    ax_beh.set_title(behavior_title, loc="left", fontsize=11, color="#0f172a", pad=18)
     ax_beh.set_yticks(range(len(behavior_rows)))
     ax_beh.set_yticklabels(behavior_rows)
     ax_beh.set_ylabel("Animal")
@@ -610,6 +698,21 @@ def plot_recording_timeline(
     ax_beh.xaxis.set_major_locator(locator)
     ax_beh.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
 
+    for state in motion_states:
+        if state.animal_id not in behavior_index:
+            continue
+        y = behavior_index[state.animal_id]
+        left = mdates.date2num(to_plot_local(state.start_utc, timezone))
+        width = max((state.end_utc - state.start_utc).total_seconds() / 86400.0, 1e-9)
+        color = MOTION_MOBILE_COLOR if state.state == "mobile" else MOTION_IMMOBILE_COLOR
+        ax_beh.broken_barh(
+            [(left, width)],
+            (y - 0.28, 0.56),
+            facecolors=color,
+            alpha=0.62,
+            zorder=1,
+        )
+
     for event in events:
         if event.animal_id not in behavior_index:
             continue
@@ -620,7 +723,7 @@ def plot_recording_timeline(
         color = event_bar_color(event)
         ax_beh.broken_barh(
             [(left, width)],
-            (y - 0.33, 0.66),
+            (y - 0.18, 0.36),
             facecolors=color,
             alpha=0.74,
             zorder=2,
@@ -639,10 +742,10 @@ def plot_recording_timeline(
             )
 
     ax_beh.legend(
-        handles=semantic_legend_handles(),
+        handles=semantic_legend_handles(include_motion_states=bool(motion_states)),
         loc="lower left",
         bbox_to_anchor=(0.0, 1.01),
-        ncol=5,
+        ncol=4 if motion_states else 5,
         frameon=False,
         fontsize=8,
         handlelength=1.3,
@@ -684,6 +787,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to behavior_events.csv (defaults to <root>/behavior_events.csv when present).",
     )
     parser.add_argument(
+        "--motion-states",
+        type=Path,
+        help=(
+            "Path to motion_states.csv. Defaults to "
+            "<root>/cropped_by_caterpillar/motion_energy/motion_states.csv when present."
+        ),
+    )
+    parser.add_argument(
+        "--no-motion-states",
+        action="store_true",
+        help="Disable automatic motion_states.csv loading.",
+    )
+    parser.add_argument(
         "--timezone",
         default=DEFAULT_TIMEZONE,
         help=f"Timezone used for local display labels (default: {DEFAULT_TIMEZONE}).",
@@ -721,6 +837,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     root = Path(args.root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         parser.error(f"root must be an existing directory: {root}")
+    if args.motion_states is not None and args.no_motion_states:
+        parser.error("--motion-states and --no-motion-states cannot be used together")
 
     local_tz = load_timezone(args.timezone)
     clips, warnings = collect_recording_clips(root)
@@ -734,6 +852,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         default_events = root / "behavior_events.csv"
         events_path = default_events if default_events.exists() else None
     events = load_behavior_events(events_path, local_tz)
+    motion_states_path: Optional[Path] = None
+    if not args.no_motion_states:
+        if args.motion_states is not None:
+            motion_states_path = args.motion_states
+            if not motion_states_path.exists():
+                parser.error(f"motion states file does not exist: {motion_states_path}")
+        else:
+            auto_motion_states = root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
+            motion_states_path = auto_motion_states if auto_motion_states.exists() else None
+    motion_states = load_motion_states(motion_states_path)
 
     animals = args.animals if args.animals else (infer_animals(events) or DEFAULT_ANIMALS)
     if not clips:
@@ -742,6 +870,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     plot_recording_timeline(
         clips,
         events,
+        motion_states,
         animals,
         timezone=local_tz,
         output_path=output_png,

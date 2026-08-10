@@ -21,7 +21,9 @@ If you use a different camera, copy a YAML template and update the model, serial
 
 - `record_basler.py` is the main CLI for listing cameras, previewing, dry runs, and scheduled recording.
 - `validate_session.py` checks clip structure, JSON sidecars, timing, and archive state.
-- `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars and `behavior_events.csv`.
+- `prepare_cropped_timestamps.py` copies one authoritative timestamp sidecar per raw source clip into `cropped_by_caterpillar/timestamps/` and writes `crop_manifest.csv`.
+- `extract_motion_energy.py` builds cached per-crop motion traces, editable thresholds, diagnostics, and `motion_states.csv`.
+- `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars, `behavior_events.csv`, and optional motion states.
 - `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
 - `config_smoke_test.yaml` is a short local test.
 - `config_multiclip_smoke_test.yaml` is a short repeated-clip test.
@@ -32,6 +34,84 @@ If you use a different camera, copy a YAML template and update the model, serial
 - `QUICKSTART.md` is the short daily checklist after setup is already complete.
 
 The tracked YAML files are templates. Copy one to a local file such as `config_local_macos.yaml` or `config_local_windows.yaml` before you edit it. Git ignores `config_local*.yaml`.
+
+## Quick motion-energy analysis for cropped caterpillar videos
+
+This workflow adds a fast motion-derived mobile/immobile proxy while pose estimation is still pending. It is useful for quick inspection, but it is not ground-truth behavior classification.
+
+Important guardrails:
+
+- raw per-frame timestamp sidecars remain the authoritative scientific time source;
+- the flat `cropped_by_caterpillar/*.mp4` layout stays unchanged;
+- one copied timestamp file is shared by all C01-C08 crops from the same raw source clip;
+- only explicit `motion_states.csv` intervals are rendered as motion-derived mobile or immobile; unfilled time stays unknown.
+
+Typical workflow on Windows:
+
+```powershell
+python prepare_cropped_timestamps.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08"
+```
+
+This creates:
+
+```text
+cropped_by_caterpillar/
+    crop_manifest.csv
+    timestamps/
+```
+
+Smoke-test one animal and a couple of clips first:
+
+```powershell
+python extract_motion_energy.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --animals C01 `
+  --limit-clips 2
+```
+
+Then run the full motion extraction:
+
+```powershell
+python extract_motion_energy.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08"
+```
+
+This writes:
+
+```text
+cropped_by_caterpillar/motion_energy/
+    traces/
+    motion_thresholds.csv
+    motion_summary.csv
+    motion_states.csv
+    motion_energy_diagnostics.png
+```
+
+If you want to tune thresholds, edit only the `threshold` values in `motion_thresholds.csv`, then regenerate states without decoding video again:
+
+```powershell
+python extract_motion_energy.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --classify-only
+```
+
+`plot_recording_timeline.py` now auto-detects `cropped_by_caterpillar/motion_energy/motion_states.csv` when it exists, so this is usually enough:
+
+```powershell
+python plot_recording_timeline.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\animal_event_log.csv"
+```
+
+If you want to point at a specific motion-state file explicitly:
+
+```powershell
+python plot_recording_timeline.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\animal_event_log.csv" `
+  --motion-states "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_states.csv"
+```
 
 ## New computer workflow
 

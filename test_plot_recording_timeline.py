@@ -19,6 +19,7 @@ class TimelinePlotTests(unittest.TestCase):
         *,
         clips: list[timeline.RecordingClip],
         events: list[timeline.BehaviorEvent],
+        motion_states: list[timeline.MotionState] | None = None,
         animals: list[str] | None = None,
     ):
         captured: dict[str, object] = {}
@@ -31,6 +32,7 @@ class TimelinePlotTests(unittest.TestCase):
                 timeline.plot_recording_timeline(
                     clips=clips,
                     events=events,
+                    motion_states=motion_states or [],
                     animals=animals or timeline.ANIMAL_ORDER,
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                     output_path=Path("ignored.png"),
@@ -87,6 +89,29 @@ class TimelinePlotTests(unittest.TestCase):
                         ]
                     )
         return timestamp_path, video_path
+
+    def write_motion_states_csv(self, path: Path, rows: list[list[object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "animal_id",
+                    "clip_key",
+                    "start_utc",
+                    "end_utc",
+                    "start_local",
+                    "end_local",
+                    "state",
+                    "threshold",
+                    "threshold_source",
+                    "mean_motion_energy",
+                    "peak_motion_energy",
+                    "n_windows",
+                ]
+            )
+            for row in rows:
+                writer.writerow(row)
 
     def test_extracts_timestamp_stats_from_gzip_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +309,7 @@ class TimelinePlotTests(unittest.TestCase):
                 timeline.plot_recording_timeline(
                     clips=[],
                     events=events,
+                    motion_states=[],
                     animals=timeline.ANIMAL_ORDER,
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                     output_path=output_png,
@@ -398,6 +424,7 @@ class TimelinePlotTests(unittest.TestCase):
                 timeline.plot_recording_timeline(
                     clips=[],
                     events=[event],
+                    motion_states=[],
                     animals=timeline.ANIMAL_ORDER,
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                     output_path=Path("ignored.png"),
@@ -406,6 +433,196 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(mock_scatter.call_count, 0)
         self.assertGreaterEqual(mock_broken_barh.call_count, 1)
+
+    def test_load_motion_states_parses_mobile_and_immobile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            motion_path = root / "motion_states.csv"
+            self.write_motion_states_csv(
+                motion_path,
+                [
+                    [
+                        "C01",
+                        "clip_a",
+                        "2026-08-09T19:00:00Z",
+                        "2026-08-09T19:00:10Z",
+                        "2026-08-09 15:00:00-04:00",
+                        "2026-08-09 15:00:10-04:00",
+                        "mobile",
+                        4.5,
+                        "manual",
+                        5.1,
+                        8.3,
+                        10,
+                    ],
+                    [
+                        "C02",
+                        "clip_b",
+                        "2026-08-09T19:10:00Z",
+                        "2026-08-09T19:10:10Z",
+                        "2026-08-09 15:10:00-04:00",
+                        "2026-08-09 15:10:10-04:00",
+                        "immobile",
+                        4.5,
+                        "manual",
+                        1.1,
+                        1.8,
+                        10,
+                    ],
+                ],
+            )
+
+            states = timeline.load_motion_states(motion_path)
+
+            self.assertEqual([state.state for state in states], ["mobile", "immobile"])
+            self.assertEqual([state.animal_id for state in states], ["C01", "C02"])
+
+    def test_motion_states_keep_canonical_row_order(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C08",
+                clip_key="clip_8",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 1, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=60,
+            ),
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 18, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 18, 1, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=1.5,
+                n_windows=60,
+            ),
+        ]
+
+        fig = self.capture_timeline_figure(clips=[], events=[], motion_states=motion_states)
+        ax_beh = fig.axes[1]
+
+        self.assertEqual(
+            [tick.get_text() for tick in ax_beh.get_yticklabels()],
+            timeline.ANIMAL_ORDER,
+        )
+
+    def test_manual_event_overlay_survives_motion_state_background(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            )
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 1, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 1, 1),
+                event="shed",
+                kind="event",
+                notes="",
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=events,
+                motion_states=motion_states,
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        self.assertEqual(mock_scatter.call_count, 1)
+
+    def test_main_auto_detects_motion_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            motion_path = root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
+            self.write_motion_states_csv(
+                motion_path,
+                [
+                    [
+                        "C01",
+                        "clip_a",
+                        "2026-08-09T19:00:00Z",
+                        "2026-08-09T19:00:05Z",
+                        "2026-08-09 15:00:00-04:00",
+                        "2026-08-09 15:00:05-04:00",
+                        "mobile",
+                        4.5,
+                        "manual",
+                        5.1,
+                        8.3,
+                        5,
+                    ]
+                ],
+            )
+
+            with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                timeline.main([str(root)])
+
+            self.assertEqual(len(mock_plot.call_args.args[2]), 1)
+
+    def test_no_motion_states_disables_auto_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            motion_path = root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
+            self.write_motion_states_csv(
+                motion_path,
+                [
+                    [
+                        "C01",
+                        "clip_a",
+                        "2026-08-09T19:00:00Z",
+                        "2026-08-09T19:00:05Z",
+                        "2026-08-09 15:00:00-04:00",
+                        "2026-08-09 15:00:05-04:00",
+                        "mobile",
+                        4.5,
+                        "manual",
+                        5.1,
+                        8.3,
+                        5,
+                    ]
+                ],
+            )
+
+            with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                timeline.main([str(root), "--no-motion-states"])
+
+            self.assertEqual(mock_plot.call_args.args[2], [])
 
 
 if __name__ == "__main__":
