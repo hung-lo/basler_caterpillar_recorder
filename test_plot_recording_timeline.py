@@ -5,15 +5,30 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import gzip
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib import error as urllib_error
 from unittest import mock
 
 import plot_recording_timeline as timeline
 
 
 class TimelinePlotTests(unittest.TestCase):
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     def capture_timeline_figure(
         self,
         *,
@@ -42,6 +57,9 @@ class TimelinePlotTests(unittest.TestCase):
         fig = captured["fig"]
         self.addCleanup(timeline.plt.close, fig)
         return fig
+
+    def behavior_axis(self, fig):
+        return fig.axes[-1]
 
     def write_timestamp_clip(
         self,
@@ -353,7 +371,7 @@ class TimelinePlotTests(unittest.TestCase):
         ]
 
         fig = self.capture_timeline_figure(clips=[], events=events, animals=["C08", "C01", "C06"])
-        ax_beh = fig.axes[1]
+        ax_beh = self.behavior_axis(fig)
 
         self.assertEqual(
             [tick.get_text() for tick in ax_beh.get_yticklabels()],
@@ -381,7 +399,7 @@ class TimelinePlotTests(unittest.TestCase):
         ]
 
         fig = self.capture_timeline_figure(clips=[], events=events)
-        ax_beh = fig.axes[1]
+        ax_beh = self.behavior_axis(fig)
 
         self.assertEqual(
             [tick.get_text() for tick in ax_beh.get_yticklabels()],
@@ -506,7 +524,7 @@ class TimelinePlotTests(unittest.TestCase):
         ]
 
         fig = self.capture_timeline_figure(clips=[], events=[], motion_states=motion_states)
-        ax_beh = fig.axes[1]
+        ax_beh = self.behavior_axis(fig)
 
         self.assertEqual(
             [tick.get_text() for tick in ax_beh.get_yticklabels()],
@@ -551,6 +569,122 @@ class TimelinePlotTests(unittest.TestCase):
             )
 
         self.assertEqual(mock_scatter.call_count, 1)
+
+    def test_plot_uses_dedicated_legend_axis(self) -> None:
+        fig = self.capture_timeline_figure(clips=[], events=[], motion_states=[])
+
+        self.assertEqual(len(fig.axes), 3)
+
+    def test_major_tick_interval_prefers_twelve_hours_for_four_day_span(self) -> None:
+        start = dt.datetime(2026, 8, 7, 0, 0, 0)
+        end = dt.datetime(2026, 8, 11, 0, 0, 0)
+
+        self.assertEqual(timeline.major_tick_interval_hours(start, end), 12)
+
+    def test_parse_google_sheet_url_extracts_sheet_id_and_gid(self) -> None:
+        source = timeline.parse_google_sheet_url(
+            "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+        )
+
+        self.assertEqual(source.sheet_id, "1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w")
+        self.assertEqual(source.gid, "1696022641")
+        self.assertEqual(
+            source.export_url,
+            "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/export?format=csv&gid=1696022641",
+        )
+
+    def test_parse_google_sheet_url_uses_fragment_gid_when_needed(self) -> None:
+        source = timeline.parse_google_sheet_url(
+            "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit#gid=1696022641"
+        )
+
+        self.assertEqual(source.gid, "1696022641")
+
+    def test_parse_google_sheet_export_url_is_supported(self) -> None:
+        source = timeline.parse_google_sheet_url(
+            "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/export?format=csv&gid=1696022641"
+        )
+
+        self.assertEqual(source.gid, "1696022641")
+
+    def test_non_google_remote_event_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with self.assertRaises(ValueError):
+                timeline.load_behavior_events_source(
+                    "https://example.com/events.csv",
+                    root=root,
+                    tz=dt.timezone(dt.timedelta(hours=-4)),
+                )
+
+    def test_google_sheet_source_is_fetched_and_snapshotted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+            csv_bytes = (
+                "animal_id,start_local,end_local,event,kind,approximate,notes\n"
+                "C06,2026-08-07T14:32:00-04:00,,shed,development,FALSE,Shed observed\n"
+                "C01,2026-08-09T13:37:00-04:00,2026-08-09T13:37:10-04:00,electrical_stimulation,stimulus,FALSE,50 uA\n"
+            ).encode("utf-8")
+
+            with mock.patch(
+                "plot_recording_timeline.urllib_request.urlopen",
+                return_value=self.FakeHTTPResponse(csv_bytes),
+            ):
+                with mock.patch.object(timeline, "plot_recording_timeline") as mock_plot:
+                    rc = timeline.main([str(root), "--events", url])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(mock_plot.call_args.args[1]), 2)
+            self.assertEqual((root / "behavior_events_used.csv").read_bytes(), csv_bytes)
+            metadata = json.loads((root / "behavior_events_source.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["source_type"], "google_sheet")
+            self.assertEqual(metadata["gid"], "1696022641")
+            self.assertEqual(metadata["rows"], 2)
+
+    def test_google_sheet_html_response_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+
+            with mock.patch(
+                "plot_recording_timeline.urllib_request.urlopen",
+                return_value=self.FakeHTTPResponse(b"<!DOCTYPE html><html><body>login</body></html>"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    timeline.load_behavior_events_source(
+                        url,
+                        root=root,
+                        tz=dt.timezone(dt.timedelta(hours=-4)),
+                    )
+
+    def test_google_sheet_network_failure_returns_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+
+            with mock.patch(
+                "plot_recording_timeline.urllib_request.urlopen",
+                side_effect=urllib_error.URLError("offline"),
+            ):
+                rc = timeline.main([str(root), "--events", url])
+
+            self.assertEqual(rc, 1)
 
     def test_main_auto_detects_motion_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -508,6 +508,30 @@ class ExtractMotionEnergyTests(unittest.TestCase):
             self.assertEqual(len([state for state in states if state.animal_id == "C01"]), 2)
             self.assertEqual({state.clip_key for state in states if state.animal_id == "C01"}, {"clip_a", "clip_b"})
 
+    def test_progress_line_includes_clip_percent_and_status(self) -> None:
+        entry = motion.ManifestEntry(
+            animal_id="C03",
+            clip_key="clip_0007",
+            cropped_video=Path("cropped_by_caterpillar/C03_clip_0007.mp4"),
+            timestamp_file=Path("cropped_by_caterpillar/timestamps/clip_0007.timestamps.csv.gz"),
+        )
+
+        line = motion.build_progress_line(
+            clip_index=2,
+            total_clips=5,
+            entry=entry,
+            decoded_frames=50,
+            total_frames=100,
+            sample_windows=12,
+            status="processing",
+        )
+
+        self.assertIn("clip 2/5", line)
+        self.assertIn("50.0%", line)
+        self.assertIn("C03 clip_0007", line)
+        self.assertIn("12 windows", line)
+        self.assertIn("processing", line)
+
 
 if __name__ == "__main__":
     unittest.main()

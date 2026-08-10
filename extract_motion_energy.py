@@ -10,10 +10,12 @@ import gzip
 import logging
 import math
 import os
+import sys
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
 MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
@@ -103,6 +105,8 @@ DEFAULT_MERGE_GAP_S = 2.0
 DEFAULT_MIN_MOBILE_S = 1.0
 CONTIGUITY_TOLERANCE_SECONDS = 0.5
 DISPLAY_MAX_POINTS = 1500
+PROGRESS_BAR_WIDTH = 28
+PROGRESS_UPDATE_SECONDS = 0.25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,6 +197,115 @@ class _StateAccumulator:
             peak_motion_energy=self.peak_motion,
             n_windows=self.n_windows,
         )
+
+
+def format_progress_bar(completed: int, total: int, *, width: int = PROGRESS_BAR_WIDTH) -> str:
+    if total <= 0:
+        fraction = 0.0
+    else:
+        fraction = min(max(completed / total, 0.0), 1.0)
+    filled = min(width, int(round(width * fraction)))
+    return f"[{'#' * filled}{'-' * (width - filled)}] {fraction * 100:5.1f}%"
+
+
+def build_progress_line(
+    *,
+    clip_index: int,
+    total_clips: int,
+    entry: ManifestEntry,
+    decoded_frames: int,
+    total_frames: int,
+    sample_windows: int,
+    status: str,
+) -> str:
+    bar = format_progress_bar(decoded_frames, total_frames)
+    return (
+        f"{bar} clip {clip_index}/{total_clips} "
+        f"{entry.animal_id} {entry.clip_key} "
+        f"{decoded_frames}/{total_frames} frames "
+        f"{sample_windows} windows "
+        f"{status}"
+    )
+
+
+@dataclasses.dataclass
+class ProgressReporter:
+    total_clips: int
+    enabled: bool = dataclasses.field(default_factory=lambda: sys.stderr.isatty())
+    stream: TextIO = dataclasses.field(default_factory=lambda: sys.stderr)
+    update_interval_s: float = PROGRESS_UPDATE_SECONDS
+    current_clip_index: int = 0
+    current_entry: Optional[ManifestEntry] = None
+    current_total_frames: int = 0
+    last_render_time: float = 0.0
+
+    def start_clip(self, clip_index: int, entry: ManifestEntry, total_frames: int) -> None:
+        self.current_clip_index = clip_index
+        self.current_entry = entry
+        self.current_total_frames = max(total_frames, 0)
+        self.last_render_time = 0.0
+        LOG.info(
+            "Processing clip %d/%d: %s %s (%d timestamp rows)",
+            clip_index,
+            self.total_clips,
+            entry.animal_id,
+            entry.clip_key,
+            total_frames,
+        )
+        self.update(decoded_frames=0, sample_windows=0, status="starting", force=True)
+
+    def update(
+        self,
+        *,
+        decoded_frames: int,
+        sample_windows: int,
+        status: str,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled or self.current_entry is None:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_render_time < self.update_interval_s:
+            return
+        line = build_progress_line(
+            clip_index=self.current_clip_index,
+            total_clips=self.total_clips,
+            entry=self.current_entry,
+            decoded_frames=decoded_frames,
+            total_frames=self.current_total_frames,
+            sample_windows=sample_windows,
+            status=status,
+        )
+        self.stream.write(f"\r{line}")
+        self.stream.flush()
+        self.last_render_time = now
+
+    def finish_clip(
+        self,
+        *,
+        decoded_frames: int,
+        sample_windows: int,
+        status: str,
+    ) -> None:
+        if self.current_entry is not None:
+            LOG.info(
+                "Finished clip %d/%d: %s %s -> %s (%d windows)",
+                self.current_clip_index,
+                self.total_clips,
+                self.current_entry.animal_id,
+                self.current_entry.clip_key,
+                status,
+                sample_windows,
+            )
+        self.update(
+            decoded_frames=decoded_frames,
+            sample_windows=sample_windows,
+            status=status,
+            force=True,
+        )
+        if self.enabled:
+            self.stream.write("\n")
+            self.stream.flush()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -460,19 +573,29 @@ def extract_trace_for_entry(
     root: Path,
     entry: ManifestEntry,
     *,
+    clip_index: int,
     timezone: dt.tzinfo,
     sample_hz: float,
     motion_width: int,
     motion_height: int,
     top_fraction: float,
     force: bool,
+    progress_reporter: Optional[ProgressReporter] = None,
 ) -> ExtractionResult:
     trace_path = trace_path_for_entry(root, entry)
     timestamps = load_timestamp_series(entry.timestamp_file)
     timestamp_rows = len(timestamps)
+    if progress_reporter is not None:
+        progress_reporter.start_clip(clip_index, entry, timestamp_rows)
 
     if valid_cached_trace(trace_path, entry) and not force:
         sample_windows = len(load_motion_trace_rows(trace_path))
+        if progress_reporter is not None:
+            progress_reporter.finish_clip(
+                decoded_frames=timestamp_rows,
+                sample_windows=sample_windows,
+                status="cached",
+            )
         return ExtractionResult(
             trace_path=trace_path,
             status="cached",
@@ -483,6 +606,12 @@ def extract_trace_for_entry(
 
     capture = cv2.VideoCapture(str(entry.cropped_video))
     if not capture.isOpened():
+        if progress_reporter is not None:
+            progress_reporter.finish_clip(
+                decoded_frames=0,
+                sample_windows=0,
+                status="failed",
+            )
         return ExtractionResult(
             trace_path=trace_path,
             status="failed",
@@ -540,10 +669,22 @@ def extract_trace_for_entry(
                 next_sample_utc = current_timestamp + sample_period
 
             decoded_frames += 1
+            if progress_reporter is not None:
+                progress_reporter.update(
+                    decoded_frames=decoded_frames,
+                    sample_windows=len(trace_rows),
+                    status="processing",
+                )
     finally:
         capture.release()
 
     if decoded_frames != timestamp_rows:
+        if progress_reporter is not None:
+            progress_reporter.finish_clip(
+                decoded_frames=decoded_frames,
+                sample_windows=len(trace_rows),
+                status="frame_mismatch",
+            )
         return ExtractionResult(
             trace_path=trace_path,
             status="frame_mismatch",
@@ -561,6 +702,12 @@ def extract_trace_for_entry(
         TRACE_FIELDS,
         trace_rows_to_dicts(trace_rows, timezone=timezone),
     )
+    if progress_reporter is not None:
+        progress_reporter.finish_clip(
+            decoded_frames=decoded_frames,
+            sample_windows=len(trace_rows),
+            status="computed",
+        )
     return ExtractionResult(
         trace_path=trace_path,
         status="computed",
@@ -1004,16 +1151,19 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     summary_rows: list[dict[str, str]] = []
     if not args.classify_only:
-        for entry in entries:
+        progress_reporter = ProgressReporter(total_clips=len(entries))
+        for clip_index, entry in enumerate(entries, start=1):
             result = extract_trace_for_entry(
                 root,
                 entry,
+                clip_index=clip_index,
                 timezone=timezone,
                 sample_hz=args.sample_hz,
                 motion_width=args.motion_width,
                 motion_height=args.motion_height,
                 top_fraction=args.top_fraction,
                 force=args.force,
+                progress_reporter=progress_reporter,
             )
             if result.error:
                 LOG.error(result.error)
@@ -1022,6 +1172,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         LOG.info("Wrote motion summary: %s", summary_path)
 
     trace_rows_by_animal = load_trace_rows_for_entries(root, entries)
+    LOG.info("Loaded cached motion traces for %d manifest entr%s", len(entries), "y" if len(entries) == 1 else "ies")
     auto_thresholds = compute_auto_thresholds(trace_rows_by_animal)
     thresholds = merge_thresholds(
         auto_thresholds=auto_thresholds,
@@ -1033,9 +1184,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         write_thresholds(thresholds_path, thresholds)
     LOG.info("Wrote or reused thresholds: %s", thresholds_path)
 
+    LOG.info("Rendering motion-energy diagnostics...")
     write_motion_diagnostics(diagnostics_path, trace_rows_by_animal, thresholds, timezone)
     LOG.info("Wrote diagnostics PNG: %s", diagnostics_path)
 
+    LOG.info("Classifying motion-derived states...")
     all_states: list[MotionState] = []
     for animal_id in ANIMAL_ORDER:
         all_states.extend(

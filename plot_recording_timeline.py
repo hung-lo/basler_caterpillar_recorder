@@ -7,12 +7,18 @@ import csv
 import dataclasses
 import datetime as dt
 import gzip
+import hashlib
+import io
+import json
 import logging
 import os
 import tempfile
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
@@ -48,8 +54,16 @@ DEFAULT_POINT_MARKER_SIZE = 70
 SHED_MARKER_SIZE = 100
 STIM_MARKER_SIZE = 180
 DEATH_MARKER_SIZE = 120
-MOTION_IMMOBILE_COLOR = "#d4d4d8"
-MOTION_MOBILE_COLOR = "#86a87a"
+MOTION_IMMOBILE_COLOR = "#bdbdbd"
+MOTION_MOBILE_COLOR = "#59a14f"
+RECORDING_COLOR = "#4c78a8"
+GAP_SHADE_COLOR = "#efefef"
+ROW_SEPARATOR_COLOR = "#e5e7eb"
+MAJOR_GAP_MIN_SECONDS = 5 * 60
+MAX_MAJOR_GAP_LABELS = 6
+GOOGLE_SHEETS_HOST = "docs.google.com"
+GOOGLE_SHEETS_TIMEOUT_SECONDS = 30
+GOOGLE_SHEETS_USER_AGENT = "basler-caterpillar-recorder/1.0"
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -73,7 +87,6 @@ STIM_COLOR = "#dc2626"
 DEATH_COLOR = "#111827"
 DEFAULT_POINT_COLOR = "#475569"
 INTERVAL_BAR_COLOR = "#8aa1c7"
-ROW_BAND_COLOR = "#f8fafc"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +131,14 @@ class MotionState:
     mean_motion_energy: float
     peak_motion_energy: float
     n_windows: int
+
+
+@dataclasses.dataclass(frozen=True)
+class GoogleSheetSource:
+    source_url: str
+    sheet_id: str
+    gid: str
+    export_url: str
 
 
 def utc_from_ns(value_ns: int) -> dt.datetime:
@@ -233,6 +254,164 @@ def format_utc(value_utc: dt.datetime) -> str:
 
 def format_local(value_utc: dt.datetime, tz: dt.tzinfo) -> str:
     return value_utc.astimezone(tz).isoformat(sep=" ", timespec="microseconds")
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_bytes(data)
+    temp_path.replace(path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def parse_google_sheet_url(value: str) -> GoogleSheetSource:
+    parsed = urllib_parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Google Sheet URL must start with http:// or https://")
+    if parsed.netloc.lower() != GOOGLE_SHEETS_HOST:
+        raise ValueError("Only supported Google Sheets URLs from docs.google.com are accepted")
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 3 or path_parts[0] != "spreadsheets" or path_parts[1] != "d":
+        raise ValueError("Unsupported Google Sheets URL format")
+    sheet_id = path_parts[2].strip()
+    if not sheet_id:
+        raise ValueError("Google Sheets URL is missing a sheet ID")
+
+    query = urllib_parse.parse_qs(parsed.query)
+    fragment = urllib_parse.parse_qs(parsed.fragment)
+    gid = (
+        (query.get("gid") or [None])[0]
+        or (fragment.get("gid") or [None])[0]
+        or "0"
+    )
+    if gid == "0":
+        LOG.warning("Google Sheets URL did not include a tab gid; defaulting to gid=0")
+
+    export_query = urllib_parse.urlencode({"format": "csv", "gid": gid})
+    export_url = f"https://{GOOGLE_SHEETS_HOST}/spreadsheets/d/{sheet_id}/export?{export_query}"
+    return GoogleSheetSource(
+        source_url=value,
+        sheet_id=sheet_id,
+        gid=gid,
+        export_url=export_url,
+    )
+
+
+def looks_like_html_document(text: str) -> bool:
+    prefix = text.lstrip()[:256].lower()
+    return prefix.startswith("<!doctype html") or prefix.startswith("<html")
+
+
+def fetch_google_sheet_csv(source: GoogleSheetSource) -> bytes:
+    request = urllib_request.Request(
+        source.export_url,
+        headers={"User-Agent": GOOGLE_SHEETS_USER_AGENT},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=GOOGLE_SHEETS_TIMEOUT_SECONDS) as response:
+            csv_bytes = response.read()
+    except (urllib_error.HTTPError, urllib_error.URLError, TimeoutError) as exc:
+        raise RuntimeError(
+            "Google Sheet could not be downloaded as CSV. "
+            "Make sure the sheet is accessible to the plotting computer without interactive login, "
+            "or export Animal_event_log as CSV and use a local path."
+        ) from exc
+
+    try:
+        decoded = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Downloaded Google Sheet CSV could not be decoded as UTF-8") from exc
+    if looks_like_html_document(decoded):
+        raise RuntimeError(
+            "Google Sheet could not be downloaded as CSV. "
+            "Make sure the sheet is accessible to the plotting computer without interactive login, "
+            "or export Animal_event_log as CSV and use a local path."
+        )
+    return csv_bytes
+
+
+def load_behavior_events_from_text(
+    text: str,
+    tz: dt.tzinfo,
+    *,
+    source_name: str,
+) -> list[BehaviorEvent]:
+    events: list[BehaviorEvent] = []
+    with io.StringIO(text) as handle:
+        reader = csv.DictReader(handle)
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                if not animal_id:
+                    raise ValueError("missing animal_id")
+                start_text = str(row.get("start_local") or "").strip()
+                end_text = str(row.get("end_local") or "").strip()
+                if not start_text:
+                    raise ValueError("missing start_local")
+                start_local = parse_local_datetime(start_text, tz)
+                if end_text:
+                    end_local = parse_local_datetime(end_text, tz)
+                    if end_local <= start_local:
+                        raise ValueError("end_local must be after start_local")
+                else:
+                    end_local = start_local + dt.timedelta(
+                        seconds=POINT_EVENT_DURATION_SECONDS
+                    )
+                events.append(
+                    BehaviorEvent(
+                        animal_id=animal_id,
+                        start_local=start_local,
+                        end_local=end_local,
+                        event=str(row.get("event") or "").strip() or "event",
+                        kind=str(row.get("kind") or "").strip() or "event",
+                        notes=str(row.get("notes") or "").strip(),
+                    )
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Skipping malformed behavior event row %d in %s: %s",
+                    row_index,
+                    source_name,
+                    exc,
+                )
+    return events
+
+
+def write_google_sheet_event_snapshot(
+    *,
+    root: Path,
+    source: GoogleSheetSource,
+    csv_bytes: bytes,
+    events: list[BehaviorEvent],
+) -> None:
+    snapshot_path = root / "behavior_events_used.csv"
+    metadata_path = root / "behavior_events_source.json"
+    atomic_write_bytes(snapshot_path, csv_bytes)
+    metadata = {
+        "source_type": "google_sheet",
+        "source_url": source.source_url,
+        "sheet_id": source.sheet_id,
+        "gid": source.gid,
+        "export_url": source.export_url,
+        "fetched_at_utc": format_utc(dt.datetime.now(UTC)),
+        "sha256": hashlib.sha256(csv_bytes).hexdigest(),
+        "rows": len(events),
+        "snapshot_csv": relative_to_root(snapshot_path, root),
+    }
+    atomic_write_text(metadata_path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    LOG.info("Saved event snapshot: %s", snapshot_path)
+    LOG.info("Saved event source metadata: %s", metadata_path)
 
 
 def discover_timestamp_files(root: Path) -> list[Path]:
@@ -355,40 +534,45 @@ def parse_local_datetime(value: str, tz: dt.tzinfo) -> dt.datetime:
 def load_behavior_events(path: Optional[Path], tz: dt.tzinfo) -> list[BehaviorEvent]:
     if path is None or not path.exists():
         return []
+    text = path.read_text(encoding="utf-8-sig")
+    return load_behavior_events_from_text(text, tz, source_name=str(path))
 
-    events: list[BehaviorEvent] = []
-    with path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row_index, row in enumerate(reader, start=2):
-            try:
-                animal_id = str(row.get("animal_id") or "").strip()
-                if not animal_id:
-                    raise ValueError("missing animal_id")
-                start_text = str(row.get("start_local") or "").strip()
-                end_text = str(row.get("end_local") or "").strip()
-                if not start_text:
-                    raise ValueError("missing start_local")
-                start_local = parse_local_datetime(start_text, tz)
-                if end_text:
-                    end_local = parse_local_datetime(end_text, tz)
-                    if end_local <= start_local:
-                        raise ValueError("end_local must be after start_local")
-                else:
-                    end_local = start_local + dt.timedelta(
-                        seconds=POINT_EVENT_DURATION_SECONDS
-                    )
-                events.append(
-                    BehaviorEvent(
-                        animal_id=animal_id,
-                        start_local=start_local,
-                        end_local=end_local,
-                        event=str(row.get("event") or "").strip() or "event",
-                        kind=str(row.get("kind") or "").strip() or "event",
-                        notes=str(row.get("notes") or "").strip(),
-                    )
-                )
-            except Exception as exc:
-                LOG.warning("Skipping malformed behavior event row %d in %s: %s", row_index, path, exc)
+
+def load_behavior_events_source(
+    source: Optional[str],
+    *,
+    root: Path,
+    tz: dt.tzinfo,
+) -> list[BehaviorEvent]:
+    if source is None:
+        return []
+
+    parsed = urllib_parse.urlparse(source)
+    if parsed.scheme in {"http", "https"}:
+        google_source = parse_google_sheet_url(source)
+        LOG.info("Fetching behavior events from Google Sheet gid=%s", google_source.gid)
+        csv_bytes = fetch_google_sheet_csv(google_source)
+        text = csv_bytes.decode("utf-8-sig")
+        events = load_behavior_events_from_text(text, tz, source_name=google_source.source_url)
+        write_google_sheet_event_snapshot(
+            root=root,
+            source=google_source,
+            csv_bytes=csv_bytes,
+            events=events,
+        )
+        LOG.info("Loaded %d behavior event(s)", len(events))
+        return events
+
+    if "://" in source:
+        raise ValueError(
+            "Only local CSV paths and supported Google Sheets URLs from docs.google.com are accepted for --events"
+        )
+
+    path = Path(source).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"behavior event CSV does not exist: {path}")
+    events = load_behavior_events(path, tz)
+    LOG.info("Loaded %d behavior event(s)", len(events))
     return events
 
 
@@ -440,6 +624,91 @@ def infer_animals(events: Iterable[BehaviorEvent]) -> list[str]:
     return animals
 
 
+def find_major_recording_gaps(
+    clips: list[RecordingClip],
+    *,
+    min_gap_seconds: int = MAJOR_GAP_MIN_SECONDS,
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    gaps: list[tuple[dt.datetime, dt.datetime]] = []
+    if len(clips) < 2:
+        return gaps
+    for previous_clip, current_clip in zip(clips, clips[1:]):
+        if current_clip.start_utc <= previous_clip.end_utc:
+            continue
+        gap_s = (current_clip.start_utc - previous_clip.end_utc).total_seconds()
+        if gap_s >= min_gap_seconds:
+            gaps.append((previous_clip.end_utc, current_clip.start_utc))
+    return gaps
+
+
+def format_gap_duration(duration_s: float) -> str:
+    duration_min = duration_s / 60.0
+    if duration_min >= 120:
+        return f"{duration_s / 3600.0:.1f} h\ngap"
+    return f"{duration_min:.0f} min\ngap"
+
+
+def major_tick_interval_hours(start_local: dt.datetime, end_local: dt.datetime) -> int:
+    span_h = max((end_local - start_local).total_seconds(), 0.0) / 3600.0
+    if span_h <= 48:
+        return 6
+    if span_h <= 120:
+        return 12
+    return 24
+
+
+def configure_time_axis(axis, start_local: dt.datetime, end_local: dt.datetime) -> None:
+    interval_h = major_tick_interval_hours(start_local, end_local)
+    axis.xaxis.set_major_locator(mdates.HourLocator(interval=interval_h))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
+    axis.tick_params(axis="x", labelrotation=0)
+    for label in axis.get_xticklabels():
+        label.set_ha("center")
+
+
+def unique_timezone_abbreviations(
+    tz: dt.tzinfo,
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+) -> set[str]:
+    abbreviations = {
+        label
+        for label in {
+            start_utc.astimezone(tz).tzname(),
+            end_utc.astimezone(tz).tzname(),
+        }
+        if label
+    }
+    return abbreviations
+
+
+def subtitle_time_label(
+    tz: dt.tzinfo,
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+) -> str:
+    abbreviations = sorted(unique_timezone_abbreviations(tz, start_utc, end_utc))
+    if timezone_label(tz) == DEFAULT_TIMEZONE:
+        base_label = "Woods Hole local time"
+    else:
+        base_label = "Local time"
+    if len(abbreviations) == 1:
+        return f"{base_label} ({abbreviations[0]})"
+    return base_label
+
+
+def x_axis_time_label(
+    tz: dt.tzinfo,
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+) -> str:
+    abbreviations = sorted(unique_timezone_abbreviations(tz, start_utc, end_utc))
+    label = f"Local time - {timezone_label(tz)}"
+    if len(abbreviations) == 1:
+        return f"{label} ({abbreviations[0]})"
+    return label
+
+
 def _bar_left_width(start_utc: dt.datetime, end_utc: dt.datetime, tz: dt.tzinfo) -> tuple[float, float]:
     left = mdates.date2num(to_plot_local(start_utc, tz))
     width = max((end_utc - start_utc).total_seconds() / 86400.0, 1.0 / 86400.0 / 24.0)
@@ -477,27 +746,25 @@ def event_bar_color(event: BehaviorEvent) -> str:
     return INTERVAL_BAR_COLOR
 
 
-def semantic_legend_handles(*, include_motion_states: bool) -> list[Line2D | Patch]:
-    handles: list[Line2D | Patch] = []
-    if include_motion_states:
-        handles.extend(
-            [
-                Patch(
-                    facecolor=MOTION_IMMOBILE_COLOR,
-                    alpha=0.62,
-                    edgecolor="none",
-                    label="Motion-derived immobile",
-                ),
-                Patch(
-                    facecolor=MOTION_MOBILE_COLOR,
-                    alpha=0.62,
-                    edgecolor="none",
-                    label="Motion-derived mobile",
-                ),
-            ]
-        )
-    handles.extend(
-        [
+def motion_legend_handles() -> list[Patch]:
+    return [
+        Patch(
+            facecolor=MOTION_IMMOBILE_COLOR,
+            alpha=0.68,
+            edgecolor="none",
+            label="Motion-derived immobile",
+        ),
+        Patch(
+            facecolor=MOTION_MOBILE_COLOR,
+            alpha=0.68,
+            edgecolor="none",
+            label="Motion-derived mobile",
+        ),
+    ]
+
+
+def manual_annotation_legend_handles() -> list[Line2D | Patch]:
+    return [
         Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Duration / state"),
         Line2D(
             [0],
@@ -543,9 +810,7 @@ def semantic_legend_handles(*, include_motion_states: bool) -> list[Line2D | Pat
             markeredgewidth=0.6,
             label="Other point event",
         ),
-        ]
-    )
-    return handles
+    ]
 
 
 def plot_recording_timeline(
@@ -586,18 +851,22 @@ def plot_recording_timeline(
     for animal_id in unknown_animals:
         LOG.warning("Skipping timeline row for unknown animal ID: %s", animal_id)
 
-    fig_height = 7.6
-    fig = plt.figure(figsize=(18, fig_height), constrained_layout=False)
-    gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 4.5], hspace=0.12)
+    fig = plt.figure(figsize=(17, 9), constrained_layout=False)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.05, 0.75, 5.5], hspace=0.04)
     ax_cov = fig.add_subplot(gs[0])
-    ax_beh = fig.add_subplot(gs[1], sharex=ax_cov)
-    fig.subplots_adjust(top=0.86, bottom=0.12, left=0.08, right=0.985)
+    ax_legend = fig.add_subplot(gs[1])
+    ax_beh = fig.add_subplot(gs[2], sharex=ax_cov)
+    fig.subplots_adjust(top=0.87, bottom=0.11, left=0.08, right=0.985)
     fig.patch.set_facecolor("white")
+    ax_cov.set_facecolor("white")
+    ax_legend.set_facecolor("white")
+    ax_beh.set_facecolor("white")
+    ax_legend.axis("off")
 
     total_recorded_h = recorded_duration_s / 3600.0
     elapsed_h = elapsed_duration_s / 3600.0
     subtitle = (
-        f"Local time - {timezone_label(timezone)} | "
+        f"{subtitle_time_label(timezone, first_utc, last_utc)} | "
         f"elapsed {elapsed_h:.1f} h | recorded {total_recorded_h:.1f} h | "
         f"coverage {recorded_fraction:.1%}"
     )
@@ -620,42 +889,6 @@ def plot_recording_timeline(
         color="#475569",
     )
 
-    if clips:
-        colors = {"camera": "#0f766e"}
-        for index, clip in enumerate(clips):
-            left, width = _bar_left_width(clip.start_utc, clip.end_utc, timezone)
-            ax_cov.broken_barh([(left, width)], (0.3, 0.42), facecolors=colors["camera"], alpha=0.82)
-            if clip_annotations:
-                center = left + width / 2.0
-                duration_min = clip.duration_s / 60.0
-                ax_cov.text(
-                    center,
-                    0.77,
-                    f"{clip.camera_label}  {duration_min:.1f}m",
-                    ha="center",
-                    va="bottom",
-                    fontsize=7,
-                    color="#1f2937",
-                    clip_on=True,
-                )
-
-        ax_cov.set_ylim(0, 1)
-        ax_cov.set_yticks([])
-        ax_cov.set_ylabel("Recording", rotation=0, labelpad=34, va="center", fontsize=10, color="#334155")
-        ax_cov.grid(True, axis="x", color="#cbd5e1", alpha=0.45, linewidth=0.6)
-    else:
-        ax_cov.text(
-            0.5,
-            0.5,
-            "No recording clips found",
-            transform=ax_cov.transAxes,
-            ha="center",
-            va="center",
-            fontsize=14,
-        )
-        ax_cov.set_yticks([])
-        ax_cov.grid(False)
-
     plot_starts: list[dt.datetime] = []
     plot_ends: list[dt.datetime] = []
     if clips:
@@ -669,6 +902,9 @@ def plot_recording_timeline(
         if state.animal_id in behavior_index:
             plot_starts.append(to_plot_local(state.start_utc, timezone))
             plot_ends.append(to_plot_local(state.end_utc, timezone))
+
+    x_min: Optional[dt.datetime] = None
+    x_max: Optional[dt.datetime] = None
     if plot_starts and plot_ends:
         x_min = min(plot_starts)
         x_max = max(plot_ends)
@@ -676,27 +912,119 @@ def plot_recording_timeline(
             x_max = x_min + dt.timedelta(minutes=1)
         ax_cov.set_xlim(x_min, x_max)
 
+    major_gaps = find_major_recording_gaps(clips)
+    for gap_start_utc, gap_end_utc in major_gaps:
+        gap_start = to_plot_local(gap_start_utc, timezone)
+        gap_end = to_plot_local(gap_end_utc, timezone)
+        ax_cov.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
+        ax_beh.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
+
+    if clips:
+        for clip in clips:
+            left, width = _bar_left_width(clip.start_utc, clip.end_utc, timezone)
+            ax_cov.broken_barh(
+                [(left, width)],
+                (0.18, 0.64),
+                facecolors=RECORDING_COLOR,
+                alpha=0.9,
+                zorder=2,
+            )
+            if clip_annotations:
+                center = left + width / 2.0
+                duration_min = clip.duration_s / 60.0
+                ax_cov.text(
+                    center,
+                    0.86,
+                    f"{clip.camera_label}  {duration_min:.1f}m",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    color="#1f2937",
+                    clip_on=True,
+                )
+
+        ax_cov.set_ylim(0, 1)
+        ax_cov.set_yticks([])
+        ax_cov.set_ylabel("Recording", rotation=0, labelpad=34, va="center", fontsize=10, color="#334155")
+        ax_cov.grid(True, axis="x", color="#cbd5e1", alpha=0.4, linewidth=0.6)
+    else:
+        ax_cov.text(
+            0.5,
+            0.5,
+            "No recording clips found",
+            transform=ax_cov.transAxes,
+            ha="center",
+            va="center",
+            fontsize=14,
+        )
+        ax_cov.set_yticks([])
+        ax_cov.grid(False)
+
+    if major_gaps and len(major_gaps) <= MAX_MAJOR_GAP_LABELS:
+        for gap_start_utc, gap_end_utc in major_gaps:
+            center = mdates.date2num(
+                to_plot_local(gap_start_utc + (gap_end_utc - gap_start_utc) / 2, timezone)
+            )
+            ax_cov.text(
+                center,
+                0.5,
+                format_gap_duration((gap_end_utc - gap_start_utc).total_seconds()),
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="#475569",
+                zorder=1,
+            )
+
     ax_cov.set_title("Recording coverage", loc="left", fontsize=11, color="#0f172a", pad=8)
     ax_cov.tick_params(axis="x", labelbottom=False)
 
-    behavior_title = "Behavior annotations"
     if motion_states:
-        behavior_title = "Behavior annotations and motion-derived states"
-    ax_beh.set_title(behavior_title, loc="left", fontsize=11, color="#0f172a", pad=18)
+        motion_legend = ax_legend.legend(
+            handles=motion_legend_handles(),
+            loc="upper left",
+            bbox_to_anchor=(0.0, 1.0),
+            ncol=2,
+            frameon=False,
+            fontsize=8,
+            title="Motion-derived states",
+            title_fontsize=9,
+            handlelength=1.3,
+            handletextpad=0.5,
+            columnspacing=1.4,
+            borderaxespad=0.0,
+        )
+        ax_legend.add_artist(motion_legend)
+
+    ax_legend.legend(
+        handles=manual_annotation_legend_handles(),
+        loc="upper left",
+        bbox_to_anchor=(0.32 if motion_states else 0.0, 1.0),
+        ncol=5,
+        frameon=False,
+        fontsize=8,
+        title="Manual annotations",
+        title_fontsize=9,
+        handlelength=1.3,
+        handletextpad=0.5,
+        columnspacing=1.2,
+        borderaxespad=0.0,
+    )
+
+    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=10)
     ax_beh.set_yticks(range(len(behavior_rows)))
     ax_beh.set_yticklabels(behavior_rows)
     ax_beh.set_ylabel("Animal")
     ax_beh.set_ylim(-0.5, len(behavior_rows) - 0.5)
     ax_beh.invert_yaxis()
-    ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.45, linewidth=0.6)
-    ax_beh.set_xlabel(f"Local time - {timezone_label(timezone)}")
+    ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.4, linewidth=0.6)
+    ax_beh.set_xlabel(x_axis_time_label(timezone, first_utc, last_utc))
 
-    for y in range(len(behavior_rows)):
-        ax_beh.axhspan(y - 0.46, y + 0.46, facecolor=ROW_BAND_COLOR, alpha=0.9, zorder=0)
+    for y in range(len(behavior_rows) + 1):
+        ax_beh.axhline(y - 0.5, color=ROW_SEPARATOR_COLOR, linewidth=0.7, zorder=0.35)
 
-    locator = mdates.AutoDateLocator()
-    ax_beh.xaxis.set_major_locator(locator)
-    ax_beh.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
+    if x_min is not None and x_max is not None:
+        configure_time_axis(ax_beh, x_min, x_max)
 
     for state in motion_states:
         if state.animal_id not in behavior_index:
@@ -707,9 +1035,9 @@ def plot_recording_timeline(
         color = MOTION_MOBILE_COLOR if state.state == "mobile" else MOTION_IMMOBILE_COLOR
         ax_beh.broken_barh(
             [(left, width)],
-            (y - 0.28, 0.56),
+            (y - 0.31, 0.62),
             facecolors=color,
-            alpha=0.62,
+            alpha=0.68,
             zorder=1,
         )
 
@@ -723,10 +1051,10 @@ def plot_recording_timeline(
         color = event_bar_color(event)
         ax_beh.broken_barh(
             [(left, width)],
-            (y - 0.18, 0.36),
+            (y - 0.22, 0.44),
             facecolors=color,
             alpha=0.74,
-            zorder=2,
+            zorder=3,
         )
         if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS:
             marker, marker_size, point_color = get_point_event_style(event.event or event.kind)
@@ -738,21 +1066,8 @@ def plot_recording_timeline(
                 color=point_color,
                 edgecolors="black",
                 linewidths=0.6,
-                zorder=5,
+                zorder=6,
             )
-
-    ax_beh.legend(
-        handles=semantic_legend_handles(include_motion_states=bool(motion_states)),
-        loc="lower left",
-        bbox_to_anchor=(0.0, 1.01),
-        ncol=4 if motion_states else 5,
-        frameon=False,
-        fontsize=8,
-        handlelength=1.3,
-        handletextpad=0.5,
-        columnspacing=1.2,
-        borderaxespad=0.0,
-    )
 
     for ax in (ax_cov, ax_beh):
         ax.spines["top"].set_visible(False)
@@ -761,7 +1076,9 @@ def plot_recording_timeline(
         ax.spines["bottom"].set_color("#cbd5e1")
         ax.tick_params(axis="both", colors="#334155")
 
-    fig.autofmt_xdate()
+    for label in ax_beh.get_xticklabels():
+        label.set_rotation(0)
+        label.set_ha("center")
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -783,8 +1100,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--events",
-        type=Path,
-        help="Path to behavior_events.csv (defaults to <root>/behavior_events.csv when present).",
+        help=(
+            "Behavior event source: either a local CSV path or a supported Google Sheets URL "
+            "(defaults to <root>/behavior_events.csv when present)."
+        ),
     )
     parser.add_argument(
         "--motion-states",
@@ -847,11 +1166,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_png = args.output or (root / "recording_behavior_timeline.png")
     write_coverage_csv(clips, coverage_csv, local_tz)
 
-    events_path = args.events
-    if events_path is None:
+    events_source = args.events
+    if events_source is None:
         default_events = root / "behavior_events.csv"
-        events_path = default_events if default_events.exists() else None
-    events = load_behavior_events(events_path, local_tz)
+        events_source = str(default_events) if default_events.exists() else None
+    try:
+        events = load_behavior_events_source(
+            events_source,
+            root=root,
+            tz=local_tz,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        LOG.error("%s", exc)
+        return 1
+
     motion_states_path: Optional[Path] = None
     if not args.no_motion_states:
         if args.motion_states is not None:

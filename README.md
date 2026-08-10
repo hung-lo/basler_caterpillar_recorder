@@ -104,6 +104,23 @@ python plot_recording_timeline.py `
   --events "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\animal_event_log.csv"
 ```
 
+`--events` can also point directly at a Google Sheet tab URL. The plotting machine must be able to read that sheet without interactive login, for example with an "Anyone with the link - Viewer" share setting.
+
+```powershell
+python plot_recording_timeline.py `
+  "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08" `
+  --events "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+```
+
+Each successful Google Sheet fetch saves the exact CSV used for the plot to:
+
+```text
+behavior_events_used.csv
+behavior_events_source.json
+```
+
+This keeps the plot reproducible even though the live sheet can change between runs.
+
 If you want to point at a specific motion-state file explicitly:
 
 ```powershell
