@@ -966,6 +966,24 @@ def event_bar_color(event: BehaviorEvent) -> str:
     return INTERVAL_BAR_COLOR
 
 
+def is_death_event(event: BehaviorEvent) -> bool:
+    return (
+        normalize_event_name(event.event) in DEATH_EVENT_NAMES
+        or normalize_event_name(event.kind) in DEATH_EVENT_NAMES
+    )
+
+
+def death_cutoffs_local(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetime]:
+    cutoffs: dict[str, dt.datetime] = {}
+    for event in events:
+        if not is_death_event(event):
+            continue
+        cutoff = cutoffs.get(event.animal_id)
+        if cutoff is None or event.start_local < cutoff:
+            cutoffs[event.animal_id] = event.start_local
+    return cutoffs
+
+
 def motion_legend_handles() -> list[Patch]:
     return [
         Patch(
