@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -152,6 +153,16 @@ class LeafFeedingLogicTests(unittest.TestCase):
         first_bucket_targets = [target for target in targets if target.estimate_bucket_utc == start]
         self.assertEqual([target.frame_index for target in first_bucket_targets], [0, 1, 2, 3, 4, 5])
 
+    def test_select_leaf_sample_targets_rejects_non_monotonic_timestamps(self) -> None:
+        timestamps = [
+            dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 9, 10, 0, 10, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 9, 10, 0, 5, tzinfo=dt.timezone.utc),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "not monotonic"):
+            leaf.select_leaf_sample_targets(timestamps)
+
     def test_hysteresis_uses_absolute_loss_thresholds(self) -> None:
         losses = [None, 800.0, 400.0, 250.0, 800.0, 700.0]
 
@@ -262,6 +273,35 @@ class LeafFeedingLogicTests(unittest.TestCase):
         self.assertIsNone(rows[1].delta_area_5min_px2)
         self.assertIsNone(rows[2].delta_area_5min_px2)
 
+    def test_bad_video_between_bursts_invalidates_whole_transition(self) -> None:
+        base = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 9000, (9000,), 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_loss_px2=750.0,
+            continue_loss_px2=300.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=5,
+            leaf_reset_increase_pct=20.0,
+            video_quality_intervals_utc=[
+                (
+                    dt.datetime(2026, 8, 9, 10, 2, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 10, 3, 0, tzinfo=dt.timezone.utc),
+                )
+            ],
+        )
+
+        self.assertFalse(rows[1].feeding_valid)
+        self.assertIsNone(rows[1].delta_area_5min_px2)
+
     def test_consolidate_leaf_estimates_combines_duplicate_bucket_samples(self) -> None:
         timestamp = dt.datetime(2026, 8, 9, 12, 30, 0, tzinfo=dt.timezone.utc)
         estimates = [
@@ -322,6 +362,36 @@ class LeafFeedingLogicTests(unittest.TestCase):
 
         self.assertEqual(result.status, "frame_mismatch")
         self.assertEqual(result.estimates, [])
+
+    def test_invalid_timestamps_are_reported(self) -> None:
+        entry = leaf.ManifestEntry("C01", "clip_a", Path("/tmp/video.mp4"), Path("/tmp/timestamps.csv"))
+        timestamps = [
+            dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 9, 12, 0, 10, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 9, 12, 0, 5, tzinfo=dt.timezone.utc),
+        ]
+
+        with mock.patch.object(leaf, "load_timestamp_series", return_value=timestamps):
+            result = leaf.extract_clip_leaf_estimates(
+                entry,
+                clip_index=1,
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=20,
+                morph_kernel=1,
+                frame_access="sparse",
+                video_quality_intervals_utc=[],
+            )
+
+        self.assertEqual(result.status, "invalid_timestamps")
+        self.assertIn("not monotonic", result.error)
 
     def test_sparse_sampling_seeks_only_selected_frames(self) -> None:
         entry = leaf.ManifestEntry("C01", "clip_a", Path("/tmp/video.mp4"), Path("/tmp/timestamps.csv"))
@@ -386,6 +456,33 @@ class LeafFeedingLogicTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.status, "seek_mismatch")
+
+    def test_load_analysis_events_supports_google_sheet_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+            csv_bytes = (
+                "animal_id,start_local,end_local,event,kind,notes\n"
+                "All,2026-08-07T18:49:00-04:00,2026-08-07T20:59:00-04:00,video_quality_low,video,White balance is off\n"
+            ).encode("utf-8")
+
+            with mock.patch(
+                "plot_recording_timeline.urllib_request.urlopen",
+                return_value=mock.Mock(
+                    __enter__=mock.Mock(return_value=mock.Mock(read=mock.Mock(return_value=csv_bytes))),
+                    __exit__=mock.Mock(return_value=False),
+                ),
+            ):
+                resets, intervals = leaf.load_analysis_events(
+                    root=root,
+                    source=url,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                )
+            self.assertEqual(resets, {})
+            self.assertEqual(len(intervals), 1)
+            self.assertEqual(intervals[0][0], dt.datetime(2026, 8, 7, 22, 49, 0, tzinfo=dt.timezone.utc))
+            self.assertTrue((root / "behavior_events_used.csv").exists())
+            self.assertTrue((root / "behavior_events_source.json").exists())
 
     def test_main_wires_progress_reporter_into_clip_extraction(self) -> None:
         repo_root = Path.cwd()

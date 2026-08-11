@@ -242,23 +242,28 @@ class TimelinePlotTests(unittest.TestCase):
             self.assertEqual(rows[0]["frames"], "3")
             self.assertEqual(rows[0]["start_utc"], "2026-08-09T19:00:00.000000Z")
 
-    def test_blank_end_local_becomes_point_event(self) -> None:
+    def test_parser_preserves_point_vs_duration_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             events_path = root / "behavior_events.csv"
             with events_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["animal_id", "start_local", "end_local", "event", "kind", "notes"])
-                writer.writerow(["C01", "2026-08-09 15:00:00", "", "electrical_stimulation", "event", ""])
-                writer.writerow(["", "", "2026-08-09 15:10:00", "shed", "event", "unknown start"])
+                writer.writerow(["C01", "2026-08-10 12:00:00-04:00", "", "observation", "observation", "test"])
+                writer.writerow(["C01", "2026-08-10 13:00:00-04:00", "2026-08-10 13:00:30-04:00", "observation", "observation", "test interval"])
 
             events = timeline.load_behavior_events(events_path, dt.timezone(dt.timedelta(hours=-4)))
 
-            self.assertEqual(len(events), 1)
-            self.assertEqual(events[0].event, "electrical_stimulation")
+            self.assertEqual(len(events), 2)
+            self.assertTrue(events[0].is_point)
+            self.assertFalse(events[1].is_point)
             self.assertEqual(
                 (events[0].end_local - events[0].start_local).total_seconds(),
                 float(timeline.POINT_EVENT_DURATION_SECONDS),
+            )
+            self.assertEqual(
+                (events[1].end_local - events[1].start_local).total_seconds(),
+                30.0,
             )
 
     def test_global_event_aliases_are_recognized_case_insensitively(self) -> None:
@@ -347,7 +352,7 @@ class TimelinePlotTests(unittest.TestCase):
 
             self.assertEqual(events, [])
 
-    def test_short_events_draw_a_marker_without_changing_the_bar(self) -> None:
+    def test_supported_point_events_render_and_generic_points_do_not(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             output_png = root / "timeline.png"
@@ -356,9 +361,10 @@ class TimelinePlotTests(unittest.TestCase):
                     animal_id="C01",
                     start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
                     end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
-                    event="electrical_stimulation",
-                    kind="event",
+                    event="manual_note",
+                    kind="electrical_stimulation",
                     notes="",
+                    is_point=True,
                 ),
                 timeline.BehaviorEvent(
                     animal_id="C01",
@@ -367,6 +373,25 @@ class TimelinePlotTests(unittest.TestCase):
                     event="shed",
                     kind="event",
                     notes="",
+                    is_point=True,
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 3, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 3, 1),
+                    event="dead",
+                    kind="event",
+                    notes="",
+                    is_point=True,
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 4, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 4, 1),
+                    event="observation",
+                    kind="observation",
+                    notes="",
+                    is_point=True,
                 ),
                 timeline.BehaviorEvent(
                     animal_id="C01",
@@ -391,13 +416,42 @@ class TimelinePlotTests(unittest.TestCase):
                     )
 
             self.assertTrue(output_png.exists())
-            self.assertEqual(mock_scatter.call_count, 1)
-            _scatter_args, scatter_kwargs = mock_scatter.call_args
+            self.assertEqual(mock_scatter.call_count, 2)
+            scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
+            self.assertIn("^", scatter_markers)
+            self.assertIn("X", scatter_markers)
+            self.assertNotIn("o", scatter_markers)
+            self.assertTrue(any(call.args[2] == "\u26a1" for call in mock_text.call_args_list if len(call.args) >= 3))
+            _scatter_args, scatter_kwargs = mock_scatter.call_args_list[0]
             self.assertEqual(scatter_kwargs["marker"], "^")
             self.assertEqual(scatter_kwargs["s"], timeline.SHED_MARKER_SIZE)
             self.assertEqual(scatter_kwargs["edgecolors"], "black")
             self.assertEqual(scatter_kwargs["linewidths"], 0.6)
-            self.assertTrue(any(call.args[2] == "\u26a1" for call in mock_text.call_args_list if len(call.args) >= 3))
+
+    def test_explicit_short_duration_events_remain_bars(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 0, 30),
+            event="observation",
+            kind="observation",
+            notes="",
+        )
+
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=[event],
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        self.assertEqual(mock_scatter.call_count, 0)
+        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
 
     def test_behavior_axis_uses_canonical_animal_order(self) -> None:
         events = [
@@ -408,6 +462,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="shed",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
             timeline.BehaviorEvent(
                 animal_id="C01",
@@ -416,6 +471,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="death",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
             timeline.BehaviorEvent(
                 animal_id="C06",
@@ -471,6 +527,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="shed",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
         ]
 
@@ -504,6 +561,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="death",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
             timeline.BehaviorEvent(
                 animal_id="C01",
@@ -512,6 +570,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="dead",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
             timeline.BehaviorEvent(
                 animal_id="C02",
@@ -528,18 +587,41 @@ class TimelinePlotTests(unittest.TestCase):
             {"C01": dt.datetime(2026, 8, 9, 15, 10, 0)},
         )
 
-    def test_unknown_point_event_uses_generic_circle(self) -> None:
-        marker, size, _color = timeline.get_point_event_style("feeding_resumed")
+    def test_unknown_point_events_are_hidden_from_the_plot(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+            event="feeding_resumed",
+            kind="observation",
+            notes="",
+            is_point=True,
+        )
 
-        self.assertEqual(marker, "o")
-        self.assertEqual(size, timeline.DEFAULT_POINT_MARKER_SIZE)
+        with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+            with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=[event],
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        self.assertEqual(mock_scatter.call_count, 0)
+        self.assertFalse(
+            any(len(call.args) >= 3 and call.args[2] == "\u26a1" for call in mock_text.call_args_list)
+        )
 
     def test_manual_annotation_legend_uses_lightning_label(self) -> None:
         labels = [handle.get_label() for handle in timeline.manual_annotation_legend_handles()]
 
         self.assertIn("\u26a1 Electrical stimulation", labels)
+        self.assertNotIn("Other point event", labels)
 
-    def test_video_quality_aliases_and_kind_share_the_same_global_style(self) -> None:
+    def test_video_quality_and_food_unavailable_global_styles_are_rendered(self) -> None:
         events = [
             timeline.GlobalEvent(
                 start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone.utc),
@@ -562,10 +644,33 @@ class TimelinePlotTests(unittest.TestCase):
                 kind="video_quality",
                 notes="",
             ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 6, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 7, 0, tzinfo=dt.timezone.utc),
+                event="food_unavailable",
+                kind="event",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 8, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 9, 0, tzinfo=dt.timezone.utc),
+                event="lights_repositioned",
+                kind="event",
+                notes="",
+            ),
         ]
 
         styles = [timeline.global_event_band_style(event) for event in events]
-        self.assertEqual(styles, [(timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA)] * 3)
+        self.assertEqual(
+            styles,
+            [
+                (timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA),
+                (timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA),
+                (timeline.VIDEO_QUALITY_LOW_COLOR, timeline.VIDEO_QUALITY_LOW_ALPHA),
+                (timeline.FOOD_UNAVAILABLE_COLOR, timeline.FOOD_UNAVAILABLE_ALPHA),
+                None,
+            ],
+        )
 
     def test_subtract_intervals_no_overlap_returns_original_interval(self) -> None:
         start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
@@ -675,6 +780,13 @@ class TimelinePlotTests(unittest.TestCase):
             timeline.GlobalEvent(
                 start_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
                 end_local=dt.datetime(2026, 8, 9, 15, 45, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                event="food_unavailable",
+                kind="event",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 16, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+                end_local=dt.datetime(2026, 8, 9, 16, 15, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
                 event="lights_repositioned",
                 kind="event",
                 notes="",
@@ -696,7 +808,37 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(mock_axvspan.call_count, 4)
         facecolors = [call.kwargs["facecolor"] for call in mock_axvspan.call_args_list]
         self.assertEqual(facecolors.count(timeline.VIDEO_QUALITY_LOW_COLOR), 2)
-        self.assertEqual(facecolors.count(timeline.GENERIC_GLOBAL_EVENT_COLOR), 2)
+        self.assertEqual(facecolors.count(timeline.FOOD_UNAVAILABLE_COLOR), 2)
+        self.assertNotIn(timeline.GENERIC_GLOBAL_EVENT_COLOR, facecolors)
+
+    def test_hidden_global_events_do_not_expand_the_timeline_bounds(self) -> None:
+        visible_event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+            event="feeding",
+            kind="event",
+            notes="",
+        )
+        hidden_global = timeline.GlobalEvent(
+            start_local=dt.datetime(2026, 8, 9, 18, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+            end_local=dt.datetime(2026, 8, 9, 18, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+            event="lights_repositioned",
+            kind="event",
+            notes="",
+        )
+
+        fig = self.capture_timeline_figure(
+            clips=[],
+            events=[visible_event],
+            global_events=[hidden_global],
+            animals=timeline.ANIMAL_ORDER,
+        )
+        ax_beh = self.behavior_axis(fig)
+
+        xmin, xmax = ax_beh.get_xlim()
+        self.assertAlmostEqual(xmin, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 0, 0)))
+        self.assertAlmostEqual(xmax, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 10, 0)))
 
     def test_manual_markers_survive_global_quality_spans(self) -> None:
         global_events = [
@@ -716,6 +858,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="shed",
                 kind="event",
                 notes="",
+                is_point=True,
             )
         ]
 
@@ -876,6 +1019,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="death",
                 kind="event",
                 notes="",
+                is_point=True,
             )
         ]
 
@@ -919,6 +1063,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="death",
                 kind="event",
                 notes="",
+                is_point=True,
             ),
             timeline.BehaviorEvent(
                 animal_id="C01",
@@ -1062,6 +1207,7 @@ class TimelinePlotTests(unittest.TestCase):
                 event="shed",
                 kind="event",
                 notes="",
+                is_point=True,
             )
         ]
 
@@ -1182,6 +1328,71 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(events[0].animal_id, "C02")
         self.assertEqual(len(global_events), 1)
         self.assertTrue(timeline.is_video_quality_global_event(global_events[0]))
+
+    def test_resolve_behavior_event_source_prefers_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "animal_event_log.csv").write_text("", encoding="utf-8")
+            (root / "behavior_events.csv").write_text("", encoding="utf-8")
+            (root / "behavior_events_source.json").write_text(
+                json.dumps(
+                    {
+                        "source_type": "google_sheet",
+                        "source_url": "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            source, reason = timeline.resolve_behavior_event_source(root, "https://docs.google.com/spreadsheets/d/example/edit?gid=1")
+
+        self.assertEqual(source, "https://docs.google.com/spreadsheets/d/example/edit?gid=1")
+        self.assertEqual(reason, "explicit")
+
+    def test_resolve_behavior_event_source_uses_saved_google_sheet_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_url = "https://docs.google.com/spreadsheets/d/1yqe8VII3YNzX2EmOlbBckgTCJKXD47PLZEfHeO2yQ2w/edit?gid=1696022641#gid=1696022641"
+            (root / "behavior_events_source.json").write_text(
+                json.dumps({"source_type": "google_sheet", "source_url": source_url}),
+                encoding="utf-8",
+            )
+
+            source, reason = timeline.resolve_behavior_event_source(root, None)
+
+        self.assertEqual(source, source_url)
+        self.assertEqual(reason, "saved_google_sheet_source")
+
+    def test_resolve_behavior_event_source_falls_back_to_animal_event_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            animal_log = root / "animal_event_log.csv"
+            animal_log.write_text("", encoding="utf-8")
+
+            source, reason = timeline.resolve_behavior_event_source(root, None)
+
+        self.assertEqual(source, str(animal_log.resolve()))
+        self.assertEqual(reason, "animal_event_log.csv")
+
+    def test_resolve_behavior_event_source_falls_back_to_behavior_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            behavior_events = root / "behavior_events.csv"
+            behavior_events.write_text("", encoding="utf-8")
+
+            source, reason = timeline.resolve_behavior_event_source(root, None)
+
+        self.assertEqual(source, str(behavior_events.resolve()))
+        self.assertEqual(reason, "behavior_events.csv")
+
+    def test_resolve_behavior_event_source_returns_none_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            source, reason = timeline.resolve_behavior_event_source(root, None)
+
+        self.assertIsNone(source)
+        self.assertEqual(reason, "none")
 
     def test_event_loader_prefers_utc_fields_when_present(self) -> None:
         csv_text = (

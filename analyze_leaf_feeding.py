@@ -361,7 +361,13 @@ def select_leaf_sample_targets(
     if burst_step_seconds <= 0:
         raise ValueError("burst_step_seconds must be > 0")
 
-    ordered_timestamps = sorted(timestamp.astimezone(UTC) for timestamp in timestamps_utc)
+    ordered_timestamps = [timestamp.astimezone(UTC) for timestamp in timestamps_utc]
+    for index in range(1, len(ordered_timestamps)):
+        if ordered_timestamps[index] < ordered_timestamps[index - 1]:
+            raise ValueError(
+                "timestamp series is not monotonic: "
+                f"row {index + 1} is earlier than row {index}"
+            )
     timestamp_ns = np.array([int(timestamp.timestamp() * 1e9) for timestamp in ordered_timestamps], dtype=np.int64)
     burst_end_delta = dt.timedelta(seconds=burst_duration_seconds)
     targets: list[LeafSampleTarget] = []
@@ -529,6 +535,21 @@ def overlaps_any_interval(
     return False
 
 
+def interval_overlaps_any(
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+    intervals_utc: Sequence[tuple[dt.datetime, dt.datetime]],
+) -> bool:
+    if end_utc <= start_utc:
+        return False
+    for exclusion_start, exclusion_end in intervals_utc:
+        if exclusion_end <= exclusion_start:
+            continue
+        if start_utc < exclusion_end and end_utc > exclusion_start:
+            return True
+    return False
+
+
 def completed_estimate_count(
     grouped_sampled: dict[dt.datetime, int],
     *,
@@ -610,12 +631,23 @@ def extract_clip_leaf_estimates(
 ) -> ClipFeedingResult:
     timestamps = load_timestamp_series(entry.timestamp_file)
     timestamp_rows = len(timestamps)
-    targets = select_leaf_sample_targets(
-        timestamps,
-        estimate_interval_minutes=estimate_interval_minutes,
-        burst_duration_seconds=burst_duration_seconds,
-        burst_step_seconds=burst_step_seconds,
-    )
+    try:
+        targets = select_leaf_sample_targets(
+            timestamps,
+            estimate_interval_minutes=estimate_interval_minutes,
+            burst_duration_seconds=burst_duration_seconds,
+            burst_step_seconds=burst_step_seconds,
+        )
+    except ValueError as exc:
+        return ClipFeedingResult(
+            [],
+            "invalid_timestamps",
+            timestamp_rows,
+            None,
+            0,
+            0,
+            f"{entry.timestamp_file}: {exc}",
+        )
     total_estimates = len({target.estimate_bucket_utc for target in targets})
     if progress_reporter is not None:
         progress_reporter.start_clip(
@@ -690,7 +722,9 @@ def extract_clip_leaf_estimates(
         decoded_leaf_frames += 1
         bucket = target.estimate_bucket_utc
         grouped_sampled[bucket] += 1
-        if overlaps_any_interval(target.timestamp_utc, video_quality_intervals_utc):
+        burst_start = bucket
+        burst_end = bucket + dt.timedelta(seconds=burst_duration_seconds)
+        if interval_overlaps_any(burst_start, burst_end, video_quality_intervals_utc):
             grouped_excluded[bucket] = True
         if area > 0:
             grouped_areas[bucket].append(float(area))
@@ -813,6 +847,7 @@ def finalize_leaf_rows(
     min_bout_minutes: int,
     leaf_reset_increase_pct: float,
     explicit_resets: Optional[dict[str, list[dt.datetime]]] = None,
+    video_quality_intervals_utc: Sequence[tuple[dt.datetime, dt.datetime]] = (),
 ) -> list[LeafAreaRow]:
     consolidated_estimates = consolidate_leaf_estimates(estimates, leaf_area_percentile=leaf_area_percentile)
     explicit_resets = explicit_resets or {}
@@ -855,13 +890,23 @@ def finalize_leaf_rows(
             relative_area = estimate.leaf_area_proxy_px / max(baseline_area, 1.0)
             loss_prev_estimate_pct: Optional[float] = None
             delta_area_5min_px2: Optional[float] = None
-            feeding_valid = not estimate.video_quality_excluded
+            feeding_valid = False
             if previous is not None and previous.timestamp_utc + estimate_interval - GRID_TOLERANCE <= estimate.timestamp_utc <= previous.timestamp_utc + estimate_interval + GRID_TOLERANCE:
                 loss_prev_estimate_pct = 100.0 * (
                     previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
                 ) / max(previous.leaf_area_proxy_px, 1.0)
-                if feeding_valid and not previous.video_quality_excluded:
+                transition_excluded = interval_overlaps_any(
+                    previous.timestamp_utc,
+                    estimate.timestamp_utc,
+                    video_quality_intervals_utc,
+                )
+                if (
+                    not estimate.video_quality_excluded
+                    and not previous.video_quality_excluded
+                    and not transition_excluded
+                ):
                     delta_area_5min_px2 = previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
+                    feeding_valid = True
             animal_rows.append(
                 LeafAreaRow(
                     animal_id=estimate.animal_id,
@@ -1121,10 +1166,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not entries:
         parser.error("no cropped manifest rows with copied timestamps were found")
 
-    events_source = args.events
-    if events_source is None:
-        default_events = root / "behavior_events.csv"
-        events_source = str(default_events) if default_events.exists() else None
+    from plot_recording_timeline import resolve_behavior_event_source
+
+    events_source, events_source_reason = resolve_behavior_event_source(root, args.events)
+    if events_source is not None:
+        LOG.info("Behavior event source (%s): %s", events_source_reason, events_source)
+    else:
+        LOG.info("No behavior event source found")
     try:
         explicit_resets, video_quality_intervals_utc = load_analysis_events(
             root=root,
@@ -1188,6 +1236,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         min_bout_minutes=args.feeding_min_bout_minutes,
         leaf_reset_increase_pct=args.leaf_reset_increase_pct,
         explicit_resets=explicit_resets,
+        video_quality_intervals_utc=video_quality_intervals_utc,
     )
     feeding_events = feeding_event_dicts(
         finalized_rows,
@@ -1211,6 +1260,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     LOG.info("  clips selected: %d", len(entries))
     LOG.info("  clips analyzed: %d", status_counts.get("computed", 0))
     LOG.info("  frame mismatches: %d", status_counts.get("frame_mismatch", 0))
+    LOG.info("  invalid timestamps: %d", status_counts.get("invalid_timestamps", 0))
     LOG.info("  seek failures: %d", status_counts.get("seek_failure", 0))
     LOG.info("  seek mismatches: %d", status_counts.get("seek_mismatch", 0))
     LOG.info("  source frames represented: %d", source_frames_total)

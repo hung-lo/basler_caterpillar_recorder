@@ -131,7 +131,7 @@ animal_id,start_local,end_local,event,kind,notes
 All,2026-08-09 15:00:00,2026-08-09 15:30:00,video_quality_low,video_quality,brief focus drift
 ```
 
-These global intervals draw as background spans across both the recording coverage panel and all animal rows. Video-quality aliases such as `video_quality_low`, `poor_video_quality`, `bad_video_quality`, `bad_lighting`, and `poor_lighting` render with a dedicated low-quality highlight. During those highlighted intervals, motion-derived mobile/immobile bands are intentionally omitted from the plot so that interval reads as unknown rather than trusted classifier output. Global rows must include both `start_local` and `end_local`.
+These global intervals draw as background spans across both the recording coverage panel and all animal rows. Only the two supported global types are rendered on the plot: `video_quality` spans, including aliases such as `video_quality_low`, `poor_video_quality`, `bad_video_quality`, `bad_lighting`, and `poor_lighting`, and `food_unavailable` spans. Other global annotations stay in the event log and snapshot CSV, but they are not drawn on the timeline. During low-video-quality intervals, motion-derived mobile/immobile bands are intentionally omitted from the plot so that the interval reads as unknown rather than trusted classifier output. Global rows must include both `start_local` and `end_local`.
 
 If you want to point at a specific motion-state file explicitly:
 
@@ -166,7 +166,7 @@ The current feeding detector is intentionally coarse:
 - feeding is classified from consecutive 5-minute absolute leaf-area loss, not percent loss;
 - `video_quality_low` event intervals invalidate feeding detection while still leaving the QC trace visible.
 
-By default, `analyze_leaf_feeding.py` auto-discovers `<root>/behavior_events.csv` when it exists, so leaf resets and global bad-video intervals stay consistent with the main timeline. You can still override that source explicitly with `--events`.
+By default, `analyze_leaf_feeding.py` and `plot_recording_timeline.py` now resolve the event source in this order: explicit `--events`, saved Google Sheet metadata in `behavior_events_source.json`, local `animal_event_log.csv`, then local `behavior_events.csv`. This keeps leaf resets and global bad-video intervals consistent with the main timeline while still letting you override the source explicitly.
 
 To overlay those automatic feeding bouts on the main timeline without changing your manual event log:
 
@@ -178,7 +178,7 @@ python plot_recording_timeline.py `
   --motion-energy "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_energy_timeseries.csv"
 ```
 
-`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers. Electrical stimulation events are rendered as a red `⚡` overlay in the animal row instead of a generic point marker.
+`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers. Semantic point events are rendered explicitly: shed / molt as a triangle, electrical stimulation as a red `⚡`, and death as an `X`. Generic point observations are kept in the event source but are not drawn on the timeline.
 
 ## New computer workflow
 

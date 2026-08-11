@@ -84,6 +84,8 @@ VIDEO_QUALITY_LOW_ALPHA = 0.12
 GENERIC_GLOBAL_EVENT_COLOR = "#94a3b8"
 GENERIC_GLOBAL_EVENT_ALPHA = 0.1
 MIN_GLOBAL_EVENT_LABEL_SECONDS = 5 * 60
+FOOD_UNAVAILABLE_COLOR = "#FB7185"
+FOOD_UNAVAILABLE_ALPHA = 0.10
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -145,6 +147,7 @@ class BehaviorEvent:
     event: str
     kind: str
     notes: str
+    is_point: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,6 +253,17 @@ def parse_google_sheet_url(value: str) -> GoogleSheetSource:
         gid=gid,
         export_url=export_url,
     )
+
+
+def normalized_event_terms(event_name: str, kind_name: str) -> set[str]:
+    return {
+        term
+        for term in {
+            normalize_event_name(event_name),
+            normalize_event_name(kind_name),
+        }
+        if term
+    }
 
 
 def looks_like_html_document(text: str) -> bool:
@@ -510,7 +524,9 @@ def load_event_tables_from_text(
                 if end_local is not None:
                     if end_local <= start_local:
                         raise ValueError("end_local must be after start_local")
+                    is_point = False
                 else:
+                    is_point = True
                     end_local = start_local + dt.timedelta(
                         seconds=POINT_EVENT_DURATION_SECONDS
                     )
@@ -522,6 +538,7 @@ def load_event_tables_from_text(
                         event=event_name,
                         kind=kind_name,
                         notes=notes,
+                        is_point=is_point,
                     )
                 )
             except Exception as exc:
@@ -597,6 +614,36 @@ def load_event_tables_source(
     LOG.info("Loaded %d per-animal behavior event(s)", len(events))
     LOG.info("Loaded %d global event interval(s)", len(global_events))
     return events, global_events
+
+
+def resolve_behavior_event_source(
+    root: Path,
+    explicit_source: Optional[str],
+) -> tuple[Optional[str], str]:
+    if explicit_source:
+        return explicit_source, "explicit"
+
+    metadata_path = root / "behavior_events_source.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("source_type") == "google_sheet":
+                source_url = str(metadata.get("source_url") or "").strip()
+                if source_url:
+                    parse_google_sheet_url(source_url)
+                    return source_url, "saved_google_sheet_source"
+        except Exception as exc:
+            LOG.warning("Ignoring malformed behavior event source metadata %s: %s", metadata_path, exc)
+
+    animal_event_log = root / "animal_event_log.csv"
+    if animal_event_log.exists():
+        return str(animal_event_log.resolve()), "animal_event_log.csv"
+
+    behavior_events = root / "behavior_events.csv"
+    if behavior_events.exists():
+        return str(behavior_events.resolve()), "behavior_events.csv"
+
+    return None, "none"
 
 
 def load_behavior_events_source(
@@ -756,26 +803,69 @@ def normalize_event_name(event_name: str) -> str:
     return event_name.strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def behavior_event_terms(event: BehaviorEvent) -> set[str]:
+    return normalized_event_terms(event.event, event.kind)
+
+
+def global_event_terms(event: GlobalEvent) -> set[str]:
+    return normalized_event_terms(event.event, event.kind)
+
+
+def behavior_event_style(event: BehaviorEvent) -> Optional[tuple[str, float, str]]:
+    terms = behavior_event_terms(event)
+    if terms & SHED_EVENT_NAMES:
+        return "^", SHED_MARKER_SIZE, SHED_COLOR
+    if terms & STIM_EVENT_NAMES:
+        return "*", STIM_MARKER_SIZE, STIM_COLOR
+    if terms & DEATH_EVENT_NAMES:
+        return "X", DEATH_MARKER_SIZE, DEATH_COLOR
+    return None
+
+
+def is_supported_behavior_point_event(event: BehaviorEvent) -> bool:
+    return event.is_point and behavior_event_style(event) is not None
+
+
+def behavior_event_is_visible(event: BehaviorEvent) -> bool:
+    return not event.is_point or is_supported_behavior_point_event(event)
+
+
+def behavior_event_display_span(event: BehaviorEvent) -> Optional[tuple[dt.datetime, dt.datetime]]:
+    if not behavior_event_is_visible(event):
+        return None
+    start = event.start_local.replace(tzinfo=None)
+    if event.is_point:
+        return start, start
+    return start, event.end_local.replace(tzinfo=None)
+
+
 def is_video_quality_global_event(event: GlobalEvent) -> bool:
-    normalized_event = normalize_event_name(event.event)
-    normalized_kind = normalize_event_name(event.kind)
-    return (
-        normalized_event in VIDEO_QUALITY_GLOBAL_EVENT_NAMES
-        or normalized_kind == "video_quality"
-    )
+    terms = global_event_terms(event)
+    return bool(terms & (VIDEO_QUALITY_GLOBAL_EVENT_NAMES | {"video_quality"}))
 
 
-def global_event_band_style(event: GlobalEvent) -> tuple[str, float]:
+def is_food_unavailable_global_event(event: GlobalEvent) -> bool:
+    terms = global_event_terms(event)
+    return "food_unavailable" in terms
+
+
+def rendered_global_event_style(event: GlobalEvent) -> Optional[tuple[str, float]]:
     if is_video_quality_global_event(event):
         return VIDEO_QUALITY_LOW_COLOR, VIDEO_QUALITY_LOW_ALPHA
-    return GENERIC_GLOBAL_EVENT_COLOR, GENERIC_GLOBAL_EVENT_ALPHA
+    if is_food_unavailable_global_event(event):
+        return FOOD_UNAVAILABLE_COLOR, FOOD_UNAVAILABLE_ALPHA
+    return None
+
+
+def global_event_band_style(event: GlobalEvent) -> Optional[tuple[str, float]]:
+    return rendered_global_event_style(event)
 
 
 def global_event_label(event: GlobalEvent) -> Optional[str]:
     if not is_video_quality_global_event(event):
         return None
-    normalized_event = normalize_event_name(event.event)
-    if normalized_event in {"bad_lighting", "poor_lighting"}:
+    terms = global_event_terms(event)
+    if terms & {"bad_lighting", "poor_lighting"}:
         return "Poor lighting"
     return "Low video quality"
 
@@ -791,13 +881,13 @@ def global_annotation_legend_handles(global_events: list[GlobalEvent]) -> list[P
                 label="Low video quality",
             )
         )
-    if any(not is_video_quality_global_event(event) for event in global_events):
+    if any(is_food_unavailable_global_event(event) for event in global_events):
         handles.append(
             Patch(
-                facecolor=GENERIC_GLOBAL_EVENT_COLOR,
-                alpha=GENERIC_GLOBAL_EVENT_ALPHA,
+                facecolor=FOOD_UNAVAILABLE_COLOR,
+                alpha=FOOD_UNAVAILABLE_ALPHA,
                 edgecolor="none",
-                label="Global interval",
+                label="food_unavailable",
             )
         )
     return handles
@@ -815,12 +905,20 @@ def timeline_bounds_utc(
         starts_utc.append(clip.start_utc)
         ends_utc.append(clip.end_utc)
     for event in events:
+        if not behavior_event_is_visible(event):
+            continue
         starts_utc.append(event.start_local.astimezone(UTC))
-        ends_utc.append(event.end_local.astimezone(UTC))
+        if event.is_point:
+            ends_utc.append(event.start_local.astimezone(UTC))
+        else:
+            ends_utc.append(event.end_local.astimezone(UTC))
     for state in motion_states:
         starts_utc.append(state.start_utc)
         ends_utc.append(state.end_utc)
     for event in global_events:
+        style = rendered_global_event_style(event)
+        if style is None:
+            continue
         starts_utc.append(event.start_local.astimezone(UTC))
         ends_utc.append(event.end_local.astimezone(UTC))
     if not starts_utc or not ends_utc:
@@ -909,25 +1007,18 @@ def is_stimulation_event_name(event_name: str) -> bool:
 def event_bar_color(event: BehaviorEvent) -> str:
     if is_feeding_event(event):
         return FEEDING_COLOR
-    marker, _marker_size, color = get_point_event_style(event.event or event.kind)
-    normalized = normalize_event_name(event.event or event.kind)
-    if normalized in SHED_EVENT_NAMES | STIM_EVENT_NAMES | DEATH_EVENT_NAMES:
-        return color
+    style = behavior_event_style(event)
+    if style is not None:
+        return style[2]
     return INTERVAL_BAR_COLOR
 
 
 def is_death_event(event: BehaviorEvent) -> bool:
-    return (
-        normalize_event_name(event.event) in DEATH_EVENT_NAMES
-        or normalize_event_name(event.kind) in DEATH_EVENT_NAMES
-    )
+    return bool(behavior_event_terms(event) & DEATH_EVENT_NAMES)
 
 
 def is_feeding_event(event: BehaviorEvent) -> bool:
-    return (
-        normalize_event_name(event.event) == "feeding"
-        or normalize_event_name(event.kind) == "feeding"
-    )
+    return "feeding" in behavior_event_terms(event)
 
 
 def death_cutoffs_local(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetime]:
@@ -1050,17 +1141,6 @@ def manual_annotation_legend_handles() -> list[Line2D | Patch]:
             markeredgewidth=0.6,
             label="Death",
         ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="None",
-            markersize=7,
-            markerfacecolor=DEFAULT_POINT_COLOR,
-            markeredgecolor="black",
-            markeredgewidth=0.6,
-            label="Other point event",
-        ),
     ]
 
 
@@ -1178,16 +1258,19 @@ def plot_recording_timeline(
         plot_starts.append(to_plot_local(first_utc, timezone))
         plot_ends.append(to_plot_local(last_utc, timezone))
     for event in events:
-        if event.animal_id in behavior_index:
-            plot_starts.append(event.start_local.replace(tzinfo=None))
-            plot_ends.append(event.end_local.replace(tzinfo=None))
+        if event.animal_id in behavior_index and behavior_event_is_visible(event):
+            start_local = event.start_local.replace(tzinfo=None)
+            end_local = start_local if event.is_point else event.end_local.replace(tzinfo=None)
+            plot_starts.append(start_local)
+            plot_ends.append(end_local)
     for state in motion_states:
         if state.animal_id in behavior_index:
             plot_starts.append(to_plot_local(state.start_utc, timezone))
             plot_ends.append(to_plot_local(state.end_utc, timezone))
     for event in global_events:
-        plot_starts.append(event.start_local.replace(tzinfo=None))
-        plot_ends.append(event.end_local.replace(tzinfo=None))
+        if rendered_global_event_style(event) is not None:
+            plot_starts.append(event.start_local.replace(tzinfo=None))
+            plot_ends.append(event.end_local.replace(tzinfo=None))
     for sample in motion_energy_samples:
         if sample.animal_id in behavior_index:
             sample_local = to_plot_local(sample.timestamp_utc, timezone)
@@ -1211,9 +1294,12 @@ def plot_recording_timeline(
         ax_beh.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
 
     for event in global_events:
+        style = global_event_band_style(event)
+        if style is None:
+            continue
         band_start = event.start_local.replace(tzinfo=None)
         band_end = event.end_local.replace(tzinfo=None)
-        facecolor, alpha = global_event_band_style(event)
+        facecolor, alpha = style
         ax_cov.axvspan(band_start, band_end, facecolor=facecolor, alpha=alpha, zorder=0.35)
         ax_beh.axvspan(band_start, band_end, facecolor=facecolor, alpha=alpha, zorder=0.45)
         label = global_event_label(event)
@@ -1502,6 +1588,37 @@ def plot_recording_timeline(
                 if event.start_local >= death_cutoff_local:
                     continue
         y = behavior_index[event.animal_id]
+        if event.is_point:
+            style = behavior_event_style(event)
+            if style is None:
+                continue
+            left = mdates.date2num(event.start_local.replace(tzinfo=None))
+            marker, marker_size, point_color = style
+            if marker == "*":
+                ax_beh.text(
+                    left,
+                    y,
+                    "\u26a1",
+                    ha="center",
+                    va="center",
+                    fontsize=13,
+                    color=point_color,
+                    fontweight="bold",
+                    zorder=6,
+                )
+            else:
+                ax_beh.scatter(
+                    left,
+                    y,
+                    s=marker_size,
+                    marker=marker,
+                    color=point_color,
+                    edgecolors="black",
+                    linewidths=0.6,
+                    zorder=6,
+                )
+            continue
+
         event_end_local = event.end_local
         if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
             event_end_local = death_cutoff_local
@@ -1518,32 +1635,6 @@ def plot_recording_timeline(
             alpha=0.74,
             zorder=3,
         )
-        if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS and not is_feeding_event(event):
-            event_name = event.event or event.kind
-            if is_stimulation_event_name(event_name):
-                ax_beh.text(
-                    left,
-                    y,
-                    "\u26a1",
-                    ha="center",
-                    va="center",
-                    fontsize=13,
-                    color=STIM_COLOR,
-                    fontweight="bold",
-                    zorder=6,
-                )
-            else:
-                marker, marker_size, point_color = get_point_event_style(event_name)
-                ax_beh.scatter(
-                    left,
-                    y,
-                    s=marker_size,
-                    marker=marker,
-                    color=point_color,
-                    edgecolors="black",
-                    linewidths=0.6,
-                    zorder=6,
-                )
 
     axes_to_style = [ax_cov, ax_beh]
     if ax_motion is not None:
@@ -1581,7 +1672,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--events",
         help=(
             "Behavior event source: either a local CSV path or a supported Google Sheets URL "
-            "(defaults to <root>/behavior_events.csv when present)."
+            "(defaults: explicit source, saved Google Sheet metadata, "
+            "<root>/animal_event_log.csv, then <root>/behavior_events.csv)."
         ),
     )
     parser.add_argument(
@@ -1671,10 +1763,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_png = args.output or (root / "recording_behavior_timeline.png")
     write_coverage_csv(clips, coverage_csv, local_tz)
 
-    events_source = args.events
-    if events_source is None:
-        default_events = root / "behavior_events.csv"
-        events_source = str(default_events) if default_events.exists() else None
+    events_source, events_source_reason = resolve_behavior_event_source(root, args.events)
+    if events_source is not None:
+        LOG.info("Behavior event source (%s): %s", events_source_reason, events_source)
+    else:
+        LOG.info("No behavior event source found")
     try:
         events, global_events = load_event_tables_source(
             events_source,
