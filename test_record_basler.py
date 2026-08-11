@@ -949,6 +949,7 @@ class FFmpegWriterTests(unittest.TestCase):
                     {"creationflags": 0x200},
                 )
                 self.assertEqual(record_basler.child_process_kwargs(isolate_ctrl_c=False), {})
+                self.assertNotIn("start_new_session", record_basler.child_process_kwargs(isolate_ctrl_c=True))
 
     def test_start_uses_new_process_group_on_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -970,6 +971,7 @@ class FFmpegWriterTests(unittest.TestCase):
 
             self.assertIs(writer.process, process)
             self.assertEqual(popen_mock.call_args.kwargs["creationflags"], 0x200)
+            self.assertNotIn("start_new_session", popen_mock.call_args.kwargs)
             if writer.stderr_handle is not None:
                 writer.stderr_handle.close()
 
@@ -987,10 +989,11 @@ class FFmpegWriterTests(unittest.TestCase):
 
             self.assertIs(writer.process, process)
             self.assertTrue(popen_mock.call_args.kwargs["start_new_session"])
+            self.assertNotIn("creationflags", popen_mock.call_args.kwargs)
             if writer.stderr_handle is not None:
                 writer.stderr_handle.close()
 
-    def test_close_and_remux_uses_new_process_group_on_windows(self) -> None:
+    def test_close_and_remux_uses_start_new_session_on_posix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = self.make_writer(Path(tmp))
             writer.temp_path.write_bytes(b"mkv")
@@ -1009,6 +1012,36 @@ class FFmpegWriterTests(unittest.TestCase):
 
             self.assertEqual((return_code, remuxed), (0, True))
             self.assertTrue(run_mock.call_args.kwargs["start_new_session"])
+            self.assertNotIn("creationflags", run_mock.call_args.kwargs)
+
+    def test_close_and_remux_uses_creationflags_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = self.make_writer(Path(tmp))
+            writer.temp_path.write_bytes(b"mkv")
+            writer.process = mock.Mock()
+            writer.process.stdin = mock.Mock()
+            writer.process.wait.return_value = 0
+            writer.stderr_handle = writer.stderr_path.open("wb")
+
+            with mock.patch.object(record_basler.os, "name", "nt"):
+                with mock.patch.object(
+                    record_basler.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x200,
+                    create=True,
+                ):
+                    with mock.patch.object(
+                        record_basler.subprocess,
+                        "run",
+                        return_value=mock.Mock(returncode=0),
+                    ) as run_mock:
+                        return_code, remuxed = writer.close_and_remux(keep_temp=True)
+
+            self.assertEqual((return_code, remuxed), (0, True))
+            self.assertEqual(run_mock.call_args.kwargs["creationflags"], 0x200)
+            self.assertNotIn("start_new_session", run_mock.call_args.kwargs)
+            if writer.stderr_handle is not None:
+                writer.stderr_handle.close()
 
     def test_write_frame_or_continue_returns_false_during_user_stop_pipe_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1044,6 +1077,55 @@ class FFmpegWriterTests(unittest.TestCase):
                 stop_event=stop_event,
                 label="camera1",
             )
+
+    def test_user_stop_pipe_close_recovery_path_remuxes_and_classifies_as_user_interrupt(self) -> None:
+        stop_event = threading.Event()
+        user_stop_event = threading.Event()
+        user_stop_event.set()
+        writer = mock.Mock()
+        writer.write.side_effect = record_basler.FFmpegPipeClosedError("boom")
+        writer.close_and_remux.return_value = (255, True)
+
+        result = record_basler.write_frame_or_continue(
+            writer,
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            user_stop_event=user_stop_event,
+            stop_event=stop_event,
+            label="camera1",
+        )
+        return_code, remuxed = writer.close_and_remux(
+            keep_temp=True,
+            allow_nonzero_capture_recovery=user_stop_event.is_set(),
+        )
+        classification = record_basler.classify_clip_stop(
+            error_message=None,
+            planned_complete=False,
+            stop_event_set=stop_event.is_set(),
+            operator_stop_requested=user_stop_event.is_set(),
+            stop_reason="unknown",
+        )
+
+        self.assertFalse(result)
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual((return_code, remuxed), (255, True))
+        writer.close_and_remux.assert_called_once_with(
+            keep_temp=True,
+            allow_nonzero_capture_recovery=True,
+        )
+        self.assertIsNone(classification.error_message)
+        self.assertFalse(classification.planned_complete)
+        self.assertTrue(classification.interrupted_by_user)
+        self.assertEqual(classification.stop_reason, "user_interrupt")
+        clip_result = record_basler.ClipResult(
+            label="camera1",
+            success=classification.error_message is None and remuxed,
+            planned_complete=classification.planned_complete,
+            interrupted_by_user=classification.interrupted_by_user,
+            metadata_path=Path("camera1.json"),
+            video_path=Path("camera1.mp4"),
+            error=classification.error_message,
+        )
+        self.assertTrue(clip_result.success)
 
     def test_close_and_remux_success_on_zero_capture_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -163,16 +163,16 @@ class LeafFeedingLogicTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not monotonic"):
             leaf.select_leaf_sample_targets(timestamps)
 
-    def test_hysteresis_uses_absolute_loss_thresholds(self) -> None:
-        losses = [None, 800.0, 400.0, 250.0, 800.0, 700.0]
+    def test_hysteresis_uses_relative_loss_thresholds(self) -> None:
+        losses = [None, 2.0, 1.5, 0.5, float("nan"), 3.0]
 
         flags = leaf.classify_feeding_hysteresis(
             losses,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
         )
 
-        self.assertEqual(flags, [False, True, True, False, True, True])
+        self.assertEqual(flags, [False, True, True, False, False, True])
 
     def test_short_gap_merge_and_short_bout_cleanup_use_five_minute_steps(self) -> None:
         merged = leaf.merge_short_gaps([True, False, True], step_minutes=5, max_gap_minutes=5)
@@ -214,8 +214,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
             leaf_area_percentile=95.0,
             estimate_interval_minutes=5,
             allowed_gap_minutes=6,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
             merge_gap_minutes=5,
             min_bout_minutes=5,
             leaf_reset_increase_pct=20.0,
@@ -239,8 +239,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
             leaf_area_percentile=95.0,
             estimate_interval_minutes=5,
             allowed_gap_minutes=6,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
             merge_gap_minutes=5,
             min_bout_minutes=5,
             leaf_reset_increase_pct=20.0,
@@ -262,8 +262,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
             leaf_area_percentile=95.0,
             estimate_interval_minutes=5,
             allowed_gap_minutes=6,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
             merge_gap_minutes=5,
             min_bout_minutes=5,
             leaf_reset_increase_pct=20.0,
@@ -286,8 +286,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
             leaf_area_percentile=95.0,
             estimate_interval_minutes=5,
             allowed_gap_minutes=6,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
             merge_gap_minutes=5,
             min_bout_minutes=5,
             leaf_reset_increase_pct=20.0,
@@ -327,13 +327,39 @@ class LeafFeedingLogicTests(unittest.TestCase):
             rows,
             dt.timezone.utc,
             estimate_interval_minutes=5,
-            start_loss_px2=750.0,
-            continue_loss_px2=300.0,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            threshold_metric="pct",
         )
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["start_utc"], "2026-08-09T10:05:00.000000Z")
         self.assertEqual(events[0]["end_utc"], "2026-08-09T10:15:00.000000Z")
+
+    def test_finalize_leaf_rows_removes_short_bouts_before_merging_gaps(self) -> None:
+        base = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 9800, (9800,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=10), 9790, (9790,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=15), 9580, (9580,), 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=10,
+            leaf_reset_increase_pct=20.0,
+        )
+
+        self.assertEqual([row.feeding_raw for row in rows], [False, True, False, True])
+        self.assertEqual([row.feeding for row in rows], [False, False, False, False])
 
     def test_frame_mismatch_is_reported_before_sampling(self) -> None:
         entry = leaf.ManifestEntry("C01", "clip_a", Path("/tmp/video.mp4"), Path("/tmp/timestamps.csv"))
@@ -854,7 +880,25 @@ class LeafFeedingLogicTests(unittest.TestCase):
                         "animal_id": "C01",
                         "clip_key": "clip_0001",
                         "timestamp_utc": "2026-08-09T10:05:00.000000Z",
-                        "leaf_area_proxy_px": "9200.000000",
+                        "leaf_area_proxy_px": "9800.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:10:00.000000Z",
+                        "leaf_area_proxy_px": "9790.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:15:00.000000Z",
+                        "leaf_area_proxy_px": "9600.000000",
                         "n_sampled_frames": "6",
                         "n_valid_frames": "6",
                         "qc_flag": "",
@@ -866,10 +910,33 @@ class LeafFeedingLogicTests(unittest.TestCase):
                 with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [])):
                     with mock.patch.object(leaf.cv2, "VideoCapture", side_effect=AssertionError("should not open video")):
                         with mock.patch("plot_recording_timeline.resolve_behavior_event_source", return_value=(None, "none")):
-                            rc = leaf.main([str(root), "--classify-only", "--animals", "C01"])
+                            rc = leaf.main(
+                                [
+                                    str(root),
+                                    "--classify-only",
+                                    "--animals",
+                                    "C01",
+                                    "--feeding-min-bout-minutes",
+                                    "10",
+                                ]
+                            )
             self.assertEqual(rc, 0)
             self.assertTrue((root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv").exists())
             self.assertTrue((root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_feeding_summary.csv").exists())
+            with (root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv").open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                self.assertEqual(list(leaf.csv.DictReader(handle)), [])
+            with (root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_area_timeseries.csv").open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                rows = list(leaf.csv.DictReader(handle))
+            self.assertEqual([row["feeding_raw"] for row in rows], ["FALSE", "TRUE", "FALSE", "FALSE"])
+            self.assertEqual([row["feeding"] for row in rows], ["FALSE", "FALSE", "FALSE", "FALSE"])
 
     def test_load_analysis_events_supports_google_sheet_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

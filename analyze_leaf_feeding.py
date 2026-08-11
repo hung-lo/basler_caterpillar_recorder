@@ -48,6 +48,8 @@ LOG = logging.getLogger("analyze_leaf_feeding")
 LEAF_ESTIMATE_INTERVAL_MINUTES = 5
 BURST_DURATION_SECONDS = 60
 BURST_STEP_SECONDS = 10
+FEEDING_START_LOSS_PCT = 2.0
+FEEDING_CONTINUE_LOSS_PCT = 1.0
 FEEDING_START_LOSS_PX2 = 750.0
 FEEDING_CONTINUE_LOSS_PX2 = 300.0
 FEEDING_MERGE_GAP_MINUTES = 5
@@ -810,22 +812,30 @@ def segment_leaf_area(
 
 
 def classify_feeding_hysteresis(
-    losses_px2: Iterable[Optional[float]],
+    losses: Iterable[Optional[float]],
     *,
-    start_loss_px2: float,
-    continue_loss_px2: float,
+    start_threshold: float | None = None,
+    continue_threshold: float | None = None,
+    start_loss_px2: float | None = None,
+    continue_loss_px2: float | None = None,
 ) -> list[bool]:
+    if start_threshold is None:
+        start_threshold = start_loss_px2
+    if continue_threshold is None:
+        continue_threshold = continue_loss_px2
+    if start_threshold is None or continue_threshold is None:
+        raise TypeError("missing feeding thresholds")
     feeding = False
     output: list[bool] = []
-    for value in losses_px2:
+    for value in losses:
         if value is None or math.isnan(value):
             feeding = False
             output.append(False)
             continue
         if not feeding:
-            feeding = value >= start_loss_px2
+            feeding = value >= start_threshold
         else:
-            feeding = value >= continue_loss_px2
+            feeding = value >= continue_threshold
         output.append(feeding)
     return output
 
@@ -1219,14 +1229,22 @@ def finalize_leaf_rows(
     leaf_area_percentile: float,
     estimate_interval_minutes: int,
     allowed_gap_minutes: int,
-    start_loss_px2: float,
-    continue_loss_px2: float,
+    start_threshold: float | None = None,
+    continue_threshold: float | None = None,
+    start_loss_px2: float | None = None,
+    continue_loss_px2: float | None = None,
     merge_gap_minutes: int,
     min_bout_minutes: int,
     leaf_reset_increase_pct: float,
     explicit_resets: Optional[dict[str, list[dt.datetime]]] = None,
     video_quality_intervals_utc: Sequence[tuple[dt.datetime, dt.datetime]] = (),
 ) -> list[LeafAreaRow]:
+    if start_threshold is None:
+        start_threshold = start_loss_px2
+    if continue_threshold is None:
+        continue_threshold = continue_loss_px2
+    if start_threshold is None or continue_threshold is None:
+        raise TypeError("missing feeding thresholds")
     consolidated_estimates = consolidate_leaf_estimates(estimates, leaf_area_percentile=leaf_area_percentile)
     explicit_resets = explicit_resets or {}
     grouped: dict[str, list[LeafAreaEstimate]] = defaultdict(list)
@@ -1321,9 +1339,9 @@ def finalize_leaf_rows(
         for epoch in sorted(by_epoch):
             epoch_rows = by_epoch[epoch]
             raw_flags = classify_feeding_hysteresis(
-                [row.delta_area_5min_px2 if row.feeding_valid else None for row in epoch_rows],
-                start_loss_px2=start_loss_px2,
-                continue_loss_px2=continue_loss_px2,
+                [row.loss_prev_estimate_pct if row.feeding_valid else None for row in epoch_rows],
+                start_threshold=start_threshold,
+                continue_threshold=continue_threshold,
             )
             final_flags = list(raw_flags)
             segment_start = 0
@@ -1340,14 +1358,14 @@ def finalize_leaf_rows(
                         break
                     segment_end += 1
                 segment_flags = raw_flags[segment_start:segment_end]
-                cleaned_flags = remove_short_bouts(
-                    merge_short_gaps(
+                cleaned_flags = merge_short_gaps(
+                    remove_short_bouts(
                         segment_flags,
                         step_minutes=estimate_interval_minutes,
-                        max_gap_minutes=merge_gap_minutes,
+                        min_bout_minutes=min_bout_minutes,
                     ),
                     step_minutes=estimate_interval_minutes,
-                    min_bout_minutes=min_bout_minutes,
+                    max_gap_minutes=merge_gap_minutes,
                 )
                 final_flags[segment_start:segment_end] = cleaned_flags
                 segment_start = segment_end
@@ -1388,17 +1406,30 @@ def feeding_event_dicts(
     timezone: dt.tzinfo,
     *,
     estimate_interval_minutes: int,
-    start_loss_px2: float,
-    continue_loss_px2: float,
+    start_threshold: float | None = None,
+    continue_threshold: float | None = None,
+    threshold_metric: str = "pct",
+    start_loss_px2: float | None = None,
+    continue_loss_px2: float | None = None,
 ) -> list[dict[str, str]]:
+    if start_threshold is None:
+        start_threshold = start_loss_px2
+    if continue_threshold is None:
+        continue_threshold = continue_loss_px2
+    if start_threshold is None or continue_threshold is None:
+        raise TypeError("missing feeding thresholds")
+    if threshold_metric == "pct" and (start_loss_px2 is not None or continue_loss_px2 is not None):
+        threshold_metric = "px2"
     events: list[dict[str, str]] = []
     grouped: dict[str, list[LeafAreaRow]] = defaultdict(list)
     for row in rows:
         grouped[row.animal_id].append(row)
     estimate_interval = dt.timedelta(minutes=estimate_interval_minutes)
+    threshold_unit = "%" if threshold_metric == "pct" else "px2"
+    descriptor = "relative" if threshold_metric == "pct" else "absolute"
     notes = (
-        f"coarse {estimate_interval_minutes}-min absolute leaf-area detector; "
-        f"start>={start_loss_px2:g}px2; continue>={continue_loss_px2:g}px2"
+        f"coarse {estimate_interval_minutes}-min {descriptor} leaf-area detector; "
+        f"start>={start_threshold:g}{threshold_unit}; continue>={continue_threshold:g}{threshold_unit}"
     )
     for animal_id in ANIMAL_ORDER:
         animal_rows = sorted(grouped.get(animal_id, []), key=lambda row: row.timestamp_utc)
@@ -1684,8 +1715,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leaf-area-percentile", type=float, default=95.0)
     parser.add_argument("--min-valid-frames", type=int, default=3)
     parser.add_argument("--allowed-gap-minutes", type=int)
-    parser.add_argument("--feeding-start-loss-px2", type=float, default=FEEDING_START_LOSS_PX2)
-    parser.add_argument("--feeding-continue-loss-px2", type=float, default=FEEDING_CONTINUE_LOSS_PX2)
+    parser.add_argument(
+        "--feeding-threshold-metric",
+        choices=["pct", "px2"],
+        default="pct",
+        help="Use relative percent loss by default, or opt into legacy absolute px2 thresholds.",
+    )
+    parser.add_argument("--feeding-start-loss-pct", type=float, default=FEEDING_START_LOSS_PCT)
+    parser.add_argument("--feeding-continue-loss-pct", type=float, default=FEEDING_CONTINUE_LOSS_PCT)
+    parser.add_argument("--feeding-start-loss-px2", type=float, default=FEEDING_START_LOSS_PX2, help=argparse.SUPPRESS)
+    parser.add_argument("--feeding-continue-loss-px2", type=float, default=FEEDING_CONTINUE_LOSS_PX2, help=argparse.SUPPRESS)
     parser.add_argument("--feeding-merge-gap-minutes", type=int, default=FEEDING_MERGE_GAP_MINUTES)
     parser.add_argument("--feeding-min-bout-minutes", type=int, default=FEEDING_MIN_BOUT_MINUTES)
     parser.add_argument("--leaf-reset-increase-pct", type=float, default=20.0)
@@ -1707,6 +1746,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--qc", action="store_true")
     return parser
+
+
+def resolve_feeding_thresholds(args: argparse.Namespace) -> tuple[str, float, float]:
+    if args.feeding_threshold_metric == "px2":
+        return "px2", args.feeding_start_loss_px2, args.feeding_continue_loss_px2
+    return "pct", args.feeding_start_loss_pct, args.feeding_continue_loss_pct
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1806,14 +1851,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         LOG.error("%s", exc)
         return 1
 
+    feeding_threshold_metric, feeding_start_threshold, feeding_continue_threshold = resolve_feeding_thresholds(args)
+
     finalized_rows = finalize_leaf_rows(
         all_estimates,
         timezone=timezone,
         leaf_area_percentile=args.leaf_area_percentile,
         estimate_interval_minutes=args.leaf_estimate_minutes,
         allowed_gap_minutes=allowed_gap_minutes,
-        start_loss_px2=args.feeding_start_loss_px2,
-        continue_loss_px2=args.feeding_continue_loss_px2,
+        start_threshold=feeding_start_threshold,
+        continue_threshold=feeding_continue_threshold,
         merge_gap_minutes=args.feeding_merge_gap_minutes,
         min_bout_minutes=args.feeding_min_bout_minutes,
         leaf_reset_increase_pct=args.leaf_reset_increase_pct,
@@ -1824,8 +1871,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         finalized_rows,
         timezone,
         estimate_interval_minutes=args.leaf_estimate_minutes,
-        start_loss_px2=args.feeding_start_loss_px2,
-        continue_loss_px2=args.feeding_continue_loss_px2,
+        start_threshold=feeding_start_threshold,
+        continue_threshold=feeding_continue_threshold,
+        threshold_metric=feeding_threshold_metric,
     )
     write_csv(output_root / "leaf_area_timeseries.csv", LEAF_AREA_FIELDS, leaf_rows_to_dicts(finalized_rows, timezone))
     write_csv(output_root / "feeding_events.csv", FEEDING_EVENT_FIELDS, feeding_events)
