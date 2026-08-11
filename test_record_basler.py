@@ -569,6 +569,51 @@ class ArchiveBackendTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(issues, [])
 
+    def test_clip_directory_ready_for_archive_rejects_unfinalized_review_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp)
+            metadata_path = clip_dir / "camera1.json"
+            (clip_dir / "camera1.mp4").write_bytes(b"mp4")
+            with gzip.open(
+                clip_dir / "camera1.timestamps.csv.gz",
+                "wt",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write("frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n")
+                handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+            review_dir = clip_dir / "review_snapshots"
+            review_dir.mkdir()
+            (review_dir / ".camera1_review_snapshot_0000.jpg.tmp").write_bytes(b"tmp")
+            record_basler.write_json(
+                metadata_path,
+                {
+                    "success": True,
+                    "planned_clip_complete": True,
+                    "interrupted_by_user": False,
+                    "stop_reason": "planned_end",
+                    "grab_failures": 0,
+                    "mp4_remux_succeeded": True,
+                    "review_snapshots": {
+                        "enabled": True,
+                        "directory": "review_snapshots",
+                        "writer_finalized": False,
+                    },
+                },
+            )
+
+            ready, issues, _total_bytes = record_basler.clip_directory_ready_for_archive(
+                clip_dir,
+                expected_camera_count=1,
+                max_clip_size_bytes=10_000_000,
+            )
+
+        self.assertFalse(ready)
+        self.assertTrue(
+            any("review_snapshots.writer_finalized" in issue for issue in issues),
+            issues,
+        )
+
     def test_summarize_clip_results_treats_valid_user_interrupt_as_non_failure(self) -> None:
         results = [
             record_basler.ClipResult(
@@ -1450,6 +1495,26 @@ class RecordingPreviewSettingsTests(unittest.TestCase):
             )
 
 
+class ReviewSnapshotSettingsTests(unittest.TestCase):
+    def test_default_is_disabled(self) -> None:
+        settings = record_basler.parse_review_snapshot_settings({})
+        self.assertFalse(settings.enabled)
+        self.assertEqual(settings.count_per_clip, 10)
+        self.assertEqual(settings.jpeg_quality, 95)
+
+    def test_equal_bin_centers_match_expected_ten_minute_targets(self) -> None:
+        self.assertEqual(
+            record_basler.review_snapshot_targets(600.0, 10),
+            [30.0, 90.0, 150.0, 210.0, 270.0, 330.0, 390.0, 450.0, 510.0, 570.0],
+        )
+
+    def test_invalid_quality_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "review_snapshots.jpeg_quality"):
+            record_basler.parse_review_snapshot_settings(
+                {"review_snapshots": {"enabled": True, "jpeg_quality": 0}}
+            )
+
+
 class RecordingPreviewTests(unittest.TestCase):
     def test_card_panel_layout_stays_out_of_footer_and_minimal_mode_fits_short_frame(self) -> None:
         layout = record_basler._calculate_card_panel_layout(260, 180, 42)
@@ -2031,6 +2096,9 @@ class StartSchedulingTests(unittest.TestCase):
                             status_settings=record_basler.StatusSettings(0.0),
                             preview_settings=record_basler.RecordingPreviewSettings(enabled=False),
                             archive_settings=record_basler.ArchiveSettings(enabled=False),
+                            review_snapshot_settings=record_basler.ReviewSnapshotSettings(
+                                enabled=False
+                            ),
                             recording_plan={
                                 "start_mode": "immediate",
                                 "requested_start_utc": None,

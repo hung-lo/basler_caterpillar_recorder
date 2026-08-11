@@ -136,6 +136,14 @@ def filename_local_timestamp(value: dt.datetime) -> str:
     return to_local(value).strftime("%Y%m%d_%H%M%S%z")
 
 
+def filename_local_timestamp_ms_from_ns(value_ns: int) -> str:
+    value = dt.datetime.fromtimestamp(value_ns / 1e9, tz=dt.timezone.utc).astimezone()
+    date_part = value.strftime("%Y%m%d_%H%M%S")
+    millis = value.microsecond // 1000
+    offset = value.strftime("%z")
+    return f"{date_part}.{millis:03d}{offset}"
+
+
 def clip_clock_local(value: dt.datetime) -> str:
     """Return a clip-directory local timestamp with the active UTC offset."""
 
@@ -182,6 +190,23 @@ def format_preview_exposure(
     prefix = "AUTO EXP" if auto_exposure else "EXP"
     suffix = "  MAX" if near_limit else ""
     return f"{prefix} {ms:.1f} ms{suffix}", near_limit
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def sanitize_token(value: str) -> str:
@@ -615,6 +640,13 @@ class RecordingPreviewSettings:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReviewSnapshotSettings:
+    enabled: bool = False
+    count_per_clip: int = 10
+    jpeg_quality: int = 95
+
+
+@dataclasses.dataclass(frozen=True)
 class SystemSettings:
     prevent_sleep_during_recording: bool = False
 
@@ -687,6 +719,228 @@ class PreviewPacket:
     auto_exposure_upper_us: Optional[float] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ReviewSnapshotJob:
+    snapshot_index: int
+    target_elapsed_s: float
+    frame_index: int
+    frame: np.ndarray
+    host_utc_ns: int
+    host_monotonic_ns: int
+    actual_clip_elapsed_s: float
+    video_time_s: float
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewSnapshotResult:
+    snapshot_index: int
+    target_elapsed_s: float
+    frame_index: int
+    filename: Optional[str]
+    host_utc_ns: int
+    host_monotonic_ns: int
+    actual_clip_elapsed_s: float
+    video_time_s: float
+    success: bool
+    error: Optional[str]
+
+
+def review_snapshot_targets(planned_duration_s: float, count_per_clip: int) -> list[float]:
+    if planned_duration_s <= 0:
+        return []
+    return [((index + 0.5) * planned_duration_s / count_per_clip) for index in range(count_per_clip)]
+
+
+def review_snapshot_filename(
+    camera_label: str,
+    snapshot_index: int,
+    host_utc_ns: int,
+    video_time_s: float,
+    frame_index: int,
+) -> str:
+    return (
+        f"{sanitize_token(camera_label)}_"
+        f"s{snapshot_index:02d}_"
+        f"{filename_local_timestamp_ms_from_ns(host_utc_ns)}_"
+        f"v{video_time_s:07.1f}s_"
+        f"f{frame_index:08d}.jpg"
+    )
+
+
+def review_snapshot_local_iso_from_ns(value_ns: int) -> str:
+    return isoformat_local(dt.datetime.fromtimestamp(value_ns / 1e9, tz=dt.timezone.utc))
+
+
+class ReviewSnapshotWriter:
+    def __init__(self, *, camera_label: str, output_dir: Path, jpeg_quality: int) -> None:
+        self.camera_label = camera_label
+        self.output_dir = output_dir
+        self.jpeg_quality = jpeg_quality
+        self.queue: queue.Queue[ReviewSnapshotJob] = queue.Queue(maxsize=2)
+        self.result_queue: queue.Queue[ReviewSnapshotResult] = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.accepting = False
+        self._thread = threading.Thread(
+            target=self._worker_main,
+            name=f"{sanitize_token(camera_label)}-review-snapshot-writer",
+            daemon=True,
+        )
+        self._started = False
+
+    def start(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.accepting = True
+        self._thread.start()
+        self._started = True
+
+    def submit(self, job: ReviewSnapshotJob) -> bool:
+        if not self.accepting or self.cancel_event.is_set():
+            return False
+        try:
+            self.queue.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+    def close_and_join(self, timeout_s: float = 10.0) -> bool:
+        self.accepting = False
+        if not self._started:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while self._thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.cancel_event.set()
+                break
+            self._thread.join(timeout=min(0.25, remaining))
+        if self._thread.is_alive():
+            self.cancel_event.set()
+            self._thread.join(timeout=0.25)
+        return not self._thread.is_alive()
+
+    def collect_results(self) -> list[ReviewSnapshotResult]:
+        results: list[ReviewSnapshotResult] = []
+        while True:
+            try:
+                results.append(self.result_queue.get_nowait())
+            except queue.Empty:
+                break
+        results.sort(key=lambda result: result.snapshot_index)
+        return results
+
+    def _worker_main(self) -> None:
+        while True:
+            try:
+                job = self.queue.get(timeout=0.1)
+            except queue.Empty:
+                if not self.accepting and self.queue.empty():
+                    break
+                if self.cancel_event.is_set() and self.queue.empty():
+                    break
+                continue
+
+            try:
+                self.result_queue.put(self._process_job(job))
+            finally:
+                self.queue.task_done()
+
+    def _process_job(self, job: ReviewSnapshotJob) -> ReviewSnapshotResult:
+        filename = review_snapshot_filename(
+            self.camera_label,
+            job.snapshot_index,
+            job.host_utc_ns,
+            job.video_time_s,
+            job.frame_index,
+        )
+        final_path = self.output_dir / filename
+        temp_path = final_path.with_name(f".{final_path.name}.tmp")
+        try:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                job.frame,
+                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+            )
+            if not ok:
+                raise RuntimeError("cv2.imencode returned false")
+            with temp_path.open("wb") as handle:
+                handle.write(encoded.tobytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, final_path)
+            return ReviewSnapshotResult(
+                snapshot_index=job.snapshot_index,
+                target_elapsed_s=job.target_elapsed_s,
+                frame_index=job.frame_index,
+                filename=filename,
+                host_utc_ns=job.host_utc_ns,
+                host_monotonic_ns=job.host_monotonic_ns,
+                actual_clip_elapsed_s=job.actual_clip_elapsed_s,
+                video_time_s=job.video_time_s,
+                success=True,
+                error=None,
+            )
+        except Exception as exc:
+            temp_path.unlink(missing_ok=True)
+            return ReviewSnapshotResult(
+                snapshot_index=job.snapshot_index,
+                target_elapsed_s=job.target_elapsed_s,
+                frame_index=job.frame_index,
+                filename=None,
+                host_utc_ns=job.host_utc_ns,
+                host_monotonic_ns=job.host_monotonic_ns,
+                actual_clip_elapsed_s=job.actual_clip_elapsed_s,
+                video_time_s=job.video_time_s,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+
+def write_review_snapshot_index_csv(path: Path, results: list[ReviewSnapshotResult]) -> None:
+    fieldnames = [
+        "snapshot_index",
+        "filename",
+        "target_elapsed_s",
+        "actual_clip_elapsed_s",
+        "target_error_s",
+        "video_time_s",
+        "frame_index",
+        "host_utc_ns",
+        "host_utc_iso",
+        "host_local_iso",
+        "host_monotonic_ns",
+    ]
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in sorted(
+                (item for item in results if item.success and item.filename),
+                key=lambda item: item.snapshot_index,
+            ):
+                writer.writerow(
+                    {
+                        "snapshot_index": result.snapshot_index,
+                        "filename": result.filename,
+                        "target_elapsed_s": f"{result.target_elapsed_s:.6f}",
+                        "actual_clip_elapsed_s": f"{result.actual_clip_elapsed_s:.6f}",
+                        "target_error_s": f"{result.actual_clip_elapsed_s - result.target_elapsed_s:.6f}",
+                        "video_time_s": f"{result.video_time_s:.6f}",
+                        "frame_index": result.frame_index,
+                        "host_utc_ns": result.host_utc_ns,
+                        "host_utc_iso": iso_utc_from_ns(result.host_utc_ns),
+                        "host_local_iso": review_snapshot_local_iso_from_ns(result.host_utc_ns),
+                        "host_monotonic_ns": result.host_monotonic_ns,
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def parse_system_settings(config: dict[str, Any]) -> SystemSettings:
     raw = config.get("system") or {}
     if not isinstance(raw, dict):
@@ -731,6 +985,24 @@ def parse_recording_preview_settings(config: dict[str, Any]) -> RecordingPreview
         raise ValueError("recording_preview.fps must be positive")
     if settings.max_width < 64 or settings.max_height < 64:
         raise ValueError("recording_preview.max_width and max_height must be at least 64")
+    return settings
+
+
+def parse_review_snapshot_settings(config: dict[str, Any]) -> ReviewSnapshotSettings:
+    raw = config.get("review_snapshots") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("review_snapshots must be a mapping/object")
+
+    settings = ReviewSnapshotSettings(
+        enabled=bool(raw.get("enabled", False)),
+        count_per_clip=int(raw.get("count_per_clip", 10)),
+        jpeg_quality=int(raw.get("jpeg_quality", 95)),
+    )
+
+    if settings.count_per_clip <= 0:
+        raise ValueError("review_snapshots.count_per_clip must be positive")
+    if not 1 <= settings.jpeg_quality <= 100:
+        raise ValueError("review_snapshots.jpeg_quality must be between 1 and 100")
     return settings
 
 
@@ -1748,6 +2020,22 @@ def clip_directory_ready_for_archive(
             issues.append(
                 f"{json_path.name}: mp4_remux_succeeded is {metadata.get('mp4_remux_succeeded')!r}"
             )
+        review_snapshots = metadata.get("review_snapshots")
+        if isinstance(review_snapshots, dict):
+            if review_snapshots.get("enabled") is True:
+                if review_snapshots.get("writer_finalized") is not True:
+                    issues.append(
+                        f"{json_path.name}: review_snapshots.writer_finalized is "
+                        f"{review_snapshots.get('writer_finalized')!r}"
+                    )
+                review_dir_name = str(review_snapshots.get("directory") or "review_snapshots")
+                review_dir = clip_dir / review_dir_name
+                if review_dir.exists():
+                    temp_review_files = sorted(review_dir.glob(".*.tmp"))
+                    if temp_review_files:
+                        issues.append(
+                            f"{json_path.name}: temporary review snapshot files remain: {len(temp_review_files)}"
+                        )
 
     return not issues, issues, total_bytes
 
@@ -2831,6 +3119,7 @@ def record_one_camera(
     result_queue: queue.Queue[ClipResult],
     preview_queue: Optional[queue.Queue[PreviewPacket]],
     preview_settings: RecordingPreviewSettings,
+    review_snapshot_settings: ReviewSnapshotSettings,
     preview_active_event: threading.Event,
 ) -> None:
     label = binding.label
@@ -2877,6 +3166,43 @@ def record_one_camera(
     planned_complete = False
     interrupted_by_user = False
     stop_reason = "unknown"
+    review_snapshot_writer: Optional[ReviewSnapshotWriter] = None
+    review_snapshot_targets_s = (
+        review_snapshot_targets(
+            (planned_stop_mono_ns - planned_start_mono_ns) / 1e9,
+            review_snapshot_settings.count_per_clip,
+        )
+        if review_snapshot_settings.enabled
+        else []
+    )
+    review_snapshot_next_target_index = 0
+    review_snapshot_targets_reached = 0
+    review_snapshot_queued = 0
+    review_snapshot_saved = 0
+    review_snapshot_failed = 0
+    review_snapshot_dropped_queue_full = 0
+    review_snapshot_missed_due_acquisition_gap = 0
+    review_snapshot_writer_finalized = not review_snapshot_settings.enabled
+    review_snapshot_error: Optional[str] = None
+
+    if review_snapshot_settings.enabled:
+        try:
+            review_snapshot_writer = ReviewSnapshotWriter(
+                camera_label=label,
+                output_dir=clip_dir / "review_snapshots",
+                jpeg_quality=review_snapshot_settings.jpeg_quality,
+            )
+            review_snapshot_writer.start()
+            LOG.info(
+                "%s review snapshots enabled: %d target(s) at JPEG quality %d",
+                label,
+                len(review_snapshot_targets_s),
+                review_snapshot_settings.jpeg_quality,
+            )
+        except Exception as exc:
+            review_snapshot_error = f"{type(exc).__name__}: {exc}"
+            LOG.warning("%s review snapshots disabled for this clip: %s", label, review_snapshot_error)
+            review_snapshot_writer = None
 
     metadata: dict[str, Any] = {
         "camera": binding.info,
@@ -2979,9 +3305,10 @@ def record_one_camera(
                 camera_timestamp = get_grab_value(grab, ("ChunkTimestamp", "TimeStamp", "Timestamp"))
                 block_id = get_grab_value(grab, ("BlockID", "ID"))
                 skipped = get_grab_value(grab, ("GetNumberOfSkippedImages", "NumberOfSkippedImages"))
+                current_frame_index = frame_count
                 csv_writer.writerow(
                     [
-                        frame_count,
+                        current_frame_index,
                         host_utc_ns,
                         iso_utc_from_ns(host_utc_ns),
                         host_mono_ns,
@@ -2999,6 +3326,44 @@ def record_one_camera(
                 last_host_mono_ns = host_mono_ns
                 last_camera_timestamp = camera_timestamp
                 frame_count += 1
+
+                if review_snapshot_writer is not None and review_snapshot_targets_s:
+                    actual_clip_elapsed_s = max(
+                        0.0,
+                        (host_mono_ns - planned_start_mono_ns) / 1e9,
+                    )
+                    due_indices: list[int] = []
+                    while (
+                        review_snapshot_next_target_index < len(review_snapshot_targets_s)
+                        and actual_clip_elapsed_s >= review_snapshot_targets_s[review_snapshot_next_target_index]
+                    ):
+                        due_indices.append(review_snapshot_next_target_index)
+                        review_snapshot_next_target_index += 1
+
+                    if due_indices:
+                        review_snapshot_targets_reached += len(due_indices)
+                        if len(due_indices) > 1:
+                            review_snapshot_missed_due_acquisition_gap += len(due_indices) - 1
+                        target_index = due_indices[-1]
+                        review_job = ReviewSnapshotJob(
+                            snapshot_index=target_index + 1,
+                            target_elapsed_s=review_snapshot_targets_s[target_index],
+                            frame_index=current_frame_index,
+                            frame=frame.copy(),
+                            host_utc_ns=host_utc_ns,
+                            host_monotonic_ns=host_mono_ns,
+                            actual_clip_elapsed_s=actual_clip_elapsed_s,
+                            video_time_s=current_frame_index / actual_fps,
+                        )
+                        if review_snapshot_writer.submit(review_job):
+                            review_snapshot_queued += 1
+                        else:
+                            review_snapshot_dropped_queue_full += 1
+                            LOG.warning(
+                                "%s review snapshot queue is full; dropping snapshot %d",
+                                label,
+                                target_index + 1,
+                            )
 
                 if (
                     preview_queue is not None
@@ -3152,6 +3517,38 @@ def record_one_camera(
                 except Exception:
                     pass
 
+        review_snapshot_results: list[ReviewSnapshotResult] = []
+        if review_snapshot_settings.enabled:
+            if review_snapshot_writer is not None:
+                review_snapshot_writer_finalized = review_snapshot_writer.close_and_join(timeout_s=10.0)
+                if not review_snapshot_writer_finalized:
+                    LOG.warning(
+                        "%s review snapshot writer did not finalize within 10 seconds; archive will remain blocked",
+                        label,
+                    )
+                review_snapshot_results = review_snapshot_writer.collect_results()
+            else:
+                review_snapshot_writer_finalized = False
+
+            review_snapshot_saved = sum(1 for result in review_snapshot_results if result.success)
+            review_snapshot_failed = sum(1 for result in review_snapshot_results if not result.success)
+            review_snapshot_unreached_targets = max(
+                0,
+                len(review_snapshot_targets_s) - review_snapshot_next_target_index,
+            )
+            review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
+            if review_snapshot_writer_finalized:
+                try:
+                    write_review_snapshot_index_csv(review_snapshot_metadata_path, review_snapshot_results)
+                except Exception as exc:
+                    review_snapshot_writer_finalized = False
+                    review_snapshot_error = f"{type(exc).__name__}: {exc}"
+                    LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
+            else:
+                review_snapshot_error = review_snapshot_error or "review snapshot writer did not finalize"
+        else:
+            review_snapshot_unreached_targets = 0
+
         actual_elapsed_s = None
         measured_fps = None
         if first_host_mono_ns is not None and last_host_mono_ns is not None:
@@ -3219,6 +3616,27 @@ def record_one_camera(
                 "ffmpeg_return_code": ffmpeg_return_code,
                 "ffmpeg_nonzero_exit_recovered": ffmpeg_nonzero_exit_recovered,
                 "mp4_remux_succeeded": remuxed,
+                "review_snapshots": {
+                    "enabled": review_snapshot_settings.enabled,
+                    "directory": "review_snapshots" if review_snapshot_settings.enabled else None,
+                    "index_csv": (
+                        f"review_snapshots/{file_stem}_snapshots.csv"
+                        if review_snapshot_settings.enabled
+                        else None
+                    ),
+                    "sampling_strategy": "equal_bin_centers_monotonic",
+                    "requested_per_full_clip": review_snapshot_settings.count_per_clip,
+                    "jpeg_quality": review_snapshot_settings.jpeg_quality,
+                    "targets_reached": review_snapshot_targets_reached,
+                    "queued": review_snapshot_queued,
+                    "saved": review_snapshot_saved,
+                    "failed": review_snapshot_failed,
+                    "dropped_queue_full": review_snapshot_dropped_queue_full,
+                    "missed_due_acquisition_gap": review_snapshot_missed_due_acquisition_gap,
+                    "unreached_targets": review_snapshot_unreached_targets,
+                    "writer_finalized": review_snapshot_writer_finalized,
+                    "error": review_snapshot_error,
+                },
                 "completed_utc": isoformat_utc(completed_at),
                 "completed_local": isoformat_local(completed_at),
             }
@@ -4620,6 +5038,7 @@ def run_recording_session(
     system_settings: SystemSettings,
     status_settings: StatusSettings,
     preview_settings: RecordingPreviewSettings,
+    review_snapshot_settings: ReviewSnapshotSettings,
     archive_settings: ArchiveSettings,
     recording_plan: dict[str, Any],
     output_root: Path,
@@ -4654,6 +5073,12 @@ def run_recording_session(
         preview_settings.fps,
         preview_settings.max_width,
         preview_settings.max_height,
+    )
+    LOG.info(
+        "Review snapshots: enabled=%s count_per_clip=%d jpeg_quality=%d",
+        review_snapshot_settings.enabled,
+        review_snapshot_settings.count_per_clip,
+        review_snapshot_settings.jpeg_quality,
     )
     LOG.info(
         "System: prevent_sleep_during_recording=%s",
@@ -4946,6 +5371,7 @@ def run_recording_session(
                             "result_queue": results,
                             "preview_queue": preview_queues.get(binding.label),
                             "preview_settings": preview_settings,
+                            "review_snapshot_settings": review_snapshot_settings,
                             "preview_active_event": preview_active_event,
                         },
                         daemon=False,
@@ -5190,6 +5616,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
     system_settings = parse_system_settings(config)
     status_settings = parse_status_settings(config)
     preview_settings = parse_recording_preview_settings(config)
+    review_snapshot_settings = parse_review_snapshot_settings(config)
     archive_settings = parse_archive_settings(config)
     total_clips = expected_clip_count(
         interval_s=interval_s,
@@ -5289,6 +5716,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                 "status": dataclasses.asdict(status_settings),
                 "system": dataclasses.asdict(system_settings),
                 "recording_preview": dataclasses.asdict(preview_settings),
+                "review_snapshots": dataclasses.asdict(review_snapshot_settings),
                 "archive": dataclasses.asdict(archive_settings),
                 "archive_preflight": dataclasses.asdict(archive_preflight) if archive_preflight else None,
                 "recording_plan": recording_plan,
@@ -5364,6 +5792,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
                     system_settings=system_settings,
                     status_settings=status_settings,
                     preview_settings=preview_settings,
+                    review_snapshot_settings=review_snapshot_settings,
                     archive_settings=archive_settings,
                     recording_plan=recording_plan,
                     output_root=output_root,
@@ -5392,6 +5821,7 @@ def run_recording(config_path: Path, config: dict[str, Any], verbose: bool, dry_
         system_settings=system_settings,
         status_settings=status_settings,
         preview_settings=preview_settings,
+        review_snapshot_settings=review_snapshot_settings,
         archive_settings=archive_settings,
         recording_plan=recording_plan,
         output_root=output_root,
