@@ -241,6 +241,145 @@ class TimelinePlotTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["frames"], "3")
             self.assertEqual(rows[0]["start_utc"], "2026-08-09T19:00:00.000000Z")
+            self.assertIn("timestamp_size_bytes", rows[0])
+            self.assertIn("timestamp_mtime_ns", rows[0])
+            self.assertTrue(rows[0]["timestamp_size_bytes"])
+            self.assertTrue(rows[0]["timestamp_mtime_ns"])
+
+    def test_collect_recording_clips_reuses_coverage_cache_when_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0001",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 5, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+
+            initial_clips, _warnings = timeline.collect_recording_clips(root)
+            coverage_csv = root / "recording_coverage.csv"
+            timeline.write_coverage_csv(initial_clips, coverage_csv, dt.timezone(dt.timedelta(hours=-4)))
+
+            with mock.patch.object(
+                timeline,
+                "read_timestamp_clip",
+                side_effect=AssertionError("cache hit should not reparse timestamp files"),
+            ):
+                cached_clips, warnings = timeline.collect_recording_clips(root, coverage_cache=coverage_csv)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual([clip.clip_id for clip in cached_clips], [clip.clip_id for clip in initial_clips])
+            self.assertEqual([clip.frames for clip in cached_clips], [2, 2])
+
+    def test_collect_recording_clips_reparses_only_changed_timestamp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clip_a_dir = root / "session_a" / "clip_0000"
+            clip_b_dir = root / "session_a" / "clip_0001"
+            self.write_timestamp_clip(
+                clip_a_dir,
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+            self.write_timestamp_clip(
+                clip_b_dir,
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 5, 1, tzinfo=dt.timezone.utc),
+                ],
+            )
+
+            initial_clips, _warnings = timeline.collect_recording_clips(root)
+            coverage_csv = root / "recording_coverage.csv"
+            timeline.write_coverage_csv(initial_clips, coverage_csv, dt.timezone(dt.timedelta(hours=-4)))
+
+            self.write_timestamp_clip(
+                clip_b_dir,
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 5, 1, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 5, 2, tzinfo=dt.timezone.utc),
+                ],
+            )
+
+            with mock.patch.object(
+                timeline,
+                "read_timestamp_clip",
+                wraps=timeline.read_timestamp_clip,
+            ) as mock_read:
+                clips, warnings = timeline.collect_recording_clips(root, coverage_cache=coverage_csv)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(mock_read.call_count, 1)
+            self.assertEqual(sorted(clip.frames for clip in clips), [2, 3])
+
+    def test_collect_recording_clips_upgrades_old_coverage_cache_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_timestamp_clip(
+                root / "session_a" / "clip_0000",
+                timestamps=[
+                    dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 1, tzinfo=dt.timezone.utc),
+                    dt.datetime(2026, 8, 9, 19, 0, 2, tzinfo=dt.timezone.utc),
+                ],
+            )
+            coverage_csv = root / "recording_coverage.csv"
+            with coverage_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "clip_id",
+                        "timestamp_file",
+                        "video_file",
+                        "start_utc",
+                        "end_utc",
+                        "start_local",
+                        "end_local",
+                        "duration_s",
+                        "frames",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "clip_id": "session_a/camera1",
+                        "timestamp_file": str(root / "session_a" / "clip_0000" / "camera1.timestamps.csv.gz"),
+                        "video_file": str(root / "session_a" / "clip_0000" / "camera1.mp4"),
+                        "start_utc": "2026-08-09T19:00:00.000000Z",
+                        "end_utc": "2026-08-09T19:00:02.000000Z",
+                        "start_local": "2026-08-09 15:00:00-04:00",
+                        "end_local": "2026-08-09 15:00:02-04:00",
+                        "duration_s": "2.000000",
+                        "frames": "3",
+                    }
+                )
+
+            with mock.patch.object(
+                timeline,
+                "read_timestamp_clip",
+                wraps=timeline.read_timestamp_clip,
+            ) as mock_read:
+                clips, warnings = timeline.collect_recording_clips(root, coverage_cache=coverage_csv)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(mock_read.call_count, 1)
+            timeline.write_coverage_csv(clips, coverage_csv, dt.timezone(dt.timedelta(hours=-4)))
+            with coverage_csv.open("r", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertIn("timestamp_size_bytes", rows[0])
+            self.assertTrue(rows[0]["timestamp_size_bytes"])
+            self.assertTrue(rows[0]["timestamp_mtime_ns"])
 
     def test_parser_preserves_point_vs_duration_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1105,6 +1244,133 @@ class TimelinePlotTests(unittest.TestCase):
         expected_width = 15 * 60 / 86400.0
         self.assertAlmostEqual(rendered_left, expected_left)
         self.assertAlmostEqual(rendered_width, expected_width)
+
+    def test_motion_states_are_batched_by_animal_and_state(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_a",
+                start_utc=dt.datetime(2026, 8, 9, 18, 50, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 18, 55, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_b",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_c",
+                start_utc=dt.datetime(2026, 8, 9, 19, 10, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 15, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=1.5,
+                n_windows=300,
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[],
+                motion_states=motion_states,
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        motion_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") in {timeline.MOTION_MOBILE_COLOR, timeline.MOTION_IMMOBILE_COLOR}
+        ]
+        self.assertEqual(len(motion_calls), 2)
+        mobile_call = next(call for call in motion_calls if call.kwargs["facecolors"] == timeline.MOTION_MOBILE_COLOR)
+        immobile_call = next(call for call in motion_calls if call.kwargs["facecolors"] == timeline.MOTION_IMMOBILE_COLOR)
+        self.assertEqual(len(mobile_call.args[0]), 2)
+        self.assertEqual(len(immobile_call.args[0]), 1)
+        self.assertAlmostEqual(mobile_call.args[0][0][1], 5 * 60 / 86400.0)
+        self.assertAlmostEqual(mobile_call.args[0][1][1], 5 * 60 / 86400.0)
+        self.assertAlmostEqual(immobile_call.args[0][0][1], 5 * 60 / 86400.0)
+
+    def test_automatic_feeding_events_are_batched_by_animal(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 15, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C02",
+                start_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 27, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C03",
+                start_local=dt.datetime(2026, 8, 9, 15, 30, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 45, 0),
+                event="observation",
+                kind="event",
+                notes="manual duration",
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=events,
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        feeding_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") == timeline.FEEDING_COLOR
+        ]
+        manual_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR
+        ]
+        self.assertEqual(len(feeding_calls), 2)
+        self.assertEqual(len(manual_calls), 1)
+        self.assertEqual(len(feeding_calls[0].args[0]) + len(feeding_calls[1].args[0]), 3)
+        self.assertEqual(sorted(len(call.args[0]) for call in feeding_calls), [1, 2])
 
     def test_motion_states_stop_at_death_time(self) -> None:
         motion_states = [

@@ -6,6 +6,7 @@ import argparse
 import csv
 import dataclasses
 import datetime as dt
+from collections import defaultdict
 import gzip
 import hashlib
 import io
@@ -15,6 +16,7 @@ import os
 import tempfile
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterable, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -120,6 +122,19 @@ DEATH_COLOR = "#111827"
 DEFAULT_POINT_COLOR = "#475569"
 INTERVAL_BAR_COLOR = "#8aa1c7"
 FEEDING_COLOR = "#7c3aed"
+RECORDING_COVERAGE_FIELDNAMES = [
+    "clip_id",
+    "timestamp_file",
+    "video_file",
+    "start_utc",
+    "end_utc",
+    "start_local",
+    "end_local",
+    "duration_s",
+    "frames",
+    "timestamp_size_bytes",
+    "timestamp_mtime_ns",
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,6 +147,8 @@ class RecordingClip:
     end_utc: dt.datetime
     duration_s: float
     frames: int
+    timestamp_size_bytes: Optional[int] = None
+    timestamp_mtime_ns: Optional[int] = None
 
     @property
     def start_local(self) -> dt.datetime:
@@ -215,6 +232,27 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 def atomic_write_text(path: Path, text: str) -> None:
     atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def recording_path_keys(path: Path) -> tuple[str, str]:
+    raw = str(path)
+    resolved = str(path.resolve(strict=False))
+    if resolved == raw:
+        return (raw, raw)
+    return (raw, resolved)
+
+
+def recording_clip_identity(timestamp_file: Path, root: Path) -> tuple[str, str]:
+    try:
+        rel_dir = timestamp_file.parent.relative_to(root)
+        clip_id_prefix = rel_dir.as_posix()
+    except ValueError:
+        clip_id_prefix = timestamp_file.parent.name
+    if clip_id_prefix == ".":
+        clip_id_prefix = ""
+    camera_label = strip_timestamp_suffix(timestamp_file.name)
+    clip_id = f"{clip_id_prefix}/{camera_label}" if clip_id_prefix else camera_label
+    return clip_id, camera_label
 
 
 def relative_to_root(path: Path, root: Path) -> str:
@@ -346,38 +384,33 @@ def discover_timestamp_files(root: Path) -> list[Path]:
 
 
 def read_timestamp_clip(timestamp_file: Path, root: Path) -> RecordingClip:
-    timestamps: list[dt.datetime] = []
+    stat_result = timestamp_file.stat()
+    start_utc: Optional[dt.datetime] = None
+    end_utc: Optional[dt.datetime] = None
+    frames = 0
     with open_text_file(timestamp_file) as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise ValueError("missing CSV header")
         for row_index, row in enumerate(reader, start=2):
             try:
-                timestamps.append(parse_timestamp_row(row))
+                timestamp = parse_timestamp_row(row)
+                if start_utc is None or timestamp < start_utc:
+                    start_utc = timestamp
+                if end_utc is None or timestamp > end_utc:
+                    end_utc = timestamp
+                frames += 1
             except Exception as exc:
                 raise ValueError(f"row {row_index}: {exc}") from exc
 
-    if not timestamps:
+    if frames == 0 or start_utc is None or end_utc is None:
         raise ValueError("no timestamp rows")
-
-    start_utc = min(timestamps)
-    end_utc = max(timestamps)
-    if end_utc < start_utc:
-        raise ValueError("timestamps are out of order")
 
     video_file = video_file_for_timestamp_file(timestamp_file)
     if not video_file.exists():
         raise ValueError(f"missing video sidecar: {video_file.name}")
 
-    try:
-        rel_dir = timestamp_file.parent.relative_to(root)
-        clip_id_prefix = rel_dir.as_posix()
-    except ValueError:
-        clip_id_prefix = timestamp_file.parent.name
-    if clip_id_prefix == ".":
-        clip_id_prefix = ""
-    camera_label = strip_timestamp_suffix(timestamp_file.name)
-    clip_id = f"{clip_id_prefix}/{camera_label}" if clip_id_prefix else camera_label
+    clip_id, camera_label = recording_clip_identity(timestamp_file, root)
 
     return RecordingClip(
         clip_id=clip_id,
@@ -387,14 +420,110 @@ def read_timestamp_clip(timestamp_file: Path, root: Path) -> RecordingClip:
         start_utc=start_utc,
         end_utc=end_utc,
         duration_s=(end_utc - start_utc).total_seconds(),
-        frames=len(timestamps),
+        frames=frames,
+        timestamp_size_bytes=stat_result.st_size,
+        timestamp_mtime_ns=stat_result.st_mtime_ns,
     )
 
 
-def collect_recording_clips(root: Path) -> tuple[list[RecordingClip], list[str]]:
+def load_recording_coverage_cache(
+    coverage_cache: Path,
+) -> tuple[dict[str, dict[str, str]], list[tuple[str, dict[str, str]]]]:
+    cache_index: dict[str, dict[str, str]] = {}
+    cache_entries: list[tuple[str, dict[str, str]]] = []
+    if not coverage_cache.exists():
+        return cache_index, cache_entries
+    try:
+        with coverage_cache.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                return cache_index, cache_entries
+            for row in reader:
+                timestamp_text = str(row.get("timestamp_file") or "").strip()
+                if not timestamp_text:
+                    continue
+                timestamp_path = Path(timestamp_text)
+                primary_key = str(timestamp_path)
+                cache_entries.append((primary_key, row))
+                for key in recording_path_keys(timestamp_path):
+                    cache_index[key] = row
+    except Exception as exc:
+        LOG.warning("Ignoring recording coverage cache %s: %s", coverage_cache, exc)
+        return {}, []
+    return cache_index, cache_entries
+
+
+def recording_clip_from_cache_row(timestamp_file: Path, root: Path, row: dict[str, str]) -> RecordingClip:
+    stat_result = timestamp_file.stat()
+    size_text = str(row.get("timestamp_size_bytes") or "").strip()
+    mtime_text = str(row.get("timestamp_mtime_ns") or "").strip()
+    if not size_text or not mtime_text:
+        raise ValueError("missing cache metadata")
+    if int(size_text) != stat_result.st_size:
+        raise ValueError("timestamp sidecar size changed")
+    if int(mtime_text) != stat_result.st_mtime_ns:
+        raise ValueError("timestamp sidecar mtime changed")
+
+    start_utc = parse_utc_value(str(row.get("start_utc") or "").strip())
+    end_utc = parse_utc_value(str(row.get("end_utc") or "").strip())
+    duration_s_text = str(row.get("duration_s") or "").strip()
+    if not duration_s_text:
+        raise ValueError("missing cached duration")
+    cached_duration_s = float(duration_s_text)
+    computed_duration_s = (end_utc - start_utc).total_seconds()
+    if abs(cached_duration_s - computed_duration_s) > 1e-6:
+        raise ValueError("cached duration does not match the stored timestamps")
+    frames = int(str(row.get("frames") or "").strip())
+
+    video_file = video_file_for_timestamp_file(timestamp_file)
+    if not video_file.exists():
+        raise ValueError(f"missing video sidecar: {video_file.name}")
+
+    clip_id, camera_label = recording_clip_identity(timestamp_file, root)
+    return RecordingClip(
+        clip_id=clip_id,
+        timestamp_file=timestamp_file,
+        video_file=video_file,
+        camera_label=camera_label,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        duration_s=(end_utc - start_utc).total_seconds(),
+        frames=frames,
+        timestamp_size_bytes=stat_result.st_size,
+        timestamp_mtime_ns=stat_result.st_mtime_ns,
+    )
+
+
+def collect_recording_clips(
+    root: Path,
+    *,
+    coverage_cache: Optional[Path] = None,
+) -> tuple[list[RecordingClip], list[str]]:
     clips: list[RecordingClip] = []
     warnings: list[str] = []
+    cache_index: dict[str, dict[str, str]] = {}
+    cache_entries: list[tuple[str, dict[str, str]]] = []
+    if coverage_cache is not None:
+        cache_index, cache_entries = load_recording_coverage_cache(coverage_cache)
+    discovered_keys: set[str] = set()
+    cache_hits = 0
+    cache_misses = 0
     for timestamp_file in discover_timestamp_files(root):
+        discovered_keys.update(recording_path_keys(timestamp_file))
+        cache_row = None
+        if cache_index:
+            for key in recording_path_keys(timestamp_file):
+                cache_row = cache_index.get(key)
+                if cache_row is not None:
+                    break
+        if cache_row is not None:
+            try:
+                clips.append(recording_clip_from_cache_row(timestamp_file, root, cache_row))
+                cache_hits += 1
+                continue
+            except Exception as exc:
+                LOG.debug("Recording coverage cache miss for %s: %s", timestamp_file, exc)
+        cache_misses += 1
         try:
             clips.append(read_timestamp_clip(timestamp_file, root))
         except Exception as exc:
@@ -402,6 +531,18 @@ def collect_recording_clips(root: Path) -> tuple[list[RecordingClip], list[str]]
             LOG.warning(warning)
             warnings.append(warning)
     clips.sort(key=lambda clip: (clip.start_utc, clip.clip_id))
+    if coverage_cache is not None:
+        stale_rows = 0
+        for primary_key, _row in cache_entries:
+            row_keys = recording_path_keys(Path(primary_key))
+            if not any(key in discovered_keys for key in row_keys):
+                stale_rows += 1
+        LOG.info(
+            "Recording coverage cache: %d hit(s), %d miss(es), %d stale row(s)",
+            cache_hits,
+            cache_misses,
+            stale_rows,
+        )
     return clips, warnings
 
 
@@ -416,29 +557,18 @@ def clip_row(clip: RecordingClip, tz: dt.tzinfo) -> dict[str, str]:
         "end_local": format_local(clip.end_utc, tz),
         "duration_s": f"{clip.duration_s:.6f}",
         "frames": str(clip.frames),
+        "timestamp_size_bytes": "" if clip.timestamp_size_bytes is None else str(clip.timestamp_size_bytes),
+        "timestamp_mtime_ns": "" if clip.timestamp_mtime_ns is None else str(clip.timestamp_mtime_ns),
     }
 
 
 def write_coverage_csv(clips: list[RecordingClip], output_path: Path, tz: dt.tzinfo) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "clip_id",
-                "timestamp_file",
-                "video_file",
-                "start_utc",
-                "end_utc",
-                "start_local",
-                "end_local",
-                "duration_s",
-                "frames",
-            ],
-        )
-        writer.writeheader()
-        for clip in clips:
-            writer.writerow(clip_row(clip, tz))
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=RECORDING_COVERAGE_FIELDNAMES)
+    writer.writeheader()
+    for clip in clips:
+        writer.writerow(clip_row(clip, tz))
+    atomic_write_text(output_path, buffer.getvalue())
 
 
 def parse_local_datetime(value: str, tz: dt.tzinfo) -> dt.datetime:
@@ -1177,6 +1307,7 @@ def plot_recording_timeline(
     timezone: dt.tzinfo,
     output_path: Path,
     annotate_clips: bool,
+    profile_timing: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     global_events = list(global_events or [])
@@ -1184,6 +1315,16 @@ def plot_recording_timeline(
     clip_annotations = annotate_clips and len(clips) <= MAX_CLIP_ANNOTATIONS
     if annotate_clips and not clip_annotations:
         LOG.info("Too many clips for per-clip annotations; disabling clip labels")
+
+    timing_enabled = profile_timing
+    timing_start = perf_counter() if timing_enabled else 0.0
+    timing_sections: list[tuple[str, float]] = []
+
+    def record_timing(label: str, started_at: float) -> None:
+        if timing_enabled:
+            timing_sections.append((label, perf_counter() - started_at))
+
+    prep_start = perf_counter() if timing_enabled else 0.0
 
     bounds = timeline_bounds_utc(clips, events, motion_states, global_events)
     if clips:
@@ -1294,6 +1435,10 @@ def plot_recording_timeline(
         ax_cov.set_xlim(x_min, x_max)
 
     major_gaps = find_major_recording_gaps(clips)
+    video_quality_masks_utc = video_quality_mask_intervals_utc(global_events)
+    death_cutoffs = death_cutoffs_local(events)
+    record_timing("plot data preparation", prep_start)
+    artist_start = perf_counter() if timing_enabled else 0.0
     for gap_start_utc, gap_end_utc in major_gaps:
         gap_start = to_plot_local(gap_start_utc, timezone)
         gap_end = to_plot_local(gap_end_utc, timezone)
@@ -1326,16 +1471,16 @@ def plot_recording_timeline(
             )
 
     if clips:
-        for clip in clips:
-            left, width = _bar_left_width(clip.start_utc, clip.end_utc, timezone)
-            ax_cov.broken_barh(
-                [(left, width)],
-                (0.18, 0.64),
-                facecolors=RECORDING_COLOR,
-                alpha=0.9,
-                zorder=2,
-            )
-            if clip_annotations:
+        recording_segments = [_bar_left_width(clip.start_utc, clip.end_utc, timezone) for clip in clips]
+        ax_cov.broken_barh(
+            recording_segments,
+            (0.18, 0.64),
+            facecolors=RECORDING_COLOR,
+            alpha=0.9,
+            zorder=2,
+        )
+        if clip_annotations:
+            for clip, (left, width) in zip(clips, recording_segments):
                 center = left + width / 2.0
                 duration_min = clip.duration_s / 60.0
                 ax_cov.text(
@@ -1532,9 +1677,6 @@ def plot_recording_timeline(
 
     if x_min is not None and x_max is not None:
         configure_time_axis(ax_beh, x_min, x_max)
-
-    video_quality_masks_utc = video_quality_mask_intervals_utc(global_events)
-    death_cutoffs = death_cutoffs_local(events)
     if video_quality_masks_utc:
         LOG.info(
             "Applying %d video-quality visualization mask(s) to motion-derived states",
@@ -1542,6 +1684,7 @@ def plot_recording_timeline(
         )
     suppressed_motion_spans = 0
     clipped_motion_spans = 0
+    motion_segments_by_group: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
     for state in motion_states:
         if state.animal_id not in behavior_index:
             continue
@@ -1557,8 +1700,6 @@ def plot_recording_timeline(
                 continue
             if state_end_utc > death_cutoff_utc:
                 state_end_utc = death_cutoff_utc
-        y = behavior_index[state.animal_id]
-        color = MOTION_MOBILE_COLOR if state.state == "mobile" else MOTION_IMMOBILE_COLOR
         visible_segments = subtract_intervals(state_start_utc, state_end_utc, video_quality_masks_utc)
         if not visible_segments:
             suppressed_motion_spans += 1
@@ -1568,13 +1709,18 @@ def plot_recording_timeline(
         for segment_start_utc, segment_end_utc in visible_segments:
             left = mdates.date2num(to_plot_local(segment_start_utc, timezone))
             width = max((segment_end_utc - segment_start_utc).total_seconds() / 86400.0, 1e-9)
-            ax_beh.broken_barh(
-                [(left, width)],
-                (y - 0.31, 0.62),
-                facecolors=color,
-                alpha=0.68,
-                zorder=1,
-            )
+            motion_segments_by_group[(state.animal_id, state.state)].append((left, width))
+
+    for (animal_id, state_name), segments in motion_segments_by_group.items():
+        y = behavior_index[animal_id]
+        color = MOTION_MOBILE_COLOR if state_name == "mobile" else MOTION_IMMOBILE_COLOR
+        ax_beh.broken_barh(
+            segments,
+            (y - 0.31, 0.62),
+            facecolors=color,
+            alpha=0.68,
+            zorder=1,
+        )
 
     if video_quality_masks_utc:
         LOG.info(
@@ -1586,6 +1732,7 @@ def plot_recording_timeline(
     stim_event_count = sum(1 for event in events if is_stimulation_event(event))
     LOG.info("Electrical stimulation events available: %d", stim_event_count)
     stimulation_markers: list[tuple[str, float, int, dt.datetime]] = []
+    feeding_segments_by_animal: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for event in events:
         if event.animal_id not in behavior_index:
             continue
@@ -1616,6 +1763,13 @@ def plot_recording_timeline(
                     zorder=3,
                 )
             stimulation_markers.append((event.animal_id, left, y, event.start_local))
+            continue
+
+        if is_feeding_event(event) and not event.is_point:
+            if duration_s <= 0:
+                continue
+            width = max(duration_s / 86400.0, 1e-9)
+            feeding_segments_by_animal[event.animal_id].append((left, width))
             continue
 
         if event.is_point:
@@ -1660,6 +1814,16 @@ def plot_recording_timeline(
             zorder=3,
         )
 
+    for animal_id, segments in feeding_segments_by_animal.items():
+        y = behavior_index[animal_id]
+        ax_beh.broken_barh(
+            segments,
+            (y - 0.22, 0.44),
+            facecolors=FEEDING_COLOR,
+            alpha=0.74,
+            zorder=3,
+        )
+
     rendered_stimulation_markers = 0
     for animal_id, left, y, event_start_local in stimulation_markers:
         LOG.debug("stimulation %s at %s", animal_id, event_start_local.isoformat(sep=" "))
@@ -1698,7 +1862,15 @@ def plot_recording_timeline(
     for label in ax_beh.get_xticklabels():
         label.set_rotation(0)
         label.set_ha("center")
+    if timing_enabled:
+        record_timing("Matplotlib artist creation", artist_start)
+        savefig_start = perf_counter()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    if timing_enabled:
+        record_timing("savefig", savefig_start)
+        record_timing("plot total", timing_start)
+        for label, elapsed in timing_sections:
+            LOG.info("Timing: %s: %.1f s", label, elapsed)
     plt.close(fig)
 
 
@@ -1791,6 +1963,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Hide per-clip labels on the recording coverage bars.",
     )
+    parser.add_argument(
+        "--profile-timing",
+        action="store_true",
+        help="Log coarse timing information for clip collection, event loading, and plotting.",
+    )
     parser.set_defaults(annotate_clips=True)
     return parser
 
@@ -1806,12 +1983,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--motion-states and --no-motion-states cannot be used together")
 
     local_tz = load_timezone(args.timezone)
-    clips, warnings = collect_recording_clips(root)
-
     coverage_csv = args.coverage_csv or (root / "recording_coverage.csv")
     output_png = args.output or (root / "recording_behavior_timeline.png")
+    total_start = perf_counter() if args.profile_timing else 0.0
+
+    coverage_start = perf_counter() if args.profile_timing else 0.0
+    clips, warnings = collect_recording_clips(root, coverage_cache=coverage_csv)
+    if args.profile_timing:
+        LOG.info(
+            "Timing: recording coverage discovery/load: %.1f s",
+            perf_counter() - coverage_start,
+        )
     write_coverage_csv(clips, coverage_csv, local_tz)
 
+    events_start = perf_counter() if args.profile_timing else 0.0
     events_source, events_source_reason = resolve_behavior_event_source(root, args.events)
     if events_source is not None:
         LOG.info("Behavior event source (%s): %s", events_source_reason, events_source)
@@ -1836,7 +2021,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 feeding_events_path = auto_feeding_events
 
         if feeding_events_path is not None:
+            feeding_start = perf_counter() if args.profile_timing else 0.0
             feeding_events, feeding_global_events = load_event_tables(feeding_events_path, local_tz)
+            if args.profile_timing:
+                LOG.info("Timing: feeding events: %.1f s", perf_counter() - feeding_start)
             events.extend(feeding_events)
             global_events.extend(feeding_global_events)
             LOG.info(
@@ -1847,7 +2035,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return 1
+    if args.profile_timing:
+        LOG.info(
+            "Timing: behavior/global events: %.1f s",
+            perf_counter() - events_start,
+        )
 
+    motion_states_start = perf_counter() if args.profile_timing else 0.0
     motion_states_path: Optional[Path] = None
     if not args.no_motion_states:
         if args.motion_states is not None:
@@ -1858,8 +2052,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             auto_motion_states = root / "cropped_by_caterpillar" / "motion_energy" / "motion_states.csv"
             motion_states_path = auto_motion_states if auto_motion_states.exists() else None
     motion_states = load_motion_states(motion_states_path)
+    if args.profile_timing:
+        LOG.info("Timing: motion states: %.1f s", perf_counter() - motion_states_start)
+    motion_energy_start = perf_counter() if args.profile_timing else 0.0
     motion_energy_path = args.motion_energy
     motion_energy_samples = load_motion_energy_samples(motion_energy_path)
+    if args.profile_timing:
+        LOG.info("Timing: motion energy: %.1f s", perf_counter() - motion_energy_start)
 
     animals = args.animals if args.animals else (infer_animals(events) or DEFAULT_ANIMALS)
     if not clips:
@@ -1877,12 +2076,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         timezone=local_tz,
         output_path=output_png,
         annotate_clips=args.annotate_clips,
+        profile_timing=args.profile_timing,
     )
 
     LOG.info("Wrote coverage CSV: %s", coverage_csv)
     LOG.info("Wrote timeline PNG: %s", output_png)
     if warnings:
         LOG.info("Skipped %d malformed timestamp file(s)", len(warnings))
+    if args.profile_timing:
+        LOG.info("Timing: total: %.1f s", perf_counter() - total_start)
     return 0
 
 
