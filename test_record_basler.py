@@ -749,6 +749,54 @@ class ArchiveBackendTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(issues, [])
 
+    def test_clip_directory_ready_for_archive_allows_review_snapshots_when_writer_never_started(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp)
+            metadata_path = clip_dir / "camera1.json"
+            (clip_dir / "camera1.mp4").write_bytes(b"mp4")
+            with gzip.open(
+                clip_dir / "camera1.timestamps.csv.gz",
+                "wt",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write("frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n")
+                handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+            record_basler.write_json(
+                metadata_path,
+                {
+                    "success": True,
+                    "planned_clip_complete": True,
+                    "interrupted_by_user": False,
+                    "stop_reason": "planned_end",
+                    "grab_failures": 0,
+                    "mp4_remux_succeeded": True,
+                    "review_snapshots": {
+                        "enabled": True,
+                        "operational": False,
+                        "writer_started": False,
+                        "writer_finalized": True,
+                        "index_csv_written": False,
+                        "directory": "review_snapshots",
+                        "requested_per_full_clip": 10,
+                        "saved": 0,
+                        "failed": 0,
+                        "dropped_queue_full": 0,
+                        "missed_due_acquisition_gap": 0,
+                        "unreached_targets": 10,
+                    },
+                },
+            )
+
+            ready, issues, _total_bytes = record_basler.clip_directory_ready_for_archive(
+                clip_dir,
+                expected_camera_count=1,
+                max_clip_size_bytes=10_000_000,
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(issues, [])
+
     def test_write_review_snapshot_index_csv_propagates_write_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "review_snapshots" / "camera1_snapshots.csv"
@@ -1666,6 +1714,10 @@ class ReviewSnapshotSettingsTests(unittest.TestCase):
             record_basler.review_snapshot_targets(600.0, 10),
             [30.0, 90.0, 150.0, 210.0, 270.0, 330.0, 390.0, 450.0, 510.0, 570.0],
         )
+
+    def test_unreached_targets_count_remaining_slots(self) -> None:
+        self.assertEqual(record_basler.compute_review_snapshot_unreached_targets(10, 0), 10)
+        self.assertEqual(record_basler.compute_review_snapshot_unreached_targets(10, 4), 6)
 
     def test_invalid_quality_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "review_snapshots.jpeg_quality"):

@@ -751,6 +751,10 @@ def review_snapshot_targets(planned_duration_s: float, count_per_clip: int) -> l
     return [((index + 0.5) * planned_duration_s / count_per_clip) for index in range(count_per_clip)]
 
 
+def compute_review_snapshot_unreached_targets(total_targets: int, next_target_index: int) -> int:
+    return max(0, total_targets - next_target_index)
+
+
 def review_snapshot_filename(
     camera_label: str,
     snapshot_index: int,
@@ -3537,9 +3541,9 @@ def record_one_camera(
                 review_snapshot_results = review_snapshot_writer.collect_results()
                 review_snapshot_saved = sum(1 for result in review_snapshot_results if result.success)
                 review_snapshot_failed = sum(1 for result in review_snapshot_results if not result.success)
-                review_snapshot_unreached_targets = max(
-                    0,
-                    len(review_snapshot_targets_s) - review_snapshot_next_target_index,
+                review_snapshot_unreached_targets = compute_review_snapshot_unreached_targets(
+                    len(review_snapshot_targets_s),
+                    review_snapshot_next_target_index,
                 )
                 review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
                 if review_snapshot_writer_finalized:
@@ -3554,7 +3558,10 @@ def record_one_camera(
             else:
                 review_snapshot_saved = 0
                 review_snapshot_failed = 0
-                review_snapshot_unreached_targets = 0
+                review_snapshot_unreached_targets = compute_review_snapshot_unreached_targets(
+                    len(review_snapshot_targets_s),
+                    review_snapshot_next_target_index,
+                )
         else:
             review_snapshot_unreached_targets = 0
 

@@ -543,6 +543,129 @@ def validate_clip_camera(
     )
 
 
+def validate_review_snapshots(
+    *,
+    clip_dir: Path,
+    camera_json_path: Path,
+    camera_metadata: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    review_snapshots = camera_metadata.get("review_snapshots")
+    if not isinstance(review_snapshots, dict) or review_snapshots.get("enabled") is not True:
+        return warnings
+
+    review_dir_name = str(review_snapshots.get("directory") or "review_snapshots").strip() or "review_snapshots"
+    review_dir = clip_dir / review_dir_name
+    writer_started = coerce_bool(review_snapshots.get("writer_started"))
+    writer_finalized = coerce_bool(review_snapshots.get("writer_finalized"))
+    operational = coerce_bool(review_snapshots.get("operational"))
+    index_csv_written = coerce_bool(review_snapshots.get("index_csv_written"))
+    saved = coerce_int(review_snapshots.get("saved"))
+    failed = coerce_int(review_snapshots.get("failed"))
+    dropped_queue_full = coerce_int(review_snapshots.get("dropped_queue_full"))
+    missed_due_acquisition_gap = coerce_int(review_snapshots.get("missed_due_acquisition_gap"))
+    unreached_targets = coerce_int(review_snapshots.get("unreached_targets"))
+    requested_per_full_clip = coerce_int(review_snapshots.get("requested_per_full_clip"))
+
+    if operational is False and writer_started is False:
+        warnings.append(f"{camera_json_path.name}: review snapshot subsystem was requested but could not start")
+        return warnings
+
+    if writer_started and writer_finalized is False:
+        warnings.append(f"{camera_json_path.name}: review snapshot writer did not finalize safely")
+    elif writer_started is False and writer_finalized is True and operational is not False:
+        warnings.append(f"{camera_json_path.name}: review snapshot writer was not started")
+
+    if not review_dir.exists():
+        warnings.append(f"{camera_json_path.name}: review snapshot directory is missing: {review_dir_name}")
+        return warnings
+
+    temp_review_files = sorted(path for path in review_dir.rglob("*") if path.is_file() and path.name.endswith(".tmp"))
+    if temp_review_files:
+        warnings.append(
+            f"{camera_json_path.name}: review snapshot temporary files remain: "
+            + ", ".join(path.name for path in temp_review_files)
+        )
+
+    index_csv_rel = str(review_snapshots.get("index_csv") or "").strip()
+    index_csv_path = clip_dir / index_csv_rel if index_csv_rel else review_dir / f"{camera_json_path.stem}_snapshots.csv"
+    if index_csv_written is True and not index_csv_path.exists():
+        warnings.append(f"{camera_json_path.name}: review snapshot index CSV is missing: {index_csv_path.name}")
+    elif index_csv_written is False:
+        warnings.append(f"{camera_json_path.name}: review snapshot index CSV was not finalized")
+
+    if not index_csv_path.exists():
+        return warnings
+
+    try:
+        with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            required_fields = {"snapshot_index", "filename", "frame_index"}
+            if not required_fields.issubset(set(fieldnames)):
+                warnings.append(
+                    f"{camera_json_path.name}: review snapshot index CSV is missing required columns "
+                    f"{sorted(required_fields - set(fieldnames))}"
+                )
+                return warnings
+
+            rows = list(reader)
+    except Exception as exc:
+        warnings.append(f"{camera_json_path.name}: review snapshot index CSV could not be parsed: {exc}")
+        return warnings
+
+    if saved is not None and saved >= 0 and len(rows) != saved:
+        warnings.append(
+            f"{camera_json_path.name}: review snapshot metadata saved={saved} but index contains {len(rows)} rows"
+        )
+
+    snapshot_indices: set[int] = set()
+    frame_indices: set[int] = set()
+    for row_index, row in enumerate(rows, start=2):
+        try:
+            snapshot_index = int(str(row.get("snapshot_index") or "").strip())
+            frame_index = int(str(row.get("frame_index") or "").strip())
+        except Exception:
+            warnings.append(f"{camera_json_path.name}: review snapshot CSV row {row_index} has invalid indices")
+            continue
+
+        if snapshot_index in snapshot_indices:
+            warnings.append(f"{camera_json_path.name}: review snapshot index {snapshot_index} is duplicated")
+        else:
+            snapshot_indices.add(snapshot_index)
+
+        if frame_index in frame_indices:
+            warnings.append(f"{camera_json_path.name}: review snapshot frame index {frame_index} is duplicated")
+        else:
+            frame_indices.add(frame_index)
+
+        filename = str(row.get("filename") or "").strip()
+        jpeg_path = review_dir / filename if filename else None
+        if jpeg_path is None or not jpeg_path.exists() or not jpeg_path.is_file():
+            warnings.append(
+                f"{camera_json_path.name}: review snapshot JPEG is missing: "
+                f"{filename or '(blank filename)'}"
+            )
+
+    if any(value is not None and value < 0 for value in [saved, failed, dropped_queue_full, missed_due_acquisition_gap, unreached_targets]):
+        warnings.append(f"{camera_json_path.name}: review snapshot counts must be non-negative")
+
+    if (
+        requested_per_full_clip is not None
+        and saved is not None
+        and failed is not None
+        and dropped_queue_full is not None
+        and missed_due_acquisition_gap is not None
+        and unreached_targets is not None
+    ):
+        if saved + failed + dropped_queue_full + missed_due_acquisition_gap + unreached_targets != requested_per_full_clip:
+            warnings.append(
+                f"{camera_json_path.name}: review snapshot counts do not add up to requested_per_full_clip"
+            )
+
+    return warnings
+
+
 def validate_session(session_dir: Path) -> int:
     problems: list[str] = []
     warnings: list[str] = []
@@ -914,6 +1037,14 @@ def validate_session(session_dir: Path) -> int:
             if label not in expected_labels:
                 problems.append(f"{clip_dir.name}: unexpected camera label {label!r}")
                 continue
+
+            warnings.extend(
+                validate_review_snapshots(
+                    clip_dir=clip_dir,
+                    camera_json_path=json_path,
+                    camera_metadata=metadata,
+                )
+            )
 
             report = validate_clip_camera(
                 clip_index=clip_index,

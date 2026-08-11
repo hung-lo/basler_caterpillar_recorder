@@ -618,7 +618,7 @@ During recording:
 - `s` saves the raw preview frame without the panel or footer into the clip directory;
 - `Ctrl+C` stops the recording cleanly.
 
-Some active recording templates also enable `review_snapshots:`. When enabled, the recorder saves a small set of full processed frames per clip into `review_snapshots/` and writes a CSV index after the background writer finalizes. If the snapshot writer never starts, the clip still finishes normally and remains archive-safe.
+Some active recording templates also enable `review_snapshots:`. When enabled, the recorder saves a small set of full processed frames per clip into `review_snapshots/` and writes a CSV index after the background writer finalizes. If the snapshot writer never starts, the clip still finishes normally and remains archive-safe. `validate_session.py` treats review snapshots as auxiliary artifacts, so missing JPEGs, duplicate snapshot rows, or an unfinished index CSV show up as warnings without turning an otherwise healthy clip into a core recording failure.
 
 ### Stopping a recording safely
 

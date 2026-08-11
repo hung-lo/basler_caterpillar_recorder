@@ -36,6 +36,8 @@ source .venv/bin/activate
 6. Validate the session.
 7. Start the unattended run only after validation passes.
 
+If `review_snapshots:` is enabled in your config, treat any review-snapshot messages from `validate_session.py` as auxiliary warnings unless the core MP4/timestamp checks also fail.
+
 For an optional one-shot scheduled start, set:
 
 ```yaml
@@ -93,6 +95,7 @@ After pressing `Ctrl+C`, keep the terminal open until the recorder reports that 
 - Short local test passed.
 - Three-clip archive test passed if archive mode is enabled.
 - `python validate_session.py SESSION_PATH` returned `PASS`.
+- Any review-snapshot warnings were understood and accepted, or the feature was disabled for that session.
 - Archive drive is mounted.
 - Laptop is on power.
 - You are using the copied local config, not a tracked template.
