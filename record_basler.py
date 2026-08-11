@@ -2023,7 +2023,9 @@ def clip_directory_ready_for_archive(
         review_snapshots = metadata.get("review_snapshots")
         if isinstance(review_snapshots, dict):
             if review_snapshots.get("enabled") is True:
-                if review_snapshots.get("writer_finalized") is not True:
+                writer_started = review_snapshots.get("writer_started") is True
+                writer_finalized = review_snapshots.get("writer_finalized") is True
+                if writer_started and not writer_finalized:
                     issues.append(
                         f"{json_path.name}: review_snapshots.writer_finalized is "
                         f"{review_snapshots.get('writer_finalized')!r}"
@@ -3185,6 +3187,7 @@ def record_one_camera(
     review_snapshot_operational = False
     review_snapshot_writer_started = False
     review_snapshot_writer_finalized = True
+    review_snapshot_index_csv_written = False
     review_snapshot_error: Optional[str] = None
 
     if review_snapshot_settings.enabled:
@@ -3542,8 +3545,8 @@ def record_one_camera(
                 if review_snapshot_writer_finalized:
                     try:
                         write_review_snapshot_index_csv(review_snapshot_metadata_path, review_snapshot_results)
+                        review_snapshot_index_csv_written = True
                     except Exception as exc:
-                        review_snapshot_writer_finalized = False
                         review_snapshot_error = f"{type(exc).__name__}: {exc}"
                         LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
                 else:
@@ -3627,6 +3630,7 @@ def record_one_camera(
                     "operational": review_snapshot_operational,
                     "writer_started": review_snapshot_writer_started,
                     "writer_finalized": review_snapshot_writer_finalized,
+                    "index_csv_written": review_snapshot_index_csv_written,
                     "directory": "review_snapshots" if review_snapshot_settings.enabled else None,
                     "index_csv": (
                         f"review_snapshots/{file_stem}_snapshots.csv"
