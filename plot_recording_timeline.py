@@ -902,6 +902,10 @@ def get_point_event_style(event_name: str) -> tuple[str, float, str]:
     return "o", DEFAULT_POINT_MARKER_SIZE, DEFAULT_POINT_COLOR
 
 
+def is_stimulation_event_name(event_name: str) -> bool:
+    return normalize_event_name(event_name) in STIM_EVENT_NAMES
+
+
 def event_bar_color(event: BehaviorEvent) -> str:
     if is_feeding_event(event):
         return FEEDING_COLOR
@@ -1031,13 +1035,9 @@ def manual_annotation_legend_handles() -> list[Line2D | Patch]:
         Line2D(
             [0],
             [0],
-            marker="*",
             linestyle="None",
-            markersize=11,
-            markerfacecolor=STIM_COLOR,
-            markeredgecolor="black",
-            markeredgewidth=0.6,
-            label="Electrical stimulation",
+            label="\u26a1 Electrical stimulation",
+            color=STIM_COLOR,
         ),
         Line2D(
             [0],
@@ -1519,17 +1519,31 @@ def plot_recording_timeline(
             zorder=3,
         )
         if duration_s <= SHORT_EVENT_THRESHOLD_SECONDS and not is_feeding_event(event):
-            marker, marker_size, point_color = get_point_event_style(event.event or event.kind)
-            ax_beh.scatter(
-                left,
-                y,
-                s=marker_size,
-                marker=marker,
-                color=point_color,
-                edgecolors="black",
-                linewidths=0.6,
-                zorder=6,
-            )
+            event_name = event.event or event.kind
+            if is_stimulation_event_name(event_name):
+                ax_beh.text(
+                    left,
+                    y,
+                    "\u26a1",
+                    ha="center",
+                    va="center",
+                    fontsize=13,
+                    color=STIM_COLOR,
+                    fontweight="bold",
+                    zorder=6,
+                )
+            else:
+                marker, marker_size, point_color = get_point_event_style(event_name)
+                ax_beh.scatter(
+                    left,
+                    y,
+                    s=marker_size,
+                    marker=marker,
+                    color=point_color,
+                    edgecolors="black",
+                    linewidths=0.6,
+                    zorder=6,
+                )
 
     axes_to_style = [ax_cov, ax_beh]
     if ax_motion is not None:

@@ -362,6 +362,14 @@ class TimelinePlotTests(unittest.TestCase):
                 ),
                 timeline.BehaviorEvent(
                     animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 2, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 2, 1),
+                    event="shed",
+                    kind="event",
+                    notes="",
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
                     start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
                     end_local=dt.datetime(2026, 8, 9, 15, 15, 0),
                     event="feeding",
@@ -371,23 +379,25 @@ class TimelinePlotTests(unittest.TestCase):
             ]
 
             with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
-                timeline.plot_recording_timeline(
-                    clips=[],
-                    events=events,
-                    motion_states=[],
-                    animals=timeline.ANIMAL_ORDER,
-                    timezone=dt.timezone(dt.timedelta(hours=-4)),
-                    output_path=output_png,
-                    annotate_clips=False,
-                )
+                with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+                    timeline.plot_recording_timeline(
+                        clips=[],
+                        events=events,
+                        motion_states=[],
+                        animals=timeline.ANIMAL_ORDER,
+                        timezone=dt.timezone(dt.timedelta(hours=-4)),
+                        output_path=output_png,
+                        annotate_clips=False,
+                    )
 
             self.assertTrue(output_png.exists())
             self.assertEqual(mock_scatter.call_count, 1)
-            scatter_args, scatter_kwargs = mock_scatter.call_args
-            self.assertEqual(scatter_kwargs["marker"], "*")
-            self.assertEqual(scatter_kwargs["s"], timeline.STIM_MARKER_SIZE)
+            _scatter_args, scatter_kwargs = mock_scatter.call_args
+            self.assertEqual(scatter_kwargs["marker"], "^")
+            self.assertEqual(scatter_kwargs["s"], timeline.SHED_MARKER_SIZE)
             self.assertEqual(scatter_kwargs["edgecolors"], "black")
             self.assertEqual(scatter_kwargs["linewidths"], 0.6)
+            self.assertTrue(any(call.args[2] == "\u26a1" for call in mock_text.call_args_list if len(call.args) >= 3))
 
     def test_behavior_axis_uses_canonical_animal_order(self) -> None:
         events = [
@@ -476,11 +486,9 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(timeline.get_point_event_style("shed")[0], "^")
         self.assertEqual(timeline.get_point_event_style("molt")[0], "^")
 
-    def test_electrical_stimulation_uses_large_star_marker(self) -> None:
-        marker, size, _color = timeline.get_point_event_style("electrical_stimulation")
-
-        self.assertEqual(marker, "*")
-        self.assertEqual(size, timeline.STIM_MARKER_SIZE)
+    def test_electrical_stimulation_is_recognized(self) -> None:
+        self.assertTrue(timeline.is_stimulation_event_name("electrical_stimulation"))
+        self.assertTrue(timeline.is_stimulation_event_name("electric_shock"))
 
     def test_death_uses_x_marker(self) -> None:
         marker, _size, _color = timeline.get_point_event_style("death")
@@ -525,6 +533,11 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(marker, "o")
         self.assertEqual(size, timeline.DEFAULT_POINT_MARKER_SIZE)
+
+    def test_manual_annotation_legend_uses_lightning_label(self) -> None:
+        labels = [handle.get_label() for handle in timeline.manual_annotation_legend_handles()]
+
+        self.assertIn("\u26a1 Electrical stimulation", labels)
 
     def test_video_quality_aliases_and_kind_share_the_same_global_style(self) -> None:
         events = [

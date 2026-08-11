@@ -24,7 +24,7 @@ If you use a different camera, copy a YAML template and update the model, serial
 - `prepare_cropped_timestamps.py` copies one authoritative timestamp sidecar per raw source clip into `cropped_by_caterpillar/timestamps/` and writes `crop_manifest.csv`.
 - `analysis_timing.py` holds the shared UTC/timestamp parsing helpers used by the analysis scripts.
 - `extract_motion_energy.py` builds cached per-crop motion traces, a consolidated `motion_energy_timeseries.csv`, editable thresholds, diagnostics, and `motion_states.csv`.
-- `analyze_leaf_feeding.py` derives minute-level leaf-area proxy traces and automatic feeding bouts from the same `crop_manifest.csv` plus copied timestamp sidecars.
+- `analyze_leaf_feeding.py` derives coarse 5-minute leaf-area proxy traces and automatic feeding bouts from the same `crop_manifest.csv` plus copied timestamp sidecars, using sparse frame seeks instead of decoding every frame.
 - `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars, behavior events, optional motion states, optional feeding events, and an optional quantitative motion panel.
 - `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
 - `config_smoke_test.yaml` is a short local test.
@@ -159,6 +159,15 @@ cropped_by_caterpillar/leaf_feeding/
     qc/
 ```
 
+The current feeding detector is intentionally coarse:
+
+- it estimates leaf area every 5 minutes on an absolute UTC grid;
+- each estimate uses a sparse 1-minute burst of frames for occlusion robustness;
+- feeding is classified from consecutive 5-minute absolute leaf-area loss, not percent loss;
+- `video_quality_low` event intervals invalidate feeding detection while still leaving the QC trace visible.
+
+By default, `analyze_leaf_feeding.py` auto-discovers `<root>/behavior_events.csv` when it exists, so leaf resets and global bad-video intervals stay consistent with the main timeline. You can still override that source explicitly with `--events`.
+
 To overlay those automatic feeding bouts on the main timeline without changing your manual event log:
 
 ```powershell
@@ -169,7 +178,7 @@ python plot_recording_timeline.py `
   --motion-energy "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_energy_timeseries.csv"
 ```
 
-`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers.
+`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers. Electrical stimulation events are rendered as a red `⚡` overlay in the animal row instead of a generic point marker.
 
 ## New computer workflow
 
