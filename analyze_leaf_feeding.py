@@ -6,9 +6,12 @@ import argparse
 import csv
 import dataclasses
 import datetime as dt
+import gzip
+import json
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -54,6 +57,25 @@ GRID_TOLERANCE = dt.timedelta(seconds=1)
 LEAF_RESET_EVENT_NAMES = {"leaf_added", "leaf_replaced", "leaf_change"}
 PROGRESS_BAR_WIDTH = 28
 PROGRESS_UPDATE_SECONDS = 0.25
+LEAF_CACHE_VERSION = 1
+LEAF_TRACE_FIELDS = [
+    "animal_id",
+    "clip_key",
+    "timestamp_utc",
+    "leaf_area_proxy_px",
+    "n_sampled_frames",
+    "n_valid_frames",
+    "qc_flag",
+]
+LEAF_TIMESERIES_INPUT_FIELDS = [
+    "animal_id",
+    "clip_key",
+    "timestamp_utc",
+    "leaf_area_proxy_px",
+    "n_sampled_frames",
+    "n_valid_frames",
+    "qc_flag",
+]
 
 LEAF_AREA_FIELDS = [
     "animal_id",
@@ -154,6 +176,235 @@ class ClipFeedingResult:
     selected_leaf_frames: int
     decoded_leaf_frames: int
     error: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class LeafTraceCacheOutcome:
+    result: ClipFeedingResult
+    cache_state: str
+    cache_message: str = ""
+
+
+def sanitize_cache_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    token = token.strip("._-")
+    return token or "clip"
+
+
+def leaf_feeding_root(root: Path) -> Path:
+    return root / "cropped_by_caterpillar" / "leaf_feeding"
+
+
+def leaf_trace_dir(root: Path) -> Path:
+    return leaf_feeding_root(root) / "traces"
+
+
+def leaf_trace_path(root: Path, animal_id: str, clip_key: str) -> Path:
+    filename = f"{sanitize_cache_token(animal_id)}__{sanitize_cache_token(clip_key)}.leaf_area.csv.gz"
+    return leaf_trace_dir(root) / filename
+
+
+def leaf_trace_meta_path(trace_path: Path) -> Path:
+    return trace_path.with_suffix("").with_suffix(".meta.json")
+
+
+def leaf_extraction_cache_settings(
+    *,
+    estimate_interval_minutes: int,
+    burst_duration_seconds: int,
+    burst_step_seconds: int,
+    leaf_area_percentile: float,
+    min_valid_frames: int,
+    hue_low: int,
+    hue_high: int,
+    sat_min: int,
+    value_min: int,
+    min_component_px: int,
+    morph_kernel: int,
+    frame_access: str,
+) -> dict[str, object]:
+    return {
+        "cache_version": LEAF_CACHE_VERSION,
+        "estimate_interval_minutes": estimate_interval_minutes,
+        "burst_duration_seconds": burst_duration_seconds,
+        "burst_step_seconds": burst_step_seconds,
+        "leaf_area_percentile": leaf_area_percentile,
+        "min_valid_frames": min_valid_frames,
+        "hue_low": hue_low,
+        "hue_high": hue_high,
+        "sat_min": sat_min,
+        "value_min": value_min,
+        "min_component_px": min_component_px,
+        "morph_kernel": morph_kernel,
+        "frame_access": frame_access,
+    }
+
+
+def write_json_atomic(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temp_path.replace(path)
+
+
+def read_json_mapping(path: Path) -> dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("metadata is not a JSON object")
+    return data
+
+
+def load_leaf_area_estimates_from_csv(path: Path) -> list[LeafAreaEstimate]:
+    estimates: list[LeafAreaEstimate] = []
+    with open_csv_text(path) as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"missing header in {path}")
+        required = {"animal_id", "clip_key", "timestamp_utc", "leaf_area_proxy_px", "n_sampled_frames", "n_valid_frames"}
+        if not required.issubset(set(reader.fieldnames)):
+            raise ValueError(f"invalid leaf-area CSV header in {path}")
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                clip_key = str(row.get("clip_key") or "").strip()
+                timestamp_utc = parse_utc_value(row.get("timestamp_utc"))
+                leaf_area_proxy_px = float(str(row.get("leaf_area_proxy_px") or "").strip())
+                n_sampled_frames = int(str(row.get("n_sampled_frames") or "").strip())
+                n_valid_frames = int(str(row.get("n_valid_frames") or "").strip())
+                qc_flag = str(row.get("qc_flag") or "").strip()
+            except Exception as exc:
+                raise ValueError(f"invalid leaf-area CSV row {row_index} in {path}: {exc}") from exc
+            estimates.append(
+                LeafAreaEstimate(
+                    animal_id=animal_id,
+                    clip_key=clip_key,
+                    timestamp_utc=timestamp_utc,
+                    leaf_area_proxy_px=leaf_area_proxy_px,
+                    sample_areas_px=(leaf_area_proxy_px,),
+                    n_sampled_frames=n_sampled_frames,
+                    n_valid_frames=n_valid_frames,
+                    video_quality_excluded=False,
+                    qc_flag=qc_flag,
+                )
+            )
+    return estimates
+
+
+def parse_utc_value(value: object) -> dt.datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("missing UTC timestamp")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def leaf_trace_rows_to_dicts(estimates: Sequence[LeafAreaEstimate]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for estimate in estimates:
+        rows.append(
+            {
+                "animal_id": estimate.animal_id,
+                "clip_key": estimate.clip_key,
+                "timestamp_utc": format_utc(estimate.timestamp_utc),
+                "leaf_area_proxy_px": f"{estimate.leaf_area_proxy_px:.6f}",
+                "n_sampled_frames": str(estimate.n_sampled_frames),
+                "n_valid_frames": str(estimate.n_valid_frames),
+                "qc_flag": estimate.qc_flag,
+            }
+        )
+    return rows
+
+
+def load_leaf_trace_cache(
+    trace_path: Path,
+    meta_path: Path,
+    entry: ManifestEntry,
+    cache_settings: dict[str, object],
+) -> tuple[list[LeafAreaEstimate], str]:
+    if not trace_path.exists() or not meta_path.exists():
+        return [], "missing"
+    try:
+        metadata = read_json_mapping(meta_path)
+        if metadata.get("cache_version") != LEAF_CACHE_VERSION:
+            return [], "invalid"
+        if str(metadata.get("animal_id") or "").strip() != entry.animal_id:
+            return [], "invalid"
+        if str(metadata.get("clip_key") or "").strip() != entry.clip_key:
+            return [], "invalid"
+        if str(metadata.get("video_path") or "") != str(entry.cropped_video):
+            return [], "invalid"
+        if str(metadata.get("timestamp_path") or "") != str(entry.timestamp_file):
+            return [], "invalid"
+        video_stat = entry.cropped_video.stat()
+        timestamp_stat = entry.timestamp_file.stat()
+        if int(metadata.get("video_size_bytes") or -1) != video_stat.st_size:
+            return [], "invalid"
+        if int(metadata.get("video_mtime_ns") or -1) != video_stat.st_mtime_ns:
+            return [], "invalid"
+        if int(metadata.get("timestamp_size_bytes") or -1) != timestamp_stat.st_size:
+            return [], "invalid"
+        if int(metadata.get("timestamp_mtime_ns") or -1) != timestamp_stat.st_mtime_ns:
+            return [], "invalid"
+        if metadata.get("leaf_extraction_settings") != cache_settings:
+            return [], "invalid"
+        estimates = load_leaf_area_estimates_from_csv(trace_path)
+        if not estimates:
+            return [], "invalid"
+        if any(estimate.animal_id != entry.animal_id or estimate.clip_key != entry.clip_key for estimate in estimates):
+            return [], "invalid"
+        ordered_timestamps = [estimate.timestamp_utc for estimate in estimates]
+        if any(ordered_timestamps[index] < ordered_timestamps[index - 1] for index in range(1, len(ordered_timestamps))):
+            return [], "invalid"
+        if int(metadata.get("trace_rows") or -1) != len(estimates):
+            return [], "invalid"
+        return estimates, "cached"
+    except Exception as exc:
+        LOG.warning("Ignoring invalid cached leaf trace %s: %s", trace_path, exc)
+        return [], "invalid"
+
+
+def write_leaf_trace_cache(
+    trace_path: Path,
+    meta_path: Path,
+    entry: ManifestEntry,
+    estimates: Sequence[LeafAreaEstimate],
+    cache_settings: dict[str, object],
+) -> None:
+    write_gzip_csv(trace_path, LEAF_TRACE_FIELDS, leaf_trace_rows_to_dicts(estimates))
+    video_stat = entry.cropped_video.stat()
+    timestamp_stat = entry.timestamp_file.stat()
+    write_json_atomic(
+        meta_path,
+        {
+            "cache_version": LEAF_CACHE_VERSION,
+            "animal_id": entry.animal_id,
+            "clip_key": entry.clip_key,
+            "video_path": str(entry.cropped_video),
+            "timestamp_path": str(entry.timestamp_file),
+            "video_size_bytes": video_stat.st_size,
+            "video_mtime_ns": video_stat.st_mtime_ns,
+            "timestamp_size_bytes": timestamp_stat.st_size,
+            "timestamp_mtime_ns": timestamp_stat.st_mtime_ns,
+            "leaf_extraction_settings": cache_settings,
+            "trace_rows": len(estimates),
+        },
+    )
 
 
 def format_progress_bar(completed: int, total: int, *, width: int = PROGRESS_BAR_WIDTH) -> str:
@@ -287,6 +538,23 @@ def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> 
         for row in rows:
             writer.writerow(row)
     temp_path.replace(path)
+
+
+def write_gzip_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with gzip.open(temp_path, "wt", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    temp_path.replace(path)
+
+
+def open_csv_text(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", newline="", encoding="utf-8")
+    return path.open("r", newline="", encoding="utf-8")
 
 
 def load_manifest_entries(root: Path, *, animals: Optional[set[str]]) -> list[ManifestEntry]:
@@ -707,7 +975,6 @@ def extract_clip_leaf_estimates(
     grouped_sampled: dict[dt.datetime, int] = defaultdict(int)
     grouped_valid: dict[dt.datetime, int] = defaultdict(int)
     grouped_areas: dict[dt.datetime, list[float]] = defaultdict(list)
-    grouped_excluded: dict[dt.datetime, bool] = defaultdict(bool)
     decoded_leaf_frames = 0
     for target, frame in sampled_frames:
         area, _mask = segment_leaf_area(
@@ -722,10 +989,6 @@ def extract_clip_leaf_estimates(
         decoded_leaf_frames += 1
         bucket = target.estimate_bucket_utc
         grouped_sampled[bucket] += 1
-        burst_start = bucket
-        burst_end = bucket + dt.timedelta(seconds=burst_duration_seconds)
-        if interval_overlaps_any(burst_start, burst_end, video_quality_intervals_utc):
-            grouped_excluded[bucket] = True
         if area > 0:
             grouped_areas[bucket].append(float(area))
             grouped_valid[bucket] += 1
@@ -757,7 +1020,7 @@ def extract_clip_leaf_estimates(
                 sample_areas_px=tuple(float(value) for value in area_array.tolist()),
                 n_sampled_frames=grouped_sampled[bucket],
                 n_valid_frames=valid_count,
-                video_quality_excluded=grouped_excluded.get(bucket, False),
+                video_quality_excluded=False,
                 qc_flag="",
             )
         )
@@ -766,11 +1029,11 @@ def extract_clip_leaf_estimates(
         progress_reporter.finish_clip(
             decoded_leaf_frames=decoded_leaf_frames,
             completed_estimates=len(estimates),
-            status="done",
+            status="processed",
         )
     return ClipFeedingResult(
         estimates,
-        "computed",
+        "processed",
         timestamp_rows,
         video_frame_count if video_frame_count > 0 else timestamp_rows,
         len(targets),
@@ -891,6 +1154,11 @@ def finalize_leaf_rows(
             loss_prev_estimate_pct: Optional[float] = None
             delta_area_5min_px2: Optional[float] = None
             feeding_valid = False
+            video_quality_excluded = estimate.video_quality_excluded or interval_overlaps_any(
+                estimate.timestamp_utc,
+                estimate.timestamp_utc + estimate_interval,
+                video_quality_intervals_utc,
+            )
             if previous is not None and previous.timestamp_utc + estimate_interval - GRID_TOLERANCE <= estimate.timestamp_utc <= previous.timestamp_utc + estimate_interval + GRID_TOLERANCE:
                 loss_prev_estimate_pct = 100.0 * (
                     previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
@@ -901,8 +1169,12 @@ def finalize_leaf_rows(
                     video_quality_intervals_utc,
                 )
                 if (
-                    not estimate.video_quality_excluded
-                    and not previous.video_quality_excluded
+                    not video_quality_excluded
+                    and not (previous.video_quality_excluded or interval_overlaps_any(
+                        previous.timestamp_utc,
+                        previous.timestamp_utc + estimate_interval,
+                        video_quality_intervals_utc,
+                    ))
                     and not transition_excluded
                 ):
                     delta_area_5min_px2 = previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
@@ -920,7 +1192,7 @@ def finalize_leaf_rows(
                     feeding_valid=feeding_valid,
                     feeding_raw=False,
                     feeding=False,
-                    video_quality_excluded=estimate.video_quality_excluded,
+                    video_quality_excluded=video_quality_excluded,
                     n_sampled_frames=estimate.n_sampled_frames,
                     n_valid_frames=estimate.n_valid_frames,
                     qc_flag=estimate.qc_flag,
@@ -1076,6 +1348,165 @@ def summary_row(root: Path, entry: ManifestEntry, result: ClipFeedingResult) -> 
     }
 
 
+def validate_leaf_timeseries_cadence(
+    estimates: Sequence[LeafAreaEstimate],
+    *,
+    estimate_interval_minutes: int,
+) -> None:
+    grouped: dict[str, list[dt.datetime]] = defaultdict(list)
+    for estimate in estimates:
+        grouped[estimate.animal_id].append(estimate.timestamp_utc)
+
+    expected = dt.timedelta(minutes=estimate_interval_minutes)
+    tolerance = max(dt.timedelta(seconds=30), expected * 0.2)
+    for animal_id in ANIMAL_ORDER:
+        timestamps = sorted(grouped.get(animal_id, []))
+        if len(timestamps) < 2:
+            continue
+        gaps = [timestamps[index] - timestamps[index - 1] for index in range(1, len(timestamps))]
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        if abs(median_gap - expected) > tolerance:
+            raise ValueError(
+                f"cached leaf-area input for {animal_id} has median cadence {median_gap}; "
+                f"expected about {expected}. Re-run the image extraction stage before classifying."
+            )
+
+
+def load_legacy_leaf_area_timeseries(
+    path: Path,
+    *,
+    animals: Optional[set[str]],
+    estimate_interval_minutes: int,
+) -> list[LeafAreaEstimate]:
+    if not path.exists():
+        raise FileNotFoundError(f"missing leaf-area timeseries: {path}")
+    estimates = load_leaf_area_estimates_from_csv(path)
+    if animals is not None:
+        estimates = [estimate for estimate in estimates if estimate.animal_id in animals]
+    if not estimates:
+        raise ValueError(f"no leaf-area rows found in {path}")
+    missing_animals = sorted(animal for animal in animals or set() if animal not in {estimate.animal_id for estimate in estimates})
+    if missing_animals:
+        raise ValueError(f"requested animals are missing from {path}: {', '.join(missing_animals)}")
+    validate_leaf_timeseries_cadence(estimates, estimate_interval_minutes=estimate_interval_minutes)
+    estimates.sort(key=lambda estimate: (ANIMAL_ORDER.index(estimate.animal_id), estimate.timestamp_utc, estimate.clip_key))
+    return estimates
+
+
+def build_classify_only_summary_rows(
+    root: Path,
+    *,
+    source_path: Path,
+    estimates: Sequence[LeafAreaEstimate],
+) -> list[dict[str, str]]:
+    grouped: dict[tuple[str, str], list[LeafAreaEstimate]] = defaultdict(list)
+    for estimate in estimates:
+        grouped[(estimate.animal_id, estimate.clip_key)].append(estimate)
+
+    source_rel = relative_to_root(source_path, root)
+    rows: list[dict[str, str]] = []
+    for (animal_id, clip_key), clip_estimates in sorted(
+        grouped.items(),
+        key=lambda item: (ANIMAL_ORDER.index(item[0][0]), item[0][1]),
+    ):
+        rows.append(
+            {
+                "animal_id": animal_id,
+                "clip_key": clip_key,
+                "cropped_video": source_rel,
+                "timestamp_file": source_rel,
+                "timestamp_rows": str(len(clip_estimates)),
+                "video_frame_count": "",
+                "selected_leaf_frames": str(len(clip_estimates)),
+                "decoded_leaf_frames": "0",
+                "leaf_estimates": str(len(clip_estimates)),
+                "status": "classify_only",
+                "error": "",
+            }
+        )
+    return rows
+
+
+def load_or_extract_clip_leaf_estimates(
+    root: Path,
+    entry: ManifestEntry,
+    *,
+    clip_index: int,
+    estimate_interval_minutes: int,
+    burst_duration_seconds: int,
+    burst_step_seconds: int,
+    leaf_area_percentile: float,
+    min_valid_frames: int,
+    hue_low: int,
+    hue_high: int,
+    sat_min: int,
+    value_min: int,
+    min_component_px: int,
+    morph_kernel: int,
+    frame_access: str,
+    force: bool,
+    progress_reporter: Optional[ProgressReporter] = None,
+) -> LeafTraceCacheOutcome:
+    trace_path = leaf_trace_path(root, entry.animal_id, entry.clip_key)
+    meta_path = leaf_trace_meta_path(trace_path)
+    cache_settings = leaf_extraction_cache_settings(
+        estimate_interval_minutes=estimate_interval_minutes,
+        burst_duration_seconds=burst_duration_seconds,
+        burst_step_seconds=burst_step_seconds,
+        leaf_area_percentile=leaf_area_percentile,
+        min_valid_frames=min_valid_frames,
+        hue_low=hue_low,
+        hue_high=hue_high,
+        sat_min=sat_min,
+        value_min=value_min,
+        min_component_px=min_component_px,
+        morph_kernel=morph_kernel,
+        frame_access=frame_access,
+    )
+
+    preexisting_cache = trace_path.exists() and meta_path.exists()
+    if not force:
+        cached_estimates, cache_state = load_leaf_trace_cache(trace_path, meta_path, entry, cache_settings)
+        if cache_state == "cached":
+            return LeafTraceCacheOutcome(
+                ClipFeedingResult(
+                    cached_estimates,
+                    "cached",
+                    len(cached_estimates),
+                    None,
+                    len(cached_estimates),
+                    0,
+                ),
+                "cached",
+            )
+    elif preexisting_cache:
+        cache_state = "forced"
+    else:
+        cache_state = "missing"
+
+    result = extract_clip_leaf_estimates(
+        entry,
+        clip_index=clip_index,
+        estimate_interval_minutes=estimate_interval_minutes,
+        burst_duration_seconds=burst_duration_seconds,
+        burst_step_seconds=burst_step_seconds,
+        leaf_area_percentile=leaf_area_percentile,
+        min_valid_frames=min_valid_frames,
+        hue_low=hue_low,
+        hue_high=hue_high,
+        sat_min=sat_min,
+        value_min=value_min,
+        min_component_px=min_component_px,
+        morph_kernel=morph_kernel,
+        frame_access=frame_access,
+        video_quality_intervals_utc=(),
+        progress_reporter=progress_reporter,
+    )
+    if result.status == "processed":
+        write_leaf_trace_cache(trace_path, meta_path, entry, result.estimates, cache_settings)
+    return LeafTraceCacheOutcome(result=result, cache_state=("invalid" if preexisting_cache and not force else cache_state))
+
+
 def write_leaf_qc(
     root: Path,
     rows: list[LeafAreaRow],
@@ -1148,6 +1579,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-min", type=int, default=25)
     parser.add_argument("--min-component-px", type=int, default=1500)
     parser.add_argument("--morph-kernel", type=int, default=5)
+    parser.add_argument(
+        "--classify-only",
+        action="store_true",
+        help="Reuse leaf_area_timeseries.csv without opening or decoding any videos.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute per-clip leaf caches even when valid cached traces exist.",
+    )
     parser.add_argument("--qc", action="store_true")
     return parser
 
@@ -1162,9 +1603,75 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--leaf-estimate-minutes must be > 0")
     timezone = load_timezone(args.timezone)
     animal_filter = set(args.animals) if args.animals else None
-    entries = load_manifest_entries(root, animals=animal_filter)
-    if not entries:
-        parser.error("no cropped manifest rows with copied timestamps were found")
+    output_root = leaf_feeding_root(root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    all_estimates: list[LeafAreaEstimate] = []
+    summary_rows: list[dict[str, str]] = []
+    status_counts: dict[str, int] = defaultdict(int)
+    source_frames_total = 0
+    decoded_leaf_frames_total = 0
+    cache_hits = 0
+    cache_invalidated = 0
+    clips_processed = 0
+    videos_opened = 0
+    allowed_gap_minutes = (
+        args.allowed_gap_minutes
+        if args.allowed_gap_minutes is not None
+        else args.leaf_estimate_minutes + DEFAULT_ALLOWED_GAP_EXTRA_MINUTES
+    )
+    if args.classify_only:
+        source_path = output_root / "leaf_area_timeseries.csv"
+        try:
+            all_estimates = load_legacy_leaf_area_timeseries(
+                source_path,
+                animals=animal_filter,
+                estimate_interval_minutes=args.leaf_estimate_minutes,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            LOG.error("%s", exc)
+            return 1
+        summary_rows = build_classify_only_summary_rows(root, source_path=source_path, estimates=all_estimates)
+    else:
+        entries = load_manifest_entries(root, animals=animal_filter)
+        if not entries:
+            parser.error("no cropped manifest rows with copied timestamps were found")
+        progress_reporter = ProgressReporter(total_clips=len(entries))
+        for clip_index, entry in enumerate(entries, start=1):
+            outcome = load_or_extract_clip_leaf_estimates(
+                root,
+                entry,
+                clip_index=clip_index,
+                estimate_interval_minutes=args.leaf_estimate_minutes,
+                burst_duration_seconds=args.burst_duration_seconds,
+                burst_step_seconds=args.burst_step_seconds,
+                leaf_area_percentile=args.leaf_area_percentile,
+                min_valid_frames=args.min_valid_frames,
+                hue_low=args.hue_low,
+                hue_high=args.hue_high,
+                sat_min=args.sat_min,
+                value_min=args.value_min,
+                min_component_px=args.min_component_px,
+                morph_kernel=args.morph_kernel,
+                frame_access=args.frame_access,
+                force=args.force,
+                progress_reporter=progress_reporter,
+            )
+            result = outcome.result
+            if outcome.cache_state == "cached":
+                cache_hits += 1
+                LOG.info("%s %s: cache hit", entry.animal_id, entry.clip_key)
+            elif outcome.cache_state == "invalid":
+                cache_invalidated += 1
+            if result.status == "processed":
+                clips_processed += 1
+                videos_opened += 1
+            if result.error:
+                LOG.error(result.error)
+            all_estimates.extend(result.estimates)
+            summary_rows.append(summary_row(root, entry, result))
+            status_counts[result.status] += 1
+            source_frames_total += result.timestamp_rows
+            decoded_leaf_frames_total += result.decoded_leaf_frames
 
     from plot_recording_timeline import resolve_behavior_event_source
 
@@ -1182,47 +1689,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return 1
-
-    output_root = root / "cropped_by_caterpillar" / "leaf_feeding"
-    output_root.mkdir(parents=True, exist_ok=True)
-    all_estimates: list[LeafAreaEstimate] = []
-    summary_rows: list[dict[str, str]] = []
-    progress_reporter = ProgressReporter(total_clips=len(entries))
-    status_counts: dict[str, int] = defaultdict(int)
-    source_frames_total = 0
-    decoded_leaf_frames_total = 0
-    allowed_gap_minutes = (
-        args.allowed_gap_minutes
-        if args.allowed_gap_minutes is not None
-        else args.leaf_estimate_minutes + DEFAULT_ALLOWED_GAP_EXTRA_MINUTES
-    )
-
-    for clip_index, entry in enumerate(entries, start=1):
-        result = extract_clip_leaf_estimates(
-            entry,
-            clip_index=clip_index,
-            estimate_interval_minutes=args.leaf_estimate_minutes,
-            burst_duration_seconds=args.burst_duration_seconds,
-            burst_step_seconds=args.burst_step_seconds,
-            leaf_area_percentile=args.leaf_area_percentile,
-            min_valid_frames=args.min_valid_frames,
-            hue_low=args.hue_low,
-            hue_high=args.hue_high,
-            sat_min=args.sat_min,
-            value_min=args.value_min,
-            min_component_px=args.min_component_px,
-            morph_kernel=args.morph_kernel,
-            frame_access=args.frame_access,
-            video_quality_intervals_utc=video_quality_intervals_utc,
-            progress_reporter=progress_reporter,
-        )
-        if result.error:
-            LOG.error(result.error)
-        all_estimates.extend(result.estimates)
-        summary_rows.append(summary_row(root, entry, result))
-        status_counts[result.status] += 1
-        source_frames_total += result.timestamp_rows
-        decoded_leaf_frames_total += result.decoded_leaf_frames
 
     finalized_rows = finalize_leaf_rows(
         all_estimates,
@@ -1256,17 +1722,29 @@ def main(argv: Optional[list[str]] = None) -> int:
             estimate_interval_minutes=args.leaf_estimate_minutes,
         )
 
-    LOG.info("Leaf feeding analysis complete")
-    LOG.info("  clips selected: %d", len(entries))
-    LOG.info("  clips analyzed: %d", status_counts.get("computed", 0))
-    LOG.info("  frame mismatches: %d", status_counts.get("frame_mismatch", 0))
-    LOG.info("  invalid timestamps: %d", status_counts.get("invalid_timestamps", 0))
-    LOG.info("  seek failures: %d", status_counts.get("seek_failure", 0))
-    LOG.info("  seek mismatches: %d", status_counts.get("seek_mismatch", 0))
-    LOG.info("  source frames represented: %d", source_frames_total)
-    LOG.info("  leaf frames decoded: %d", decoded_leaf_frames_total)
-    LOG.info("  %d-min leaf estimates: %d", args.leaf_estimate_minutes, len(finalized_rows))
-    LOG.info("  coarse feeding events: %d", len(feeding_events))
+    if args.classify_only:
+        LOG.info("Leaf feeding reclassification complete")
+        LOG.info("  source: %s", relative_to_root(output_root / "leaf_area_timeseries.csv", root))
+        LOG.info("  videos opened: 0")
+        LOG.info("  leaf estimates loaded: %d", len(all_estimates))
+        LOG.info("  %d-min leaf estimates: %d", args.leaf_estimate_minutes, len(finalized_rows))
+        LOG.info("  coarse feeding events: %d", len(feeding_events))
+    else:
+        LOG.info("Leaf feeding analysis complete")
+        LOG.info("  clips selected: %d", len(summary_rows))
+        LOG.info("  cache hits: %d", cache_hits)
+        LOG.info("  clips processed: %d", clips_processed)
+        LOG.info("  cache invalidated: %d", cache_invalidated)
+        LOG.info("  videos opened: %d", videos_opened)
+        LOG.info("  frame mismatches: %d", status_counts.get("frame_mismatch", 0))
+        LOG.info("  invalid timestamps: %d", status_counts.get("invalid_timestamps", 0))
+        LOG.info("  seek failures: %d", status_counts.get("seek_failure", 0))
+        LOG.info("  seek mismatches: %d", status_counts.get("seek_mismatch", 0))
+        LOG.info("  leaf estimates loaded/extracted: %d", len(all_estimates))
+        LOG.info("  %d-min leaf estimates: %d", args.leaf_estimate_minutes, len(finalized_rows))
+        LOG.info("  source frames represented: %d", source_frames_total)
+        LOG.info("  leaf frames decoded: %d", decoded_leaf_frames_total)
+        LOG.info("  coarse feeding events: %d", len(feeding_events))
     LOG.info("Wrote leaf area timeseries: %s", output_root / "leaf_area_timeseries.csv")
     LOG.info("Wrote feeding events: %s", output_root / "feeding_events.csv")
     LOG.info("Wrote leaf feeding summary: %s", output_root / "leaf_feeding_summary.csv")

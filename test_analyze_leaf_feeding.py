@@ -422,7 +422,7 @@ class LeafFeedingLogicTests(unittest.TestCase):
                         video_quality_intervals_utc=[],
                     )
 
-        self.assertEqual(result.status, "computed")
+        self.assertEqual(result.status, "processed")
         self.assertEqual(result.decoded_leaf_frames, 36)
         self.assertEqual(fake_capture.read_calls, 36)
         self.assertEqual(len(fake_capture.set_calls), 36)
@@ -456,6 +456,121 @@ class LeafFeedingLogicTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.status, "seek_mismatch")
+
+    def test_cached_leaf_trace_reuse_avoids_video_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = leaf.ManifestEntry(
+                "C01",
+                "clip_0001",
+                root / "cropped_by_caterpillar" / "camera1" / "clip_0001.mp4",
+                root / "cropped_by_caterpillar" / "timestamps" / "clip_0001.timestamps.csv",
+            )
+            entry.cropped_video.parent.mkdir(parents=True, exist_ok=True)
+            entry.timestamp_file.parent.mkdir(parents=True, exist_ok=True)
+            entry.cropped_video.write_bytes(b"mp4")
+            entry.timestamp_file.write_text("timestamp", encoding="utf-8")
+            estimates = [
+                leaf.LeafAreaEstimate(
+                    "C01",
+                    "clip_0001",
+                    dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc),
+                    10000.0,
+                    (10000.0,),
+                    6,
+                    6,
+                ),
+                leaf.LeafAreaEstimate(
+                    "C01",
+                    "clip_0001",
+                    dt.datetime(2026, 8, 9, 10, 5, 0, tzinfo=dt.timezone.utc),
+                    9200.0,
+                    (9200.0,),
+                    6,
+                    6,
+                ),
+            ]
+            cache_settings = leaf.leaf_extraction_cache_settings(
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=1500,
+                morph_kernel=5,
+                frame_access="sparse",
+            )
+            trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
+            meta_path = leaf.leaf_trace_meta_path(trace_path)
+            leaf.write_leaf_trace_cache(trace_path, meta_path, entry, estimates, cache_settings)
+
+            with mock.patch.object(leaf, "extract_clip_leaf_estimates", side_effect=AssertionError("should not decode video")):
+                outcome = leaf.load_or_extract_clip_leaf_estimates(
+                    root,
+                    entry,
+                    clip_index=1,
+                    estimate_interval_minutes=5,
+                    burst_duration_seconds=60,
+                    burst_step_seconds=10,
+                    leaf_area_percentile=95.0,
+                    min_valid_frames=3,
+                    hue_low=25,
+                    hue_high=95,
+                    sat_min=35,
+                    value_min=25,
+                    min_component_px=1500,
+                    morph_kernel=5,
+                    frame_access="sparse",
+                    force=False,
+                    progress_reporter=None,
+                )
+
+        self.assertEqual(outcome.cache_state, "cached")
+        self.assertEqual(outcome.result.status, "cached")
+        self.assertEqual(len(outcome.result.estimates), 2)
+
+    def test_main_classify_only_reuses_legacy_timeseries_without_video_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_area_timeseries.csv"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            leaf.write_csv(
+                source_path,
+                leaf.LEAF_AREA_FIELDS,
+                [
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:00:00.000000Z",
+                        "leaf_area_proxy_px": "10000.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:05:00.000000Z",
+                        "leaf_area_proxy_px": "9200.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                ],
+            )
+
+            with mock.patch.object(leaf, "load_manifest_entries", side_effect=AssertionError("should not inspect manifest")):
+                with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [])):
+                    with mock.patch.object(leaf.cv2, "VideoCapture", side_effect=AssertionError("should not open video")):
+                        with mock.patch("plot_recording_timeline.resolve_behavior_event_source", return_value=(None, "none")):
+                            rc = leaf.main([str(root), "--classify-only", "--animals", "C01"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv").exists())
+            self.assertTrue((root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_feeding_summary.csv").exists())
 
     def test_load_analysis_events_supports_google_sheet_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,16 +610,21 @@ class LeafFeedingLogicTests(unittest.TestCase):
                     with mock.patch.object(leaf, "feeding_event_dicts", return_value=[]):
                         with mock.patch.object(leaf, "leaf_rows_to_dicts", return_value=[]):
                             with mock.patch.object(leaf, "write_csv"):
-                                with mock.patch.object(leaf, "load_timezone", return_value=dt.timezone.utc):
-                                    with mock.patch.object(
-                                        leaf,
-                                        "extract_clip_leaf_estimates",
-                                        side_effect=[
-                                            leaf.ClipFeedingResult([], "computed", 9000, 9000, 36, 36),
-                                            leaf.ClipFeedingResult([], "computed", 9000, 9000, 36, 36),
-                                        ],
-                                    ) as mock_extract:
-                                        rc = leaf.main(["."])
+                                with mock.patch.object(leaf, "write_leaf_trace_cache"):
+                                    with mock.patch.object(leaf, "load_timezone", return_value=dt.timezone.utc):
+                                        with mock.patch.object(
+                                            leaf,
+                                            "extract_clip_leaf_estimates",
+                                            side_effect=[
+                                                leaf.ClipFeedingResult([], "processed", 9000, 9000, 36, 36),
+                                                leaf.ClipFeedingResult([], "processed", 9000, 9000, 36, 36),
+                                            ],
+                                        ) as mock_extract:
+                                            with mock.patch(
+                                                "plot_recording_timeline.resolve_behavior_event_source",
+                                                return_value=(None, "none"),
+                                            ):
+                                                rc = leaf.main(["."])
 
         self.assertEqual(rc, 0)
         first_call = mock_extract.call_args_list[0]

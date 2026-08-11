@@ -24,7 +24,7 @@ If you use a different camera, copy a YAML template and update the model, serial
 - `prepare_cropped_timestamps.py` copies one authoritative timestamp sidecar per raw source clip into `cropped_by_caterpillar/timestamps/` and writes `crop_manifest.csv`.
 - `analysis_timing.py` holds the shared UTC/timestamp parsing helpers used by the analysis scripts.
 - `extract_motion_energy.py` builds cached per-crop motion traces, a consolidated `motion_energy_timeseries.csv`, editable thresholds, diagnostics, and `motion_states.csv`.
-- `analyze_leaf_feeding.py` derives coarse 5-minute leaf-area proxy traces and automatic feeding bouts from the same `crop_manifest.csv` plus copied timestamp sidecars, using sparse frame seeks instead of decoding every frame.
+- `analyze_leaf_feeding.py` derives coarse 5-minute leaf-area proxy traces and automatic feeding bouts from the same `crop_manifest.csv` plus copied timestamp sidecars, caches per-clip leaf traces, and supports `--classify-only` reuse of an existing `leaf_area_timeseries.csv` without reopening video files.
 - `plot_recording_timeline.py` builds `recording_coverage.csv` and `recording_behavior_timeline.png` from timestamp sidecars, behavior events, optional motion states, optional feeding events, and an optional quantitative motion panel.
 - `test_record_basler.py` covers schedule math, preview sizing, JSON handling, and archive helpers.
 - `config_smoke_test.yaml` is a short local test.
@@ -149,10 +149,14 @@ python analyze_leaf_feeding.py `
   "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08"
 ```
 
+Normal reruns reuse valid per-clip caches automatically. If you only want to recompute the downstream feeding calls from an already-generated `leaf_area_timeseries.csv`, add `--classify-only`.
+
 This writes:
 
 ```text
 cropped_by_caterpillar/leaf_feeding/
+    traces/
+        <animal>__<clip_key>.leaf_area.csv.gz
     leaf_area_timeseries.csv
     feeding_events.csv
     leaf_feeding_summary.csv
