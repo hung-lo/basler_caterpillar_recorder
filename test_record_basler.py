@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import csv
 import datetime as dt
 import gzip
 import json
@@ -796,6 +797,56 @@ class ArchiveBackendTests(unittest.TestCase):
 
         self.assertTrue(ready)
         self.assertEqual(issues, [])
+
+    def test_clip_directory_ready_for_archive_rejects_leftover_review_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp)
+            metadata_path = clip_dir / "camera1.json"
+            (clip_dir / "camera1.mp4").write_bytes(b"mp4")
+            with gzip.open(
+                clip_dir / "camera1.timestamps.csv.gz",
+                "wt",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write("frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n")
+                handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+            review_dir = clip_dir / "review_snapshots"
+            review_dir.mkdir()
+            (review_dir / ".camera1_review_snapshot_0001.jpg.tmp").write_bytes(b"tmp")
+            record_basler.write_json(
+                metadata_path,
+                {
+                    "success": True,
+                    "planned_clip_complete": True,
+                    "interrupted_by_user": False,
+                    "stop_reason": "planned_end",
+                    "grab_failures": 0,
+                    "mp4_remux_succeeded": True,
+                    "review_snapshots": {
+                        "enabled": True,
+                        "operational": True,
+                        "writer_started": True,
+                        "writer_finalized": True,
+                        "index_csv_written": False,
+                        "directory": "review_snapshots",
+                        "saved": 0,
+                        "failed": 0,
+                    },
+                },
+            )
+
+            ready, issues, _total_bytes = record_basler.clip_directory_ready_for_archive(
+                clip_dir,
+                expected_camera_count=1,
+                max_clip_size_bytes=10_000_000,
+            )
+
+        self.assertFalse(ready)
+        self.assertTrue(
+            any("temporary review snapshot files remain" in issue for issue in issues),
+            issues,
+        )
 
     def test_write_review_snapshot_index_csv_propagates_write_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1857,6 +1908,289 @@ class ReviewSnapshotSettingsTests(unittest.TestCase):
             record_basler.parse_review_snapshot_settings(
                 {"review_snapshots": {"enabled": True, "jpeg_quality": 0}}
             )
+
+
+class ReviewSnapshotLifecycleTests(unittest.TestCase):
+    def _advance_targets(
+        self,
+        targets_s: list[float],
+        elapsed_samples_s: list[float],
+    ) -> tuple[int, int, int, list[int]]:
+        next_target_index = 0
+        targets_reached = 0
+        missed_due_gap = 0
+        queued_target_indices: list[int] = []
+        for elapsed_s in elapsed_samples_s:
+            due_indices: list[int] = []
+            while next_target_index < len(targets_s) and elapsed_s >= targets_s[next_target_index]:
+                due_indices.append(next_target_index)
+                next_target_index += 1
+            if due_indices:
+                targets_reached += len(due_indices)
+                if len(due_indices) > 1:
+                    missed_due_gap += len(due_indices) - 1
+                queued_target_indices.append(due_indices[-1])
+        return next_target_index, targets_reached, missed_due_gap, queued_target_indices
+
+    def test_writer_never_started_leaves_all_targets_unreached(self) -> None:
+        targets_s = record_basler.review_snapshot_targets(600.0, 10)
+        finalization = record_basler.finalize_review_snapshots(
+            label="camera1",
+            clip_dir=Path(tempfile.gettempdir()),
+            file_stem="camera1",
+            review_snapshot_enabled=True,
+            review_snapshot_writer_started=False,
+            review_snapshot_writer=None,
+            review_snapshot_targets_s=targets_s,
+            review_snapshot_next_target_index=0,
+        )
+
+        self.assertTrue(finalization.writer_finalized)
+        self.assertFalse(finalization.index_csv_written)
+        self.assertEqual(finalization.saved, 0)
+        self.assertEqual(finalization.unreached_targets, 10)
+
+    def test_partial_clip_tracks_reached_and_unreached_targets(self) -> None:
+        targets_s = record_basler.review_snapshot_targets(600.0, 10)
+        next_target_index, targets_reached, missed_due_gap, queued_target_indices = self._advance_targets(
+            targets_s,
+            [29.5, 89.5, 149.5, 209.5, 255.0],
+        )
+
+        self.assertEqual(next_target_index, 4)
+        self.assertEqual(targets_reached, 4)
+        self.assertEqual(missed_due_gap, 0)
+        self.assertEqual(queued_target_indices, [0, 1, 2, 3])
+        self.assertEqual(record_basler.compute_review_snapshot_unreached_targets(len(targets_s), next_target_index), 6)
+        self.assertTrue(all(index < 4 for index in queued_target_indices))
+
+    def test_acquisition_gap_counts_missed_targets_not_unreached(self) -> None:
+        targets_s = record_basler.review_snapshot_targets(600.0, 10)
+        next_target_index, targets_reached, missed_due_gap, queued_target_indices = self._advance_targets(
+            targets_s,
+            [30.5, 89.0, 211.0],
+        )
+
+        self.assertEqual(next_target_index, 4)
+        self.assertEqual(targets_reached, 4)
+        self.assertEqual(missed_due_gap, 2)
+        self.assertEqual(queued_target_indices, [0, 3])
+        self.assertEqual(record_basler.compute_review_snapshot_unreached_targets(len(targets_s), next_target_index), 6)
+
+    def test_queue_full_submit_is_non_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = record_basler.ReviewSnapshotWriter(
+                camera_label="camera1",
+                output_dir=Path(tmp),
+                jpeg_quality=95,
+            )
+            writer.accepting = True
+            writer.queue = queue.Queue(maxsize=1)
+            frame = np.zeros((8, 8, 3), dtype=np.uint8)
+            job_one = record_basler.ReviewSnapshotJob(
+                snapshot_index=0,
+                target_elapsed_s=30.0,
+                frame_index=42,
+                frame=frame,
+                host_utc_ns=1,
+                host_monotonic_ns=2,
+                actual_clip_elapsed_s=30.25,
+                video_time_s=29.75,
+            )
+            job_two = dataclasses.replace(job_one, snapshot_index=1, frame_index=43)
+
+            self.assertTrue(writer.submit(job_one))
+            self.assertFalse(writer.submit(job_two))
+
+    def test_atomic_jpeg_success_writes_final_image_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "review_snapshots"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            writer = record_basler.ReviewSnapshotWriter(
+                camera_label="camera1",
+                output_dir=output_dir,
+                jpeg_quality=90,
+            )
+            frame = np.full((12, 12, 3), 127, dtype=np.uint8)
+            job = record_basler.ReviewSnapshotJob(
+                snapshot_index=3,
+                target_elapsed_s=150.0,
+                frame_index=99,
+                frame=frame,
+                host_utc_ns=1_725_000_000_000_000_000,
+                host_monotonic_ns=123,
+                actual_clip_elapsed_s=150.25,
+                video_time_s=149.75,
+            )
+            expected_filename = record_basler.review_snapshot_filename(
+                "camera1",
+                job.snapshot_index,
+                job.host_utc_ns,
+                job.video_time_s,
+                job.frame_index,
+            )
+
+            result = writer._process_job(job)
+            final_path = output_dir / expected_filename
+            temp_path = final_path.with_name(f".{final_path.name}.tmp")
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.filename, expected_filename)
+            self.assertTrue(final_path.exists())
+            self.assertGreater(final_path.stat().st_size, 0)
+            self.assertIsNotNone(record_basler.cv2.imread(str(final_path)))
+            self.assertFalse(temp_path.exists())
+
+    def test_atomic_jpeg_failure_removes_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "review_snapshots"
+            writer = record_basler.ReviewSnapshotWriter(
+                camera_label="camera1",
+                output_dir=output_dir,
+                jpeg_quality=90,
+            )
+            frame = np.full((12, 12, 3), 127, dtype=np.uint8)
+            job = record_basler.ReviewSnapshotJob(
+                snapshot_index=3,
+                target_elapsed_s=150.0,
+                frame_index=99,
+                frame=frame,
+                host_utc_ns=1_725_000_000_000_000_000,
+                host_monotonic_ns=123,
+                actual_clip_elapsed_s=150.25,
+                video_time_s=149.75,
+            )
+
+            with mock.patch.object(record_basler.cv2, "imencode", return_value=(False, None)):
+                result = writer._process_job(job)
+
+            final_path = output_dir / record_basler.review_snapshot_filename(
+                "camera1",
+                job.snapshot_index,
+                job.host_utc_ns,
+                job.video_time_s,
+                job.frame_index,
+            )
+            temp_path = final_path.with_name(f".{final_path.name}.tmp")
+
+            self.assertFalse(result.success)
+            self.assertFalse(final_path.exists())
+            self.assertFalse(temp_path.exists())
+
+    def test_atomic_snapshot_csv_writes_sorted_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_snapshots" / "camera1_snapshots.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            results = [
+                record_basler.ReviewSnapshotResult(
+                    snapshot_index=2,
+                    target_elapsed_s=150.0,
+                    frame_index=12,
+                    filename="camera1_s02.jpg",
+                    host_utc_ns=3,
+                    host_monotonic_ns=30,
+                    actual_clip_elapsed_s=150.1,
+                    video_time_s=149.9,
+                    success=True,
+                    error=None,
+                ),
+                record_basler.ReviewSnapshotResult(
+                    snapshot_index=0,
+                    target_elapsed_s=30.0,
+                    frame_index=4,
+                    filename="camera1_s00.jpg",
+                    host_utc_ns=1,
+                    host_monotonic_ns=10,
+                    actual_clip_elapsed_s=30.1,
+                    video_time_s=29.9,
+                    success=True,
+                    error=None,
+                ),
+                record_basler.ReviewSnapshotResult(
+                    snapshot_index=1,
+                    target_elapsed_s=90.0,
+                    frame_index=8,
+                    filename="camera1_s01.jpg",
+                    host_utc_ns=2,
+                    host_monotonic_ns=20,
+                    actual_clip_elapsed_s=90.1,
+                    video_time_s=89.9,
+                    success=True,
+                    error=None,
+                ),
+            ]
+
+            record_basler.write_review_snapshot_index_csv(path, results)
+
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
+            self.assertEqual([row["snapshot_index"] for row in rows], ["0", "1", "2"])
+            self.assertEqual(len(rows), 3)
+
+    def test_atomic_snapshot_csv_failure_removes_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_snapshots" / "camera1_snapshots.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            results = [
+                record_basler.ReviewSnapshotResult(
+                    snapshot_index=0,
+                    target_elapsed_s=30.0,
+                    frame_index=4,
+                    filename="camera1_s00.jpg",
+                    host_utc_ns=1,
+                    host_monotonic_ns=10,
+                    actual_clip_elapsed_s=30.1,
+                    video_time_s=29.9,
+                    success=True,
+                    error=None,
+                )
+            ]
+
+            with mock.patch.object(record_basler.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaisesRegex(OSError, "boom"):
+                    record_basler.write_review_snapshot_index_csv(path, results)
+
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
+
+    def test_finalize_review_snapshots_keeps_writer_finalized_on_csv_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = mock.Mock()
+            writer.close_and_join.return_value = True
+            writer.collect_results.return_value = [
+                record_basler.ReviewSnapshotResult(
+                    snapshot_index=0,
+                    target_elapsed_s=30.0,
+                    frame_index=4,
+                    filename="camera1_s00.jpg",
+                    host_utc_ns=1,
+                    host_monotonic_ns=10,
+                    actual_clip_elapsed_s=30.1,
+                    video_time_s=29.9,
+                    success=True,
+                    error=None,
+                )
+            ]
+            with mock.patch.object(record_basler, "write_review_snapshot_index_csv", side_effect=OSError("boom")):
+                finalization = record_basler.finalize_review_snapshots(
+                    label="camera1",
+                    clip_dir=Path(tmp),
+                    file_stem="camera1",
+                    review_snapshot_enabled=True,
+                    review_snapshot_writer_started=True,
+                    review_snapshot_writer=writer,
+                    review_snapshot_targets_s=record_basler.review_snapshot_targets(600.0, 10),
+                    review_snapshot_next_target_index=1,
+                )
+
+        self.assertTrue(finalization.writer_finalized)
+        self.assertFalse(finalization.index_csv_written)
+        self.assertEqual(finalization.saved, 1)
+        self.assertEqual(finalization.unreached_targets, 9)
 
 
 class RecordingPreviewTests(unittest.TestCase):

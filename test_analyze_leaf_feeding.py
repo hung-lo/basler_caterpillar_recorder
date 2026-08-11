@@ -198,7 +198,34 @@ class LeafFeedingLogicTests(unittest.TestCase):
 
         self.assertEqual(area, 800.0)
 
-    def test_leaf_reset_starts_new_epoch(self) -> None:
+    def test_explicit_leaf_reset_starts_new_epoch(self) -> None:
+        base = dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 9500, (9500,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=10), 9000, (9000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=15), 15000, (15000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=20), 14950, (14950,), 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=5,
+            leaf_reset_increase_pct=20.0,
+            explicit_resets={"C01": [base + dt.timedelta(minutes=15)]},
+        )
+
+        self.assertEqual([row.leaf_epoch for row in rows], [1, 1, 1, 2, 2])
+        self.assertIsNone(rows[3].delta_area_5min_px2)
+
+    def test_automatic_area_increase_is_qc_only_and_keeps_epoch(self) -> None:
         base = dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc)
         estimates = [
             leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
@@ -221,8 +248,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
             leaf_reset_increase_pct=20.0,
         )
 
-        self.assertEqual([row.leaf_epoch for row in rows], [1, 1, 1, 2, 2])
-        self.assertIsNone(rows[3].delta_area_5min_px2)
+        self.assertEqual([row.leaf_epoch for row in rows], [1, 1, 1, 1, 1])
+        self.assertIn("automatic_area_increase", rows[3].qc_flag)
 
     def test_cross_clip_continuity_does_not_force_new_leaf_epoch(self) -> None:
         base = dt.datetime(2026, 8, 9, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -360,6 +387,157 @@ class LeafFeedingLogicTests(unittest.TestCase):
 
         self.assertEqual([row.feeding_raw for row in rows], [False, True, False, True])
         self.assertEqual([row.feeding for row in rows], [False, False, False, False])
+
+    def test_main_classify_only_default_min_bout_removes_single_positive_bin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_area_timeseries.csv"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            leaf.write_csv(
+                source_path,
+                leaf.LEAF_AREA_FIELDS,
+                [
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:00:00.000000Z",
+                        "leaf_area_proxy_px": "10000.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                    {
+                        "animal_id": "C01",
+                        "clip_key": "clip_0001",
+                        "timestamp_utc": "2026-08-09T10:05:00.000000Z",
+                        "leaf_area_proxy_px": "9700.000000",
+                        "n_sampled_frames": "6",
+                        "n_valid_frames": "6",
+                        "qc_flag": "",
+                    },
+                ],
+            )
+
+            with mock.patch.object(leaf, "load_manifest_entries", side_effect=AssertionError("should not inspect manifest")):
+                with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [], {})):
+                    with mock.patch.object(leaf.cv2, "VideoCapture", side_effect=AssertionError("should not open video")):
+                        with mock.patch("plot_recording_timeline.resolve_behavior_event_source", return_value=(None, "none")):
+                            rc = leaf.main([str(root), "--classify-only", "--animals", "C01"])
+
+            self.assertEqual(rc, 0)
+            with (root / "cropped_by_caterpillar" / "leaf_feeding" / "feeding_events.csv").open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                self.assertEqual(list(leaf.csv.DictReader(handle)), [])
+            with (root / "cropped_by_caterpillar" / "leaf_feeding" / "leaf_area_timeseries.csv").open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                rows = list(leaf.csv.DictReader(handle))
+            self.assertEqual([row["feeding_raw"] for row in rows], ["FALSE", "TRUE"])
+            self.assertEqual([row["feeding"] for row in rows], ["FALSE", "FALSE"])
+
+    def test_finalize_leaf_rows_rejects_transient_area_rebound(self) -> None:
+        base = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 9700, (9700,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=10), 9400, (9400,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=15), 9800, (9800,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=20), 9900, (9900,), 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=10,
+            leaf_reset_increase_pct=20.0,
+        )
+
+        self.assertEqual([row.feeding_raw for row in rows], [False, True, True, False, False])
+        self.assertEqual([row.feeding for row in rows], [False, False, False, False, False])
+        self.assertIn("transient_area_rebound", rows[1].qc_flag)
+        self.assertIn("transient_area_rebound", rows[2].qc_flag)
+
+    def test_finalize_leaf_rows_rejects_catastrophic_long_rebound(self) -> None:
+        base = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 4900, (4900,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=10), 4800, (4800,), 6, 6),
+        ]
+        for index in range(3, 145):
+            timestamp = base + dt.timedelta(minutes=5 * index)
+            area = 9200 if index == 144 else 4800
+            estimates.append(
+                leaf.LeafAreaEstimate("C01", "clip", timestamp, area, (area,), 6, 6)
+            )
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=10,
+            leaf_reset_increase_pct=20.0,
+        )
+
+        self.assertEqual([row.feeding_raw for row in rows[:3]], [False, True, True])
+        self.assertTrue(any("unexplained_large_area_rebound" in row.qc_flag for row in rows[:3]))
+        self.assertTrue(all(not row.feeding for row in rows))
+
+    def test_finalize_leaf_rows_stops_feeding_at_death_cutoff(self) -> None:
+        base = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
+        estimates = [
+            leaf.LeafAreaEstimate("C01", "clip", base, 10000, (10000,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=5), 9700, (9700,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=10), 9400, (9400,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=15), 9100, (9100,), 6, 6),
+            leaf.LeafAreaEstimate("C01", "clip", base + dt.timedelta(minutes=20), 8800, (8800,), 6, 6),
+        ]
+
+        rows = leaf.finalize_leaf_rows(
+            estimates,
+            timezone=dt.timezone.utc,
+            leaf_area_percentile=95.0,
+            estimate_interval_minutes=5,
+            allowed_gap_minutes=6,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            merge_gap_minutes=5,
+            min_bout_minutes=10,
+            leaf_reset_increase_pct=20.0,
+            death_cutoffs_utc={"C01": base + dt.timedelta(minutes=12)},
+        )
+
+        self.assertEqual([row.feeding for row in rows], [False, True, True, False, False])
+        self.assertIn("post_death", rows[3].qc_flag)
+        self.assertIn("post_death", rows[4].qc_flag)
+
+        events = leaf.feeding_event_dicts(
+            rows,
+            dt.timezone.utc,
+            estimate_interval_minutes=5,
+            start_threshold=2.0,
+            continue_threshold=1.0,
+            threshold_metric="pct",
+            death_cutoffs_utc={"C01": base + dt.timedelta(minutes=12)},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["end_utc"], "2026-08-09T10:12:00.000000Z")
 
     def test_frame_mismatch_is_reported_before_sampling(self) -> None:
         entry = leaf.ManifestEntry("C01", "clip_a", Path("/tmp/video.mp4"), Path("/tmp/timestamps.csv"))
@@ -907,7 +1085,7 @@ class LeafFeedingLogicTests(unittest.TestCase):
             )
 
             with mock.patch.object(leaf, "load_manifest_entries", side_effect=AssertionError("should not inspect manifest")):
-                with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [])):
+                with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [], {})):
                     with mock.patch.object(leaf.cv2, "VideoCapture", side_effect=AssertionError("should not open video")):
                         with mock.patch("plot_recording_timeline.resolve_behavior_event_source", return_value=(None, "none")):
                             rc = leaf.main(
@@ -954,13 +1132,14 @@ class LeafFeedingLogicTests(unittest.TestCase):
                     __exit__=mock.Mock(return_value=False),
                 ),
             ):
-                resets, intervals = leaf.load_analysis_events(
+                resets, intervals, death_cutoffs = leaf.load_analysis_events(
                     root=root,
                     source=url,
                     timezone=dt.timezone(dt.timedelta(hours=-4)),
                 )
             self.assertEqual(resets, {})
             self.assertEqual(len(intervals), 1)
+            self.assertEqual(death_cutoffs, {})
             self.assertEqual(intervals[0][0], dt.datetime(2026, 8, 7, 22, 49, 0, tzinfo=dt.timezone.utc))
             self.assertTrue((root / "behavior_events_used.csv").exists())
             self.assertTrue((root / "behavior_events_source.json").exists())
@@ -971,7 +1150,7 @@ class LeafFeedingLogicTests(unittest.TestCase):
         entry_b = leaf.ManifestEntry("C02", "clip_b", repo_root / "b.mp4", repo_root / "b.timestamps.csv")
 
         with mock.patch.object(leaf, "load_manifest_entries", return_value=[entry_a, entry_b]):
-            with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [])):
+            with mock.patch.object(leaf, "load_analysis_events", return_value=({}, [], {})):
                 with mock.patch.object(leaf, "finalize_leaf_rows", return_value=[]):
                     with mock.patch.object(leaf, "feeding_event_dicts", return_value=[]):
                         with mock.patch.object(leaf, "leaf_rows_to_dicts", return_value=[]):

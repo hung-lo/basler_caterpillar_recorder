@@ -745,6 +745,17 @@ class ReviewSnapshotResult:
     error: Optional[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class ReviewSnapshotFinalization:
+    results: list[ReviewSnapshotResult]
+    writer_finalized: bool
+    index_csv_written: bool
+    saved: int
+    failed: int
+    unreached_targets: int
+    error: Optional[str]
+
+
 def review_snapshot_targets(planned_duration_s: float, count_per_clip: int) -> list[float]:
     if planned_duration_s <= 0:
         return []
@@ -943,6 +954,65 @@ def write_review_snapshot_index_csv(path: Path, results: list[ReviewSnapshotResu
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
+
+
+def finalize_review_snapshots(
+    *,
+    label: str,
+    clip_dir: Path,
+    file_stem: str,
+    review_snapshot_enabled: bool,
+    review_snapshot_writer_started: bool,
+    review_snapshot_writer: Optional[ReviewSnapshotWriter],
+    review_snapshot_targets_s: list[float],
+    review_snapshot_next_target_index: int,
+) -> ReviewSnapshotFinalization:
+    results: list[ReviewSnapshotResult] = []
+    writer_finalized = True
+    index_csv_written = False
+    saved = 0
+    failed = 0
+    unreached_targets = (
+        compute_review_snapshot_unreached_targets(len(review_snapshot_targets_s), review_snapshot_next_target_index)
+        if review_snapshot_enabled
+        else 0
+    )
+    error: Optional[str] = None
+
+    if review_snapshot_enabled and review_snapshot_writer_started and review_snapshot_writer is not None:
+        writer_finalized = review_snapshot_writer.close_and_join(timeout_s=10.0)
+        if not writer_finalized:
+            LOG.warning(
+                "%s review snapshot writer did not finalize within 10 seconds; archive will remain blocked",
+                label,
+            )
+        results = review_snapshot_writer.collect_results()
+        saved = sum(1 for result in results if result.success)
+        failed = sum(1 for result in results if not result.success)
+        unreached_targets = compute_review_snapshot_unreached_targets(
+            len(review_snapshot_targets_s),
+            review_snapshot_next_target_index,
+        )
+        review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
+        if writer_finalized:
+            try:
+                write_review_snapshot_index_csv(review_snapshot_metadata_path, results)
+                index_csv_written = True
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
+        else:
+            error = error or "review snapshot writer did not finalize"
+
+    return ReviewSnapshotFinalization(
+        results=results,
+        writer_finalized=writer_finalized,
+        index_csv_written=index_csv_written,
+        saved=saved,
+        failed=failed,
+        unreached_targets=unreached_targets,
+        error=error,
+    )
 
 
 def parse_system_settings(config: dict[str, Any]) -> SystemSettings:
@@ -2063,7 +2133,9 @@ def clip_directory_ready_for_archive(
                 review_dir_name = str(review_snapshots.get("directory") or "review_snapshots")
                 review_dir = clip_dir / review_dir_name
                 if review_dir.exists():
-                    temp_review_files = sorted(review_dir.glob(".*.tmp"))
+                    temp_review_files = sorted(
+                        path for path in review_dir.rglob("*") if path.is_file() and path.name.endswith(".tmp")
+                    )
                     if temp_review_files:
                         issues.append(
                             f"{json_path.name}: temporary review snapshot files remain: {len(temp_review_files)}"
@@ -3218,6 +3290,11 @@ def record_one_camera(
     review_snapshot_writer_started = False
     review_snapshot_writer_finalized = True
     review_snapshot_index_csv_written = False
+    review_snapshot_unreached_targets = (
+        compute_review_snapshot_unreached_targets(len(review_snapshot_targets_s), review_snapshot_next_target_index)
+        if review_snapshot_settings.enabled
+        else 0
+    )
     review_snapshot_error: Optional[str] = None
 
     if review_snapshot_settings.enabled:
@@ -3562,40 +3639,27 @@ def record_one_camera(
                 except Exception:
                     pass
 
-        review_snapshot_results: list[ReviewSnapshotResult] = []
         if review_snapshot_settings.enabled:
-            if review_snapshot_writer_started and review_snapshot_writer is not None:
-                review_snapshot_writer_finalized = review_snapshot_writer.close_and_join(timeout_s=10.0)
-                if not review_snapshot_writer_finalized:
-                    LOG.warning(
-                        "%s review snapshot writer did not finalize within 10 seconds; archive will remain blocked",
-                        label,
-                    )
-                review_snapshot_results = review_snapshot_writer.collect_results()
-                review_snapshot_saved = sum(1 for result in review_snapshot_results if result.success)
-                review_snapshot_failed = sum(1 for result in review_snapshot_results if not result.success)
-                review_snapshot_unreached_targets = compute_review_snapshot_unreached_targets(
-                    len(review_snapshot_targets_s),
-                    review_snapshot_next_target_index,
-                )
-                review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
-                if review_snapshot_writer_finalized:
-                    try:
-                        write_review_snapshot_index_csv(review_snapshot_metadata_path, review_snapshot_results)
-                        review_snapshot_index_csv_written = True
-                    except Exception as exc:
-                        review_snapshot_error = f"{type(exc).__name__}: {exc}"
-                        LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
-                else:
-                    review_snapshot_error = review_snapshot_error or "review snapshot writer did not finalize"
-            else:
-                review_snapshot_saved = 0
-                review_snapshot_failed = 0
-                review_snapshot_unreached_targets = compute_review_snapshot_unreached_targets(
-                    len(review_snapshot_targets_s),
-                    review_snapshot_next_target_index,
-                )
+            finalization = finalize_review_snapshots(
+                label=label,
+                clip_dir=clip_dir,
+                file_stem=file_stem,
+                review_snapshot_enabled=review_snapshot_settings.enabled,
+                review_snapshot_writer_started=review_snapshot_writer_started,
+                review_snapshot_writer=review_snapshot_writer,
+                review_snapshot_targets_s=review_snapshot_targets_s,
+                review_snapshot_next_target_index=review_snapshot_next_target_index,
+            )
+            review_snapshot_results = finalization.results
+            review_snapshot_writer_finalized = finalization.writer_finalized
+            review_snapshot_index_csv_written = finalization.index_csv_written
+            review_snapshot_saved = finalization.saved
+            review_snapshot_failed = finalization.failed
+            review_snapshot_unreached_targets = finalization.unreached_targets
+            review_snapshot_error = finalization.error
         else:
+            review_snapshot_saved = 0
+            review_snapshot_failed = 0
             review_snapshot_unreached_targets = 0
 
         actual_elapsed_s = None

@@ -53,10 +53,16 @@ FEEDING_CONTINUE_LOSS_PCT = 1.0
 FEEDING_START_LOSS_PX2 = 750.0
 FEEDING_CONTINUE_LOSS_PX2 = 300.0
 FEEDING_MERGE_GAP_MINUTES = 5
-FEEDING_MIN_BOUT_MINUTES = 5
+FEEDING_MIN_BOUT_MINUTES = 10
+FEEDING_REBOUND_WINDOW_MINUTES = 30
+FEEDING_MAX_RECOVERY_FRACTION = 0.60
+FEEDING_CATASTROPHIC_DROP_PCT = 50.0
+FEEDING_LONG_REBOUND_HOURS = 12
+FEEDING_LONG_RECOVERY_FRACTION = 0.75
 DEFAULT_ALLOWED_GAP_EXTRA_MINUTES = 1
 GRID_TOLERANCE = dt.timedelta(seconds=1)
 LEAF_RESET_EVENT_NAMES = {"leaf_added", "leaf_replaced", "leaf_change"}
+DEATH_EVENT_NAMES = {"death", "dead"}
 PROGRESS_BAR_WIDTH = 28
 PROGRESS_UPDATE_SECONDS = 0.25
 LEAF_CACHE_VERSION = 2
@@ -840,6 +846,97 @@ def classify_feeding_hysteresis(
     return output
 
 
+def merge_qc_flag(existing: str, *labels: str) -> str:
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    for label in labels:
+        clean = label.strip()
+        if clean and clean not in parts:
+            parts.append(clean)
+    return ";".join(parts)
+
+
+def reject_transient_rebound_bouts(
+    rows: list[LeafAreaRow],
+    flags: list[bool],
+    *,
+    estimate_interval_minutes: int,
+    rebound_window_minutes: int,
+    max_recovery_fraction: float,
+    catastrophic_drop_pct: float,
+    long_rebound_hours: int,
+    long_recovery_fraction: float,
+) -> tuple[list[bool], list[str]]:
+    if len(rows) != len(flags):
+        raise ValueError("rows and flags must have the same length")
+    if not rows:
+        return list(flags), []
+
+    estimate_interval = dt.timedelta(minutes=estimate_interval_minutes)
+    rebound_window = dt.timedelta(minutes=rebound_window_minutes)
+    long_rebound_window = dt.timedelta(hours=long_rebound_hours)
+    cleaned_flags = list(flags)
+    qc_flags = [row.qc_flag for row in rows]
+    tolerance = GRID_TOLERANCE
+    index = 0
+    while index < len(rows):
+        if not cleaned_flags[index]:
+            index += 1
+            continue
+        bout_start = index
+        while index < len(rows) and cleaned_flags[index]:
+            index += 1
+        bout_end = index
+        if bout_start == 0:
+            continue
+        pre_row = rows[bout_start - 1]
+        if abs((rows[bout_start].timestamp_utc - pre_row.timestamp_utc) - estimate_interval) > tolerance:
+            continue
+        bout_rows = rows[bout_start:bout_end]
+        bout_min_area = min(row.leaf_area_proxy_px for row in bout_rows)
+        pre_area = pre_row.leaf_area_proxy_px
+        drop = pre_area - bout_min_area
+        if drop <= 0:
+            continue
+
+        def scan_future(window: dt.timedelta, *, use_peak: bool = False) -> tuple[float, bool]:
+            future_values: list[float] = []
+            last_time = bout_rows[-1].timestamp_utc + estimate_interval
+            future_index = bout_end
+            while future_index < len(rows):
+                future_row = rows[future_index]
+                if not future_row.feeding_valid:
+                    break
+                if abs((future_row.timestamp_utc - rows[future_index - 1].timestamp_utc) - estimate_interval) > tolerance:
+                    break
+                if future_row.timestamp_utc - last_time > window:
+                    break
+                future_values.append(future_row.leaf_area_proxy_px)
+                future_index += 1
+            if not future_values:
+                return bout_min_area, False
+            if use_peak:
+                return max(future_values), True
+            return float(np.percentile(np.array(future_values, dtype=np.float64), 80)), True
+
+        future_high, has_future = scan_future(rebound_window)
+        recovery_fraction = (future_high - bout_min_area) / max(drop, 1e-9)
+        if has_future and recovery_fraction >= max_recovery_fraction:
+            for item in range(bout_start, bout_end):
+                cleaned_flags[item] = False
+                qc_flags[item] = merge_qc_flag(qc_flags[item], "transient_area_rebound")
+            continue
+
+        if pre_area > 0 and drop / pre_area >= catastrophic_drop_pct / 100.0:
+            long_future_high, has_long_future = scan_future(long_rebound_window, use_peak=True)
+            long_recovery_fraction_value = (long_future_high - bout_min_area) / max(drop, 1e-9)
+            if has_long_future and long_recovery_fraction_value >= long_recovery_fraction:
+                for item in range(bout_start, bout_end):
+                    cleaned_flags[item] = False
+                    qc_flags[item] = merge_qc_flag(qc_flags[item], "unexplained_large_area_rebound")
+
+    return cleaned_flags, qc_flags
+
+
 def merge_short_gaps(
     flags: list[bool],
     *,
@@ -1171,20 +1268,30 @@ def load_analysis_events(
     root: Path,
     source: Optional[str],
     timezone: dt.tzinfo,
-) -> tuple[dict[str, list[dt.datetime]], list[tuple[dt.datetime, dt.datetime]]]:
+) -> tuple[
+    dict[str, list[dt.datetime]],
+    list[tuple[dt.datetime, dt.datetime]],
+    dict[str, dt.datetime],
+]:
     if source is None:
-        return {}, []
+        return {}, [], {}
     from plot_recording_timeline import load_event_tables_source, video_quality_mask_intervals_utc
 
     events, global_events = load_event_tables_source(source, root=root, tz=timezone)
     resets: dict[str, list[dt.datetime]] = defaultdict(list)
+    death_cutoffs_utc: dict[str, dt.datetime] = {}
     for event in events:
         event_name = (event.event or "").strip().lower()
         if event.animal_id in ANIMAL_ORDER and event_name in LEAF_RESET_EVENT_NAMES:
             resets[event.animal_id].append(event.start_local.astimezone(UTC))
+        if event.animal_id in ANIMAL_ORDER and event_name in DEATH_EVENT_NAMES:
+            cutoff = event.start_local.astimezone(UTC)
+            previous_cutoff = death_cutoffs_utc.get(event.animal_id)
+            if previous_cutoff is None or cutoff < previous_cutoff:
+                death_cutoffs_utc[event.animal_id] = cutoff
     for animal_id in list(resets):
         resets[animal_id].sort()
-    return dict(resets), video_quality_mask_intervals_utc(global_events)
+    return dict(resets), video_quality_mask_intervals_utc(global_events), death_cutoffs_utc
 
 
 def consolidate_leaf_estimates(
@@ -1238,6 +1345,7 @@ def finalize_leaf_rows(
     leaf_reset_increase_pct: float,
     explicit_resets: Optional[dict[str, list[dt.datetime]]] = None,
     video_quality_intervals_utc: Sequence[tuple[dt.datetime, dt.datetime]] = (),
+    death_cutoffs_utc: Optional[dict[str, dt.datetime]] = None,
 ) -> list[LeafAreaRow]:
     if start_threshold is None:
         start_threshold = start_loss_px2
@@ -1263,6 +1371,7 @@ def finalize_leaf_rows(
         baseline_area: Optional[float] = None
         reset_index = 0
         reset_times = explicit_resets.get(animal_id, [])
+        death_cutoff = (death_cutoffs_utc or {}).get(animal_id)
         animal_rows: list[LeafAreaRow] = []
         for estimate in animal_estimates:
             while reset_index < len(reset_times) and reset_times[reset_index] <= estimate.timestamp_utc:
@@ -1270,6 +1379,7 @@ def finalize_leaf_rows(
                 baseline_area = None
                 previous = None
                 reset_index += 1
+            estimate_qc_flag = estimate.qc_flag
             if previous is not None:
                 if estimate.timestamp_utc - previous.timestamp_utc > allowed_gap:
                     current_epoch += 1
@@ -1278,21 +1388,24 @@ def finalize_leaf_rows(
                 else:
                     increase_pct = relative_change_percent(previous.leaf_area_proxy_px, estimate.leaf_area_proxy_px)
                     if increase_pct > leaf_reset_increase_pct:
-                        current_epoch += 1
-                        baseline_area = None
-                        previous = None
+                        estimate_qc_flag = merge_qc_flag(estimate_qc_flag, "automatic_area_increase")
             if baseline_area is None:
                 baseline_area = estimate.leaf_area_proxy_px
             relative_area = estimate.leaf_area_proxy_px / max(baseline_area, 1.0)
             loss_prev_estimate_pct: Optional[float] = None
             delta_area_5min_px2: Optional[float] = None
             feeding_valid = False
+            post_death = death_cutoff is not None and estimate.timestamp_utc >= death_cutoff
             video_quality_excluded = estimate.video_quality_excluded or interval_overlaps_any(
                 estimate.timestamp_utc,
                 estimate.timestamp_utc + estimate_interval,
                 video_quality_intervals_utc,
             )
-            if previous is not None and previous.timestamp_utc + estimate_interval - GRID_TOLERANCE <= estimate.timestamp_utc <= previous.timestamp_utc + estimate_interval + GRID_TOLERANCE:
+            if (
+                not post_death
+                and previous is not None
+                and previous.timestamp_utc + estimate_interval - GRID_TOLERANCE <= estimate.timestamp_utc <= previous.timestamp_utc + estimate_interval + GRID_TOLERANCE
+            ):
                 loss_prev_estimate_pct = 100.0 * (
                     previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
                 ) / max(previous.leaf_area_proxy_px, 1.0)
@@ -1312,6 +1425,11 @@ def finalize_leaf_rows(
                 ):
                     delta_area_5min_px2 = previous.leaf_area_proxy_px - estimate.leaf_area_proxy_px
                     feeding_valid = True
+            if post_death:
+                estimate_qc_flag = merge_qc_flag(estimate_qc_flag, "post_death")
+                feeding_valid = False
+                loss_prev_estimate_pct = None
+                delta_area_5min_px2 = None
             animal_rows.append(
                 LeafAreaRow(
                     animal_id=estimate.animal_id,
@@ -1328,7 +1446,7 @@ def finalize_leaf_rows(
                     video_quality_excluded=video_quality_excluded,
                     n_sampled_frames=estimate.n_sampled_frames,
                     n_valid_frames=estimate.n_valid_frames,
-                    qc_flag=estimate.qc_flag,
+                    qc_flag=estimate_qc_flag,
                 )
             )
             previous = estimate
@@ -1344,6 +1462,7 @@ def finalize_leaf_rows(
                 continue_threshold=continue_threshold,
             )
             final_flags = list(raw_flags)
+            qc_flags = [row.qc_flag for row in epoch_rows]
             segment_start = 0
             while segment_start < len(epoch_rows):
                 if not epoch_rows[segment_start].feeding_valid:
@@ -1369,8 +1488,20 @@ def finalize_leaf_rows(
                 )
                 final_flags[segment_start:segment_end] = cleaned_flags
                 segment_start = segment_end
-            for row, raw_flag, final_flag in zip(epoch_rows, raw_flags, final_flags):
-                rows.append(dataclasses.replace(row, feeding_raw=raw_flag, feeding=final_flag))
+            filtered_flags, filtered_qc = reject_transient_rebound_bouts(
+                epoch_rows,
+                final_flags,
+                estimate_interval_minutes=estimate_interval_minutes,
+                rebound_window_minutes=FEEDING_REBOUND_WINDOW_MINUTES,
+                max_recovery_fraction=FEEDING_MAX_RECOVERY_FRACTION,
+                catastrophic_drop_pct=FEEDING_CATASTROPHIC_DROP_PCT,
+                long_rebound_hours=FEEDING_LONG_REBOUND_HOURS,
+                long_recovery_fraction=FEEDING_LONG_RECOVERY_FRACTION,
+            )
+            final_flags = filtered_flags
+            qc_flags = filtered_qc
+            for index, (row, raw_flag, final_flag) in enumerate(zip(epoch_rows, raw_flags, final_flags)):
+                rows.append(dataclasses.replace(row, feeding_raw=raw_flag, feeding=final_flag, qc_flag=qc_flags[index]))
     rows.sort(key=lambda row: (ANIMAL_ORDER.index(row.animal_id), row.timestamp_utc))
     return rows
 
@@ -1411,6 +1542,7 @@ def feeding_event_dicts(
     threshold_metric: str = "pct",
     start_loss_px2: float | None = None,
     continue_loss_px2: float | None = None,
+    death_cutoffs_utc: Optional[dict[str, dt.datetime]] = None,
 ) -> list[dict[str, str]]:
     if start_threshold is None:
         start_threshold = start_loss_px2
@@ -1435,6 +1567,7 @@ def feeding_event_dicts(
         animal_rows = sorted(grouped.get(animal_id, []), key=lambda row: row.timestamp_utc)
         active_start: Optional[LeafAreaRow] = None
         previous: Optional[LeafAreaRow] = None
+        death_cutoff = (death_cutoffs_utc or {}).get(animal_id)
         for row in animal_rows:
             contiguous = (
                 previous is not None
@@ -1446,6 +1579,37 @@ def feeding_event_dicts(
             elif active_start is not None and previous is not None and (not row.feeding or not contiguous):
                 start_utc = active_start.timestamp_utc
                 end_utc = previous.timestamp_utc + estimate_interval
+                if death_cutoff is not None:
+                    if start_utc >= death_cutoff:
+                        active_start = row if row.feeding else None
+                        previous = row
+                        continue
+                    if end_utc > death_cutoff:
+                        end_utc = death_cutoff
+                if end_utc > start_utc:
+                    events.append(
+                        {
+                            "animal_id": animal_id,
+                            "start_utc": format_utc(start_utc),
+                            "end_utc": format_utc(end_utc),
+                            "start_local": format_local(start_utc, timezone),
+                            "end_local": format_local(end_utc, timezone),
+                            "event": "feeding",
+                            "kind": "feeding",
+                            "notes": notes,
+                        }
+                    )
+                active_start = row if row.feeding else None
+            previous = row
+        if active_start is not None and previous is not None:
+            start_utc = active_start.timestamp_utc
+            end_utc = previous.timestamp_utc + estimate_interval
+            if death_cutoff is not None:
+                if start_utc >= death_cutoff:
+                    continue
+                if end_utc > death_cutoff:
+                    end_utc = death_cutoff
+            if end_utc > start_utc:
                 events.append(
                     {
                         "animal_id": animal_id,
@@ -1458,23 +1622,6 @@ def feeding_event_dicts(
                         "notes": notes,
                     }
                 )
-                active_start = row if row.feeding else None
-            previous = row
-        if active_start is not None and previous is not None:
-            start_utc = active_start.timestamp_utc
-            end_utc = previous.timestamp_utc + estimate_interval
-            events.append(
-                {
-                    "animal_id": animal_id,
-                    "start_utc": format_utc(start_utc),
-                    "end_utc": format_utc(end_utc),
-                    "start_local": format_local(start_utc, timezone),
-                    "end_local": format_local(end_utc, timezone),
-                    "event": "feeding",
-                    "kind": "feeding",
-                    "notes": notes,
-                }
-            )
     return events
 
 
@@ -1727,6 +1874,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feeding-continue-loss-px2", type=float, default=FEEDING_CONTINUE_LOSS_PX2, help=argparse.SUPPRESS)
     parser.add_argument("--feeding-merge-gap-minutes", type=int, default=FEEDING_MERGE_GAP_MINUTES)
     parser.add_argument("--feeding-min-bout-minutes", type=int, default=FEEDING_MIN_BOUT_MINUTES)
+    parser.add_argument("--feeding-rebound-window-minutes", type=int, default=FEEDING_REBOUND_WINDOW_MINUTES)
+    parser.add_argument("--feeding-max-recovery-fraction", type=float, default=FEEDING_MAX_RECOVERY_FRACTION)
+    parser.add_argument("--feeding-catastrophic-drop-pct", type=float, default=FEEDING_CATASTROPHIC_DROP_PCT)
+    parser.add_argument("--feeding-long-rebound-hours", type=int, default=FEEDING_LONG_REBOUND_HOURS)
+    parser.add_argument("--feeding-long-recovery-fraction", type=float, default=FEEDING_LONG_RECOVERY_FRACTION)
     parser.add_argument("--leaf-reset-increase-pct", type=float, default=20.0)
     parser.add_argument("--hue-low", type=int, default=25)
     parser.add_argument("--hue-high", type=int, default=95)
@@ -1842,7 +1994,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         LOG.info("No behavior event source found")
     try:
-        explicit_resets, video_quality_intervals_utc = load_analysis_events(
+        explicit_resets, video_quality_intervals_utc, death_cutoffs_utc = load_analysis_events(
             root=root,
             source=events_source,
             timezone=timezone,
@@ -1866,6 +2018,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         leaf_reset_increase_pct=args.leaf_reset_increase_pct,
         explicit_resets=explicit_resets,
         video_quality_intervals_utc=video_quality_intervals_utc,
+        death_cutoffs_utc=death_cutoffs_utc,
     )
     feeding_events = feeding_event_dicts(
         finalized_rows,
@@ -1874,6 +2027,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         start_threshold=feeding_start_threshold,
         continue_threshold=feeding_continue_threshold,
         threshold_metric=feeding_threshold_metric,
+        death_cutoffs_utc=death_cutoffs_utc,
     )
     write_csv(output_root / "leaf_area_timeseries.csv", LEAF_AREA_FIELDS, leaf_rows_to_dicts(finalized_rows, timezone))
     write_csv(output_root / "feeding_events.csv", FEEDING_EVENT_FIELDS, feeding_events)

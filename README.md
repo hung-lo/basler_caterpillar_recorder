@@ -37,6 +37,52 @@ If you use a different camera, copy a YAML template and update the model, serial
 
 The tracked YAML files are templates. Copy one to a local file such as `config_local_macos.yaml` or `config_local_windows.yaml` before you edit it. Git ignores `config_local*.yaml`.
 
+## Automatic review snapshots
+
+Long recordings can optionally save a small set of full-resolution JPEG frames from each clip for rapid human review:
+
+```yaml
+review_snapshots:
+  enabled: true
+  count_per_clip: 10
+  jpeg_quality: 95
+```
+
+For a 10-minute clip with 10 requested snapshots, frames are sampled near the centers of ten equal time bins:
+
+```text
+00:30
+01:30
+02:30
+03:30
+04:30
+05:30
+06:30
+07:30
+08:30
+09:30
+```
+
+The snapshots come from the same full processed frames sent to FFmpeg. They are not screenshots of the resized preview and they do not include the preview status overlay.
+
+They are stored inside each clip:
+
+```text
+review_snapshots/
+    camera1_s00_...jpg
+    camera1_s01_...jpg
+    ...
+    camera1_snapshots.csv
+```
+
+Each JPEG filename records the camera label, snapshot slot, local capture time with numeric UTC offset, approximate MP4 player position, and encoded frame index. The CSV also stores canonical UTC timing and monotonic clip timing so each still image can be traced back to the main timestamp sidecar.
+
+The review set is meant for fast human inspection, especially for checking body-size changes over time and narrowing down events such as molts. Automatic molt detection is intentionally not part of the recorder.
+
+If Ctrl+C stops a clip early, only snapshot targets already reached are kept. Future targets are not fabricated. The recorder still prioritizes finalizing the scientific MP4 and frame timestamp sidecar.
+
+Review snapshots are optional convenience artifacts. A failed JPEG, a dropped snapshot job, or a missing snapshot index CSV does not invalidate an otherwise successful recording. `validate_session.py` reports review-snapshot problems as auxiliary warnings without turning the MP4 or timestamps into a core failure.
+
 ## Quick motion-energy analysis for cropped caterpillar videos
 
 This workflow adds a fast motion-derived mobile/immobile proxy while pose estimation is still pending. It is useful for quick inspection, but it is not ground-truth behavior classification.

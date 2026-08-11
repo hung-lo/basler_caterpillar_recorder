@@ -38,6 +38,21 @@ source .venv/bin/activate
 
 If `review_snapshots:` is enabled in your config, treat any review-snapshot messages from `validate_session.py` as auxiliary warnings unless the core MP4/timestamp checks also fail.
 
+### Review snapshots
+
+Current recording configs can enable a small review set per clip:
+
+```yaml
+review_snapshots:
+  enabled: true
+  count_per_clip: 10
+  jpeg_quality: 95
+```
+
+Each completed clip contains about 10 full-resolution JPEGs in `review_snapshots/` for quick visual inspection. These are independent of the recording preview, so pressing `q` does not stop the automatic review images.
+
+If Ctrl+C interrupts a clip, only the targets already reached are kept. The MP4 and timestamp sidecar still finalize through the normal shutdown path. Review-snapshot problems are auxiliary and do not by themselves invalidate a successful video.
+
 For an optional one-shot scheduled start, set:
 
 ```yaml
