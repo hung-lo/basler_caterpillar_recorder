@@ -462,23 +462,27 @@ def load_leaf_trace_cache(
             return [], "invalid"
         if metadata.get("leaf_extraction_settings") != cache_settings:
             return [], "invalid"
+        extraction_status = str(metadata.get("extraction_status") or "success").strip().lower()
+        if extraction_status != "success":
+            return [], "invalid"
         estimates = load_leaf_trace_estimates_from_csv(
             trace_path,
             entry=entry,
             expected_percentile=float(cache_settings["leaf_area_percentile"]),
         )
-        if not estimates:
-            return [], "invalid"
         if any(estimate.animal_id != entry.animal_id or estimate.clip_key != entry.clip_key for estimate in estimates):
             return [], "invalid"
         ordered_timestamps = [estimate.timestamp_utc for estimate in estimates]
         if any(ordered_timestamps[index] < ordered_timestamps[index - 1] for index in range(1, len(ordered_timestamps))):
             return [], "invalid"
-        if int(metadata.get("trace_rows") or -1) != len(estimates):
+        trace_rows = metadata.get("trace_rows")
+        if trace_rows is None or int(trace_rows) != len(estimates):
             return [], "invalid"
-        if int(metadata.get("timestamp_rows") or -1) <= 0:
+        timestamp_rows = metadata.get("timestamp_rows")
+        if timestamp_rows is not None and int(timestamp_rows) < 0:
             return [], "invalid"
-        if int(metadata.get("selected_leaf_frames") or -1) <= 0:
+        selected_leaf_frames = metadata.get("selected_leaf_frames")
+        if selected_leaf_frames is not None and int(selected_leaf_frames) < 0:
             return [], "invalid"
         return estimates, "cached"
     except Exception as exc:
@@ -509,6 +513,7 @@ def write_leaf_trace_cache(
             "timestamp_size_bytes": timestamp_stat.st_size,
             "timestamp_mtime_ns": timestamp_stat.st_mtime_ns,
             "leaf_extraction_settings": cache_settings,
+            "extraction_status": "success",
             "timestamp_rows": result.timestamp_rows,
             "selected_leaf_frames": result.selected_leaf_frames,
             "decoded_leaf_frames": result.decoded_leaf_frames,

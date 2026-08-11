@@ -599,6 +599,75 @@ class LeafFeedingLogicTests(unittest.TestCase):
         self.assertEqual(loaded[0].qc_flag, estimate.qc_flag)
         self.assertEqual(loaded[0].sample_areas_px, estimate.sample_areas_px)
 
+    def test_empty_leaf_trace_cache_is_reused_without_video_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = leaf.ManifestEntry(
+                "C01",
+                "clip_0001",
+                root / "cropped_by_caterpillar" / "camera1" / "clip_0001.mp4",
+                root / "cropped_by_caterpillar" / "timestamps" / "clip_0001.timestamps.csv",
+            )
+            entry.cropped_video.parent.mkdir(parents=True, exist_ok=True)
+            entry.timestamp_file.parent.mkdir(parents=True, exist_ok=True)
+            entry.cropped_video.write_bytes(b"mp4")
+            entry.timestamp_file.write_text("timestamp", encoding="utf-8")
+            cache_settings = leaf.leaf_extraction_cache_settings(
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=1500,
+                morph_kernel=5,
+                frame_access="sparse",
+            )
+            trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
+            meta_path = leaf.leaf_trace_meta_path(trace_path)
+            leaf.write_leaf_trace_cache(
+                trace_path,
+                meta_path,
+                entry,
+                leaf.ClipFeedingResult([], "processed", 150, 150, 0, 0),
+                cache_settings,
+            )
+
+            with leaf.open_csv_text(trace_path) as handle:
+                reader = leaf.csv.DictReader(handle)
+                self.assertEqual(reader.fieldnames, leaf.LEAF_TRACE_FIELDS)
+                self.assertEqual(list(reader), [])
+
+            with mock.patch.object(leaf, "extract_clip_leaf_estimates", side_effect=AssertionError("should not decode video")):
+                outcome = leaf.load_or_extract_clip_leaf_estimates(
+                    root,
+                    entry,
+                    clip_index=1,
+                    estimate_interval_minutes=5,
+                    burst_duration_seconds=60,
+                    burst_step_seconds=10,
+                    leaf_area_percentile=95.0,
+                    min_valid_frames=3,
+                    hue_low=25,
+                    hue_high=95,
+                    sat_min=35,
+                    value_min=25,
+                    min_component_px=1500,
+                    morph_kernel=5,
+                    frame_access="sparse",
+                    force=False,
+                    progress_reporter=None,
+                )
+
+        self.assertEqual(outcome.cache_state, "cached")
+        self.assertEqual(outcome.result.status, "cached")
+        self.assertEqual(outcome.result.timestamp_rows, 150)
+        self.assertEqual(outcome.result.selected_leaf_frames, 0)
+        self.assertEqual(len(outcome.result.estimates), 0)
+
     def test_cached_and_fresh_consolidation_match_at_clip_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
