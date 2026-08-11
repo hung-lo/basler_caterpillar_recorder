@@ -98,6 +98,7 @@ STIM_EVENT_NAMES = {
     "electric_stimulation",
     "electrical_shock",
     "electric_shock",
+    "shock",
 }
 DEATH_EVENT_NAMES = {
     "death",
@@ -824,6 +825,10 @@ def behavior_event_style(event: BehaviorEvent) -> Optional[tuple[str, float, str
 
 def is_supported_behavior_point_event(event: BehaviorEvent) -> bool:
     return event.is_point and behavior_event_style(event) is not None
+
+
+def is_stimulation_event(event: BehaviorEvent) -> bool:
+    return bool(behavior_event_terms(event) & STIM_EVENT_NAMES)
 
 
 def behavior_event_is_visible(event: BehaviorEvent) -> bool:
@@ -1588,11 +1593,40 @@ def plot_recording_timeline(
                 if event.start_local >= death_cutoff_local:
                     continue
         y = behavior_index[event.animal_id]
+        event_end_local = event.end_local
+        if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
+            event_end_local = death_cutoff_local
+        duration_s = max((event_end_local - event.start_local).total_seconds(), 0.0)
+        left = mdates.date2num(event.start_local.replace(tzinfo=None))
+
+        if is_stimulation_event(event):
+            if duration_s > 0:
+                width = max(duration_s / 86400.0, 1e-9)
+                color = event_bar_color(event)
+                ax_beh.broken_barh(
+                    [(left, width)],
+                    (y - 0.22, 0.44),
+                    facecolors=color,
+                    alpha=0.74,
+                    zorder=3,
+                )
+            ax_beh.text(
+                left,
+                y,
+                "\u26a1",
+                ha="center",
+                va="center",
+                fontsize=13,
+                color=STIM_COLOR,
+                fontweight="bold",
+                zorder=7,
+            )
+            continue
+
         if event.is_point:
             style = behavior_event_style(event)
             if style is None:
                 continue
-            left = mdates.date2num(event.start_local.replace(tzinfo=None))
             marker, marker_size, point_color = style
             if marker == "*":
                 ax_beh.text(
@@ -1619,13 +1653,8 @@ def plot_recording_timeline(
                 )
             continue
 
-        event_end_local = event.end_local
-        if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
-            event_end_local = death_cutoff_local
-        duration_s = max((event_end_local - event.start_local).total_seconds(), 0.0)
         if duration_s <= 0:
             continue
-        left = mdates.date2num(event.start_local.replace(tzinfo=None))
         width = max(duration_s / 86400.0, 1e-9)
         color = event_bar_color(event)
         ax_beh.broken_barh(

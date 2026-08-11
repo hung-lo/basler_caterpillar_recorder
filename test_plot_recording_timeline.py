@@ -440,6 +440,36 @@ class TimelinePlotTests(unittest.TestCase):
 
         with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
             with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+                with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+                    timeline.plot_recording_timeline(
+                        clips=[],
+                        events=[event],
+                        motion_states=[],
+                        animals=timeline.ANIMAL_ORDER,
+                        timezone=dt.timezone(dt.timedelta(hours=-4)),
+                        output_path=Path("ignored.png"),
+                        annotate_clips=False,
+                    )
+
+        self.assertEqual(mock_scatter.call_count, 0)
+        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
+        self.assertFalse(
+            any(len(call.args) >= 3 and call.args[2] == "\u26a1" for call in mock_text.call_args_list)
+        )
+
+    def test_explicit_duration_stimulation_renders_bar_and_marker(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 13, 37, 0),
+            end_local=dt.datetime(2026, 8, 9, 13, 37, 10),
+            event="electrical_stimulation",
+            kind="stimulus",
+            notes="50 uA pulse train at 100 Hz for 10 seconds",
+            is_point=False,
+        )
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            with mock.patch("matplotlib.axes.Axes.text") as mock_text:
                 timeline.plot_recording_timeline(
                     clips=[],
                     events=[event],
@@ -450,8 +480,46 @@ class TimelinePlotTests(unittest.TestCase):
                     annotate_clips=False,
                 )
 
-        self.assertEqual(mock_scatter.call_count, 0)
-        self.assertGreaterEqual(mock_broken_barh.call_count, 1)
+        stim_bars = [call for call in mock_broken_barh.call_args_list if call.kwargs.get("facecolors") == timeline.STIM_COLOR]
+        self.assertEqual(len(stim_bars), 1)
+        lightning_calls = [call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "\u26a1"]
+        self.assertEqual(len(lightning_calls), 1)
+        self.assertAlmostEqual(
+            lightning_calls[0].args[0],
+            timeline.mdates.date2num(dt.datetime(2026, 8, 9, 13, 37, 0)),
+        )
+
+    def test_long_duration_stimulation_still_renders_marker(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 13, 40, 0),
+            end_local=dt.datetime(2026, 8, 9, 13, 50, 0),
+            event="shock",
+            kind="stimulus",
+            notes="long stimulation",
+            is_point=False,
+        )
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+                timeline.plot_recording_timeline(
+                    clips=[],
+                    events=[event],
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
+
+        stim_bars = [call for call in mock_broken_barh.call_args_list if call.kwargs.get("facecolors") == timeline.STIM_COLOR]
+        self.assertEqual(len(stim_bars), 1)
+        lightning_calls = [call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "\u26a1"]
+        self.assertEqual(len(lightning_calls), 1)
+        self.assertAlmostEqual(
+            lightning_calls[0].args[0],
+            timeline.mdates.date2num(dt.datetime(2026, 8, 9, 13, 40, 0)),
+        )
 
     def test_behavior_axis_uses_canonical_animal_order(self) -> None:
         events = [
@@ -546,6 +614,7 @@ class TimelinePlotTests(unittest.TestCase):
     def test_electrical_stimulation_is_recognized(self) -> None:
         self.assertTrue(timeline.is_stimulation_event_name("electrical_stimulation"))
         self.assertTrue(timeline.is_stimulation_event_name("electric_shock"))
+        self.assertTrue(timeline.is_stimulation_event_name("shock"))
 
     def test_death_uses_x_marker(self) -> None:
         marker, _size, _color = timeline.get_point_event_style("death")
