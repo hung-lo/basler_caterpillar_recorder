@@ -569,6 +569,47 @@ class ArchiveBackendTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(issues, [])
 
+    def test_clip_directory_ready_for_archive_allows_review_snapshots_that_never_started(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp)
+            metadata_path = clip_dir / "camera1.json"
+            (clip_dir / "camera1.mp4").write_bytes(b"mp4")
+            with gzip.open(
+                clip_dir / "camera1.timestamps.csv.gz",
+                "wt",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write("frame_index,host_utc_ns,host_utc_iso,host_monotonic_ns,camera_timestamp,block_id,skipped_images\n")
+                handle.write("0,1,1970-01-01T00:00:00.000Z,1,1,1,0\n")
+            record_basler.write_json(
+                metadata_path,
+                {
+                    "success": True,
+                    "planned_clip_complete": True,
+                    "interrupted_by_user": False,
+                    "stop_reason": "planned_end",
+                    "grab_failures": 0,
+                    "mp4_remux_succeeded": True,
+                    "review_snapshots": {
+                        "enabled": True,
+                        "operational": False,
+                        "writer_started": False,
+                        "writer_finalized": True,
+                        "directory": "review_snapshots",
+                    },
+                },
+            )
+
+            ready, issues, _total_bytes = record_basler.clip_directory_ready_for_archive(
+                clip_dir,
+                expected_camera_count=1,
+                max_clip_size_bytes=10_000_000,
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(issues, [])
+
     def test_clip_directory_ready_for_archive_rejects_unfinalized_review_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             clip_dir = Path(tmp)
@@ -596,6 +637,8 @@ class ArchiveBackendTests(unittest.TestCase):
                     "mp4_remux_succeeded": True,
                     "review_snapshots": {
                         "enabled": True,
+                        "operational": True,
+                        "writer_started": True,
                         "directory": "review_snapshots",
                         "writer_finalized": False,
                     },
@@ -613,6 +656,30 @@ class ArchiveBackendTests(unittest.TestCase):
             any("review_snapshots.writer_finalized" in issue for issue in issues),
             issues,
         )
+
+    def test_write_review_snapshot_index_csv_propagates_write_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_snapshots" / "camera1_snapshots.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            result = record_basler.ReviewSnapshotResult(
+                snapshot_index=0,
+                target_elapsed_s=1.0,
+                frame_index=3,
+                filename="camera1_review_snapshot_0001.jpg",
+                host_utc_ns=1,
+                host_monotonic_ns=2,
+                actual_clip_elapsed_s=1.25,
+                video_time_s=0.75,
+                success=True,
+                error=None,
+            )
+
+            with mock.patch.object(record_basler.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaisesRegex(OSError, "boom"):
+                    record_basler.write_review_snapshot_index_csv(path, [result])
+
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
 
     def test_summarize_clip_results_treats_valid_user_interrupt_as_non_failure(self) -> None:
         results = [

@@ -3182,7 +3182,9 @@ def record_one_camera(
     review_snapshot_failed = 0
     review_snapshot_dropped_queue_full = 0
     review_snapshot_missed_due_acquisition_gap = 0
-    review_snapshot_writer_finalized = not review_snapshot_settings.enabled
+    review_snapshot_operational = False
+    review_snapshot_writer_started = False
+    review_snapshot_writer_finalized = True
     review_snapshot_error: Optional[str] = None
 
     if review_snapshot_settings.enabled:
@@ -3193,6 +3195,9 @@ def record_one_camera(
                 jpeg_quality=review_snapshot_settings.jpeg_quality,
             )
             review_snapshot_writer.start()
+            review_snapshot_operational = True
+            review_snapshot_writer_started = True
+            review_snapshot_writer_finalized = False
             LOG.info(
                 "%s review snapshots enabled: %d target(s) at JPEG quality %d",
                 label,
@@ -3519,7 +3524,7 @@ def record_one_camera(
 
         review_snapshot_results: list[ReviewSnapshotResult] = []
         if review_snapshot_settings.enabled:
-            if review_snapshot_writer is not None:
+            if review_snapshot_writer_started and review_snapshot_writer is not None:
                 review_snapshot_writer_finalized = review_snapshot_writer.close_and_join(timeout_s=10.0)
                 if not review_snapshot_writer_finalized:
                     LOG.warning(
@@ -3527,25 +3532,26 @@ def record_one_camera(
                         label,
                     )
                 review_snapshot_results = review_snapshot_writer.collect_results()
+                review_snapshot_saved = sum(1 for result in review_snapshot_results if result.success)
+                review_snapshot_failed = sum(1 for result in review_snapshot_results if not result.success)
+                review_snapshot_unreached_targets = max(
+                    0,
+                    len(review_snapshot_targets_s) - review_snapshot_next_target_index,
+                )
+                review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
+                if review_snapshot_writer_finalized:
+                    try:
+                        write_review_snapshot_index_csv(review_snapshot_metadata_path, review_snapshot_results)
+                    except Exception as exc:
+                        review_snapshot_writer_finalized = False
+                        review_snapshot_error = f"{type(exc).__name__}: {exc}"
+                        LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
+                else:
+                    review_snapshot_error = review_snapshot_error or "review snapshot writer did not finalize"
             else:
-                review_snapshot_writer_finalized = False
-
-            review_snapshot_saved = sum(1 for result in review_snapshot_results if result.success)
-            review_snapshot_failed = sum(1 for result in review_snapshot_results if not result.success)
-            review_snapshot_unreached_targets = max(
-                0,
-                len(review_snapshot_targets_s) - review_snapshot_next_target_index,
-            )
-            review_snapshot_metadata_path = clip_dir / "review_snapshots" / f"{file_stem}_snapshots.csv"
-            if review_snapshot_writer_finalized:
-                try:
-                    write_review_snapshot_index_csv(review_snapshot_metadata_path, review_snapshot_results)
-                except Exception as exc:
-                    review_snapshot_writer_finalized = False
-                    review_snapshot_error = f"{type(exc).__name__}: {exc}"
-                    LOG.warning("%s review snapshot CSV could not be written: %s", label, exc)
-            else:
-                review_snapshot_error = review_snapshot_error or "review snapshot writer did not finalize"
+                review_snapshot_saved = 0
+                review_snapshot_failed = 0
+                review_snapshot_unreached_targets = 0
         else:
             review_snapshot_unreached_targets = 0
 
@@ -3618,6 +3624,9 @@ def record_one_camera(
                 "mp4_remux_succeeded": remuxed,
                 "review_snapshots": {
                     "enabled": review_snapshot_settings.enabled,
+                    "operational": review_snapshot_operational,
+                    "writer_started": review_snapshot_writer_started,
+                    "writer_finalized": review_snapshot_writer_finalized,
                     "directory": "review_snapshots" if review_snapshot_settings.enabled else None,
                     "index_csv": (
                         f"review_snapshots/{file_stem}_snapshots.csv"
@@ -3634,7 +3643,6 @@ def record_one_camera(
                     "dropped_queue_full": review_snapshot_dropped_queue_full,
                     "missed_due_acquisition_gap": review_snapshot_missed_due_acquisition_gap,
                     "unreached_targets": review_snapshot_unreached_targets,
-                    "writer_finalized": review_snapshot_writer_finalized,
                     "error": review_snapshot_error,
                 },
                 "completed_utc": isoformat_utc(completed_at),

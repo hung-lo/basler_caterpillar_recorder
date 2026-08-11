@@ -48,6 +48,11 @@ encoding:
   crf: 25
   gop_seconds: 2
 
+review_snapshots:
+  enabled: true
+  count_per_clip: 10
+  jpeg_quality: 95
+
 cameras:
   # Full native sensor field of view at 5 fps, rotated 90 degrees CCW and
   # downscaled after rotation to keep file sizes practical.

@@ -46,6 +46,11 @@ recording_preview:
   show_status: true
   layout: card_panel
 
+review_snapshots:
+  enabled: true
+  count_per_clip: 10
+  jpeg_quality: 95
+
 cameras:
   - label: camera1
     animal_ids: [C01, C02, C03, C04, C05, C06, C07, C08]

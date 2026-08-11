@@ -24,6 +24,11 @@ encoding:
   crf: 25
   gop_seconds: 2
 
+review_snapshots:
+  enabled: true
+  count_per_clip: 10
+  jpeg_quality: 95
+
 cameras:
   - label: camera1
     animal_ids: [M01, M02, M03, M04, M05, M06, M07]
