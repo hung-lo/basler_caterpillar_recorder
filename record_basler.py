@@ -1539,12 +1539,16 @@ def close_bindings(bindings: Iterable[CameraBinding]) -> None:
             pass
 
 
-def child_creationflags(*, isolate_ctrl_c: bool = False) -> int:
-    if os.name != "nt":
-        return 0
-    if isolate_ctrl_c:
-        return int(subprocess.CREATE_NEW_PROCESS_GROUP)
-    return 0
+def child_process_kwargs(*, isolate_ctrl_c: bool = False) -> dict[str, Any]:
+    if not isolate_ctrl_c:
+        return {}
+    if os.name == "nt":
+        return {"creationflags": int(subprocess.CREATE_NEW_PROCESS_GROUP)}
+    return {"start_new_session": True}
+
+
+class FFmpegPipeClosedError(RuntimeError):
+    pass
 
 
 class FFmpegWriter:
@@ -1616,7 +1620,7 @@ class FFmpegWriter:
             stdout=subprocess.DEVNULL,
             stderr=self.stderr_handle,
             bufsize=0,
-            creationflags=child_creationflags(isolate_ctrl_c=True),
+            **child_process_kwargs(isolate_ctrl_c=True),
         )
 
     def write(self, frame: np.ndarray) -> None:
@@ -1630,7 +1634,7 @@ class FFmpegWriter:
         try:
             self.process.stdin.write(frame.tobytes())
         except BrokenPipeError as exc:
-            raise RuntimeError(f"FFmpeg stopped while writing {self.temp_path}") from exc
+            raise FFmpegPipeClosedError(f"FFmpeg stopped while writing {self.temp_path}") from exc
 
     def close_and_remux(
         self,
@@ -1681,7 +1685,7 @@ class FFmpegWriter:
                 stdout=subprocess.DEVNULL,
                 stderr=log_handle,
                 check=False,
-                creationflags=child_creationflags(isolate_ctrl_c=True),
+                **child_process_kwargs(isolate_ctrl_c=True),
             )
         if remux.returncode == 0:
             if not keep_temp:
@@ -1699,6 +1703,28 @@ class FFmpegWriter:
             remux_log,
         )
         return return_code, False
+
+
+def write_frame_or_continue(
+    writer: FFmpegWriter,
+    frame: np.ndarray,
+    *,
+    user_stop_event: threading.Event,
+    stop_event: threading.Event,
+    label: str,
+) -> bool:
+    try:
+        writer.write(frame)
+        return True
+    except FFmpegPipeClosedError:
+        if user_stop_event.is_set():
+            LOG.info(
+                "%s FFmpeg closed its input during operator stop; finalizing the active clip",
+                label,
+            )
+            stop_event.set()
+            return False
+        raise
 
 
 @dataclasses.dataclass
@@ -3312,7 +3338,14 @@ def record_one_camera(
 
                 image = binding.converter.Convert(grab)
                 frame = apply_frame_transform(image.GetArray(), binding.requested)
-                writer.write(frame)
+                if not write_frame_or_continue(
+                    writer,
+                    frame,
+                    user_stop_event=user_stop_event,
+                    stop_event=stop_event,
+                    label=label,
+                ):
+                    break
 
                 camera_timestamp = get_grab_value(grab, ("ChunkTimestamp", "TimeStamp", "Timestamp"))
                 block_id = get_grab_value(grab, ("BlockID", "ID"))

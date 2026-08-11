@@ -928,6 +928,28 @@ class FFmpegWriterTests(unittest.TestCase):
             encoding_cfg={"codec": "libx264", "preset": "veryfast", "crf": 23},
         )
 
+    def test_child_process_kwargs_uses_start_new_session_on_posix(self) -> None:
+        with mock.patch.object(record_basler.os, "name", "posix"):
+            self.assertEqual(
+                record_basler.child_process_kwargs(isolate_ctrl_c=True),
+                {"start_new_session": True},
+            )
+            self.assertEqual(record_basler.child_process_kwargs(isolate_ctrl_c=False), {})
+
+    def test_child_process_kwargs_uses_creationflags_on_windows(self) -> None:
+        with mock.patch.object(record_basler.os, "name", "nt"):
+            with mock.patch.object(
+                record_basler.subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0x200,
+                create=True,
+            ):
+                self.assertEqual(
+                    record_basler.child_process_kwargs(isolate_ctrl_c=True),
+                    {"creationflags": 0x200},
+                )
+                self.assertEqual(record_basler.child_process_kwargs(isolate_ctrl_c=False), {})
+
     def test_start_uses_new_process_group_on_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = self.make_writer(Path(tmp))
@@ -951,7 +973,7 @@ class FFmpegWriterTests(unittest.TestCase):
             if writer.stderr_handle is not None:
                 writer.stderr_handle.close()
 
-    def test_start_uses_zero_creationflags_off_windows(self) -> None:
+    def test_start_uses_start_new_session_off_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = self.make_writer(Path(tmp))
             process = mock.Mock()
@@ -964,7 +986,7 @@ class FFmpegWriterTests(unittest.TestCase):
                     writer.start()
 
             self.assertIs(writer.process, process)
-            self.assertEqual(popen_mock.call_args.kwargs["creationflags"], 0)
+            self.assertTrue(popen_mock.call_args.kwargs["start_new_session"])
             if writer.stderr_handle is not None:
                 writer.stderr_handle.close()
 
@@ -977,22 +999,51 @@ class FFmpegWriterTests(unittest.TestCase):
             writer.process.wait.return_value = 0
             writer.stderr_handle = writer.stderr_path.open("wb")
 
-            with mock.patch.object(record_basler.os, "name", "nt"):
+            with mock.patch.object(record_basler.os, "name", "posix"):
                 with mock.patch.object(
                     record_basler.subprocess,
-                    "CREATE_NEW_PROCESS_GROUP",
-                    0x200,
-                    create=True,
-                ):
-                    with mock.patch.object(
-                        record_basler.subprocess,
-                        "run",
-                        return_value=mock.Mock(returncode=0),
-                    ) as run_mock:
-                        return_code, remuxed = writer.close_and_remux(keep_temp=True)
+                    "run",
+                    return_value=mock.Mock(returncode=0),
+                ) as run_mock:
+                    return_code, remuxed = writer.close_and_remux(keep_temp=True)
 
             self.assertEqual((return_code, remuxed), (0, True))
-            self.assertEqual(run_mock.call_args.kwargs["creationflags"], 0x200)
+            self.assertTrue(run_mock.call_args.kwargs["start_new_session"])
+
+    def test_write_frame_or_continue_returns_false_during_user_stop_pipe_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_event = threading.Event()
+            user_stop_event = threading.Event()
+            user_stop_event.set()
+            writer = mock.Mock()
+            writer.write.side_effect = record_basler.FFmpegPipeClosedError("boom")
+
+            result = record_basler.write_frame_or_continue(
+                writer,
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                user_stop_event=user_stop_event,
+                stop_event=stop_event,
+                label="camera1",
+            )
+
+        self.assertFalse(result)
+        self.assertTrue(stop_event.is_set())
+        writer.write.assert_called_once()
+
+    def test_write_frame_or_continue_raises_if_pipe_closes_without_user_stop(self) -> None:
+        stop_event = threading.Event()
+        user_stop_event = threading.Event()
+        writer = mock.Mock()
+        writer.write.side_effect = record_basler.FFmpegPipeClosedError("boom")
+
+        with self.assertRaises(record_basler.FFmpegPipeClosedError):
+            record_basler.write_frame_or_continue(
+                writer,
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                user_stop_event=user_stop_event,
+                stop_event=stop_event,
+                label="camera1",
+            )
 
     def test_close_and_remux_success_on_zero_capture_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
