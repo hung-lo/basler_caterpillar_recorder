@@ -57,15 +57,18 @@ GRID_TOLERANCE = dt.timedelta(seconds=1)
 LEAF_RESET_EVENT_NAMES = {"leaf_added", "leaf_replaced", "leaf_change"}
 PROGRESS_BAR_WIDTH = 28
 PROGRESS_UPDATE_SECONDS = 0.25
-LEAF_CACHE_VERSION = 1
+LEAF_CACHE_VERSION = 2
 LEAF_TRACE_FIELDS = [
     "animal_id",
     "clip_key",
+    "video_path",
+    "timestamp_path",
     "timestamp_utc",
     "leaf_area_proxy_px",
     "n_sampled_frames",
     "n_valid_frames",
     "qc_flag",
+    "sample_areas_px",
 ]
 LEAF_TIMESERIES_INPUT_FIELDS = [
     "animal_id",
@@ -295,6 +298,96 @@ def load_leaf_area_estimates_from_csv(path: Path) -> list[LeafAreaEstimate]:
     return estimates
 
 
+def parse_sample_areas_px(
+    value: object,
+    *,
+    row_index: int,
+    path: Path,
+    min_valid_frames: int,
+) -> tuple[float, ...]:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("missing sample_areas_px")
+    values = json.loads(text)
+    if not isinstance(values, list):
+        raise ValueError("sample_areas_px is not a JSON list")
+    sample_areas: list[float] = []
+    for item in values:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError("sample_areas_px contains a non-numeric value")
+        sample_areas.append(float(item))
+    if min_valid_frames > 0 and not sample_areas:
+        raise ValueError("sample_areas_px is empty for a valid estimate")
+    return tuple(sample_areas)
+
+
+def load_leaf_trace_estimates_from_csv(
+    path: Path,
+    *,
+    entry: ManifestEntry,
+    expected_percentile: float,
+) -> list[LeafAreaEstimate]:
+    estimates: list[LeafAreaEstimate] = []
+    with open_csv_text(path) as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"missing header in {path}")
+        required = {
+            "animal_id",
+            "clip_key",
+            "video_path",
+            "timestamp_path",
+            "timestamp_utc",
+            "leaf_area_proxy_px",
+            "n_sampled_frames",
+            "n_valid_frames",
+            "sample_areas_px",
+        }
+        if not required.issubset(set(reader.fieldnames)):
+            raise ValueError(f"invalid leaf trace CSV header in {path}")
+        for row_index, row in enumerate(reader, start=2):
+            try:
+                animal_id = str(row.get("animal_id") or "").strip()
+                clip_key = str(row.get("clip_key") or "").strip()
+                video_path = str(row.get("video_path") or "").strip()
+                timestamp_path = str(row.get("timestamp_path") or "").strip()
+                timestamp_utc = parse_utc_value(row.get("timestamp_utc"))
+                leaf_area_proxy_px = float(str(row.get("leaf_area_proxy_px") or "").strip())
+                n_sampled_frames = int(str(row.get("n_sampled_frames") or "").strip())
+                n_valid_frames = int(str(row.get("n_valid_frames") or "").strip())
+                qc_flag = str(row.get("qc_flag") or "").strip()
+                sample_areas_px = parse_sample_areas_px(
+                    row.get("sample_areas_px"),
+                    row_index=row_index,
+                    path=path,
+                    min_valid_frames=n_valid_frames,
+                )
+            except Exception as exc:
+                raise ValueError(f"invalid leaf trace CSV row {row_index} in {path}: {exc}") from exc
+            if video_path != str(entry.cropped_video) or timestamp_path != str(entry.timestamp_file):
+                raise ValueError(f"trace provenance does not match cache metadata in {path} row {row_index}")
+            if sample_areas_px:
+                expected_proxy = float(np.percentile(np.array(sample_areas_px, dtype=np.float64), expected_percentile))
+                if not math.isclose(leaf_area_proxy_px, expected_proxy, rel_tol=0.0, abs_tol=1e-6):
+                    raise ValueError(
+                        f"leaf_area_proxy_px does not match sample_areas_px in {path} row {row_index}"
+                    )
+            estimates.append(
+                LeafAreaEstimate(
+                    animal_id=animal_id,
+                    clip_key=clip_key,
+                    timestamp_utc=timestamp_utc,
+                    leaf_area_proxy_px=leaf_area_proxy_px,
+                    sample_areas_px=sample_areas_px,
+                    n_sampled_frames=n_sampled_frames,
+                    n_valid_frames=n_valid_frames,
+                    video_quality_excluded=False,
+                    qc_flag=qc_flag,
+                )
+            )
+    return estimates
+
+
 def parse_utc_value(value: object) -> dt.datetime:
     text = str(value or "").strip()
     if not text:
@@ -314,18 +407,24 @@ def relative_to_root(path: Path, root: Path) -> str:
         return str(path)
 
 
-def leaf_trace_rows_to_dicts(estimates: Sequence[LeafAreaEstimate]) -> list[dict[str, str]]:
+def leaf_trace_rows_to_dicts(
+    entry: ManifestEntry,
+    estimates: Sequence[LeafAreaEstimate],
+) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for estimate in estimates:
         rows.append(
             {
                 "animal_id": estimate.animal_id,
                 "clip_key": estimate.clip_key,
+                "video_path": str(entry.cropped_video),
+                "timestamp_path": str(entry.timestamp_file),
                 "timestamp_utc": format_utc(estimate.timestamp_utc),
                 "leaf_area_proxy_px": f"{estimate.leaf_area_proxy_px:.6f}",
                 "n_sampled_frames": str(estimate.n_sampled_frames),
                 "n_valid_frames": str(estimate.n_valid_frames),
                 "qc_flag": estimate.qc_flag,
+                "sample_areas_px": json.dumps(list(estimate.sample_areas_px), separators=(",", ":")),
             }
         )
     return rows
@@ -363,7 +462,11 @@ def load_leaf_trace_cache(
             return [], "invalid"
         if metadata.get("leaf_extraction_settings") != cache_settings:
             return [], "invalid"
-        estimates = load_leaf_area_estimates_from_csv(trace_path)
+        estimates = load_leaf_trace_estimates_from_csv(
+            trace_path,
+            entry=entry,
+            expected_percentile=float(cache_settings["leaf_area_percentile"]),
+        )
         if not estimates:
             return [], "invalid"
         if any(estimate.animal_id != entry.animal_id or estimate.clip_key != entry.clip_key for estimate in estimates):
@@ -372,6 +475,10 @@ def load_leaf_trace_cache(
         if any(ordered_timestamps[index] < ordered_timestamps[index - 1] for index in range(1, len(ordered_timestamps))):
             return [], "invalid"
         if int(metadata.get("trace_rows") or -1) != len(estimates):
+            return [], "invalid"
+        if int(metadata.get("timestamp_rows") or -1) <= 0:
+            return [], "invalid"
+        if int(metadata.get("selected_leaf_frames") or -1) <= 0:
             return [], "invalid"
         return estimates, "cached"
     except Exception as exc:
@@ -383,10 +490,10 @@ def write_leaf_trace_cache(
     trace_path: Path,
     meta_path: Path,
     entry: ManifestEntry,
-    estimates: Sequence[LeafAreaEstimate],
+    result: ClipFeedingResult,
     cache_settings: dict[str, object],
 ) -> None:
-    write_gzip_csv(trace_path, LEAF_TRACE_FIELDS, leaf_trace_rows_to_dicts(estimates))
+    write_gzip_csv(trace_path, LEAF_TRACE_FIELDS, leaf_trace_rows_to_dicts(entry, result.estimates))
     video_stat = entry.cropped_video.stat()
     timestamp_stat = entry.timestamp_file.stat()
     write_json_atomic(
@@ -402,7 +509,10 @@ def write_leaf_trace_cache(
             "timestamp_size_bytes": timestamp_stat.st_size,
             "timestamp_mtime_ns": timestamp_stat.st_mtime_ns,
             "leaf_extraction_settings": cache_settings,
-            "trace_rows": len(estimates),
+            "timestamp_rows": result.timestamp_rows,
+            "selected_leaf_frames": result.selected_leaf_frames,
+            "decoded_leaf_frames": result.decoded_leaf_frames,
+            "trace_rows": len(result.estimates),
         },
     )
 
@@ -1468,13 +1578,14 @@ def load_or_extract_clip_leaf_estimates(
     if not force:
         cached_estimates, cache_state = load_leaf_trace_cache(trace_path, meta_path, entry, cache_settings)
         if cache_state == "cached":
+            metadata = read_json_mapping(meta_path)
             return LeafTraceCacheOutcome(
                 ClipFeedingResult(
                     cached_estimates,
                     "cached",
-                    len(cached_estimates),
+                    int(metadata.get("timestamp_rows") or len(cached_estimates)),
                     None,
-                    len(cached_estimates),
+                    int(metadata.get("selected_leaf_frames") or len(cached_estimates)),
                     0,
                 ),
                 "cached",
@@ -1503,7 +1614,7 @@ def load_or_extract_clip_leaf_estimates(
         progress_reporter=progress_reporter,
     )
     if result.status == "processed":
-        write_leaf_trace_cache(trace_path, meta_path, entry, result.estimates, cache_settings)
+        write_leaf_trace_cache(trace_path, meta_path, entry, result, cache_settings)
     return LeafTraceCacheOutcome(result=result, cache_state=("invalid" if preexisting_cache and not force else cache_state))
 
 

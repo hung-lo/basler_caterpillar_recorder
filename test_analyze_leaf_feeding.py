@@ -475,7 +475,7 @@ class LeafFeedingLogicTests(unittest.TestCase):
                     "C01",
                     "clip_0001",
                     dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc),
-                    10000.0,
+                    float(np.percentile(np.array([10000.0], dtype=np.float64), 95.0)),
                     (10000.0,),
                     6,
                     6,
@@ -484,8 +484,8 @@ class LeafFeedingLogicTests(unittest.TestCase):
                     "C01",
                     "clip_0001",
                     dt.datetime(2026, 8, 9, 10, 5, 0, tzinfo=dt.timezone.utc),
-                    9200.0,
-                    (9200.0,),
+                    float(np.percentile(np.array([9180.0, 9200.0, 9220.0], dtype=np.float64), 95.0)),
+                    (9180.0, 9200.0, 9220.0),
                     6,
                     6,
                 ),
@@ -506,7 +506,13 @@ class LeafFeedingLogicTests(unittest.TestCase):
             )
             trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
             meta_path = leaf.leaf_trace_meta_path(trace_path)
-            leaf.write_leaf_trace_cache(trace_path, meta_path, entry, estimates, cache_settings)
+            leaf.write_leaf_trace_cache(
+                trace_path,
+                meta_path,
+                entry,
+                leaf.ClipFeedingResult(estimates, "processed", 9000, 9000, 36, 36),
+                cache_settings,
+            )
 
             with mock.patch.object(leaf, "extract_clip_leaf_estimates", side_effect=AssertionError("should not decode video")):
                 outcome = leaf.load_or_extract_clip_leaf_estimates(
@@ -532,6 +538,230 @@ class LeafFeedingLogicTests(unittest.TestCase):
         self.assertEqual(outcome.cache_state, "cached")
         self.assertEqual(outcome.result.status, "cached")
         self.assertEqual(len(outcome.result.estimates), 2)
+
+    def test_leaf_trace_cache_roundtrip_preserves_sample_areas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = leaf.ManifestEntry(
+                "C01",
+                "clip_0001",
+                root / "cropped_by_caterpillar" / "camera1" / "clip_0001.mp4",
+                root / "cropped_by_caterpillar" / "timestamps" / "clip_0001.timestamps.csv",
+            )
+            entry.cropped_video.parent.mkdir(parents=True, exist_ok=True)
+            entry.timestamp_file.parent.mkdir(parents=True, exist_ok=True)
+            entry.cropped_video.write_bytes(b"mp4")
+            entry.timestamp_file.write_text("timestamp", encoding="utf-8")
+            estimate = leaf.LeafAreaEstimate(
+                "C01",
+                "clip_0001",
+                dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc),
+                float(np.percentile(np.array([100.0, 120.0, 140.0, 160.0], dtype=np.float64), 95.0)),
+                (100.0, 120.0, 140.0, 160.0),
+                6,
+                4,
+                qc_flag="ok",
+            )
+            cache_settings = leaf.leaf_extraction_cache_settings(
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=1500,
+                morph_kernel=5,
+                frame_access="sparse",
+            )
+            trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
+            meta_path = leaf.leaf_trace_meta_path(trace_path)
+            leaf.write_leaf_trace_cache(
+                trace_path,
+                meta_path,
+                entry,
+                leaf.ClipFeedingResult([estimate], "processed", 9000, 9000, 36, 36),
+                cache_settings,
+            )
+
+            loaded, state = leaf.load_leaf_trace_cache(trace_path, meta_path, entry, cache_settings)
+
+        self.assertEqual(state, "cached")
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].animal_id, estimate.animal_id)
+        self.assertEqual(loaded[0].clip_key, estimate.clip_key)
+        self.assertEqual(loaded[0].timestamp_utc, estimate.timestamp_utc)
+        self.assertEqual(loaded[0].leaf_area_proxy_px, estimate.leaf_area_proxy_px)
+        self.assertEqual(loaded[0].n_sampled_frames, estimate.n_sampled_frames)
+        self.assertEqual(loaded[0].n_valid_frames, estimate.n_valid_frames)
+        self.assertEqual(loaded[0].qc_flag, estimate.qc_flag)
+        self.assertEqual(loaded[0].sample_areas_px, estimate.sample_areas_px)
+
+    def test_cached_and_fresh_consolidation_match_at_clip_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_settings = leaf.leaf_extraction_cache_settings(
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=1500,
+                morph_kernel=5,
+                frame_access="sparse",
+            )
+            timestamp = dt.datetime(2026, 8, 9, 12, 30, 0, tzinfo=dt.timezone.utc)
+            original_estimates = [
+                leaf.LeafAreaEstimate(
+                    "C01",
+                    "clip_0010",
+                    timestamp,
+                    float(np.percentile(np.array([100.0, 110.0, 120.0, 130.0], dtype=np.float64), 95.0)),
+                    (100.0, 110.0, 120.0, 130.0),
+                    6,
+                    4,
+                ),
+                leaf.LeafAreaEstimate(
+                    "C01",
+                    "clip_0011",
+                    timestamp,
+                    float(np.percentile(np.array([140.0, 150.0, 160.0, 170.0], dtype=np.float64), 95.0)),
+                    (140.0, 150.0, 160.0, 170.0),
+                    6,
+                    4,
+                ),
+            ]
+            fresh = leaf.consolidate_leaf_estimates(list(original_estimates), leaf_area_percentile=95.0)
+
+            entries = [
+                leaf.ManifestEntry(
+                    "C01",
+                    "clip_0010",
+                    root / "cropped_by_caterpillar" / "camera1" / "clip_0010.mp4",
+                    root / "cropped_by_caterpillar" / "timestamps" / "clip_0010.timestamps.csv",
+                ),
+                leaf.ManifestEntry(
+                    "C01",
+                    "clip_0011",
+                    root / "cropped_by_caterpillar" / "camera1" / "clip_0011.mp4",
+                    root / "cropped_by_caterpillar" / "timestamps" / "clip_0011.timestamps.csv",
+                ),
+            ]
+            for entry in entries:
+                entry.cropped_video.parent.mkdir(parents=True, exist_ok=True)
+                entry.timestamp_file.parent.mkdir(parents=True, exist_ok=True)
+                entry.cropped_video.write_bytes(b"mp4")
+                entry.timestamp_file.write_text("timestamp", encoding="utf-8")
+
+            loaded: list[leaf.LeafAreaEstimate] = []
+            for entry, estimate in zip(entries, original_estimates, strict=True):
+                trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
+                meta_path = leaf.leaf_trace_meta_path(trace_path)
+                leaf.write_leaf_trace_cache(
+                    trace_path,
+                    meta_path,
+                    entry,
+                    leaf.ClipFeedingResult([estimate], "processed", 9000, 9000, 36, 36),
+                    cache_settings,
+                )
+                reloaded, state = leaf.load_leaf_trace_cache(trace_path, meta_path, entry, cache_settings)
+                self.assertEqual(state, "cached")
+                loaded.extend(reloaded)
+
+            cached = leaf.consolidate_leaf_estimates(loaded, leaf_area_percentile=95.0)
+
+        self.assertEqual(len(fresh), 1)
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0].leaf_area_proxy_px, fresh[0].leaf_area_proxy_px)
+        self.assertEqual(cached[0].sample_areas_px, fresh[0].sample_areas_px)
+
+    def test_segmentation_setting_change_invalidates_leaf_trace_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = leaf.ManifestEntry(
+                "C01",
+                "clip_0001",
+                root / "cropped_by_caterpillar" / "camera1" / "clip_0001.mp4",
+                root / "cropped_by_caterpillar" / "timestamps" / "clip_0001.timestamps.csv",
+            )
+            entry.cropped_video.parent.mkdir(parents=True, exist_ok=True)
+            entry.timestamp_file.parent.mkdir(parents=True, exist_ok=True)
+            entry.cropped_video.write_bytes(b"mp4")
+            entry.timestamp_file.write_text("timestamp", encoding="utf-8")
+            trace_path = leaf.leaf_trace_path(root, entry.animal_id, entry.clip_key)
+            meta_path = leaf.leaf_trace_meta_path(trace_path)
+            base_cache_settings = leaf.leaf_extraction_cache_settings(
+                estimate_interval_minutes=5,
+                burst_duration_seconds=60,
+                burst_step_seconds=10,
+                leaf_area_percentile=95.0,
+                min_valid_frames=3,
+                hue_low=25,
+                hue_high=95,
+                sat_min=35,
+                value_min=25,
+                min_component_px=1500,
+                morph_kernel=5,
+                frame_access="sparse",
+            )
+            leaf.write_leaf_trace_cache(
+                trace_path,
+                meta_path,
+                entry,
+                leaf.ClipFeedingResult(
+                    [
+                        leaf.LeafAreaEstimate(
+                            "C01",
+                            "clip_0001",
+                            dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc),
+                            float(np.percentile(np.array([100.0, 120.0, 140.0], dtype=np.float64), 95.0)),
+                            (100.0, 120.0, 140.0),
+                            6,
+                            3,
+                        )
+                    ],
+                    "processed",
+                    9000,
+                    9000,
+                    36,
+                    36,
+                ),
+                base_cache_settings,
+            )
+
+            with mock.patch.object(
+                leaf,
+                "extract_clip_leaf_estimates",
+                return_value=leaf.ClipFeedingResult([], "processed", 9000, 9000, 36, 36),
+            ) as mock_extract:
+                outcome = leaf.load_or_extract_clip_leaf_estimates(
+                    root,
+                    entry,
+                    clip_index=1,
+                    estimate_interval_minutes=5,
+                    burst_duration_seconds=60,
+                    burst_step_seconds=10,
+                    leaf_area_percentile=95.0,
+                    min_valid_frames=3,
+                    hue_low=26,
+                    hue_high=95,
+                    sat_min=35,
+                    value_min=25,
+                    min_component_px=1500,
+                    morph_kernel=5,
+                    frame_access="sparse",
+                    force=False,
+                    progress_reporter=None,
+                )
+
+        self.assertEqual(mock_extract.call_count, 1)
+        self.assertEqual(outcome.cache_state, "invalid")
 
     def test_main_classify_only_reuses_legacy_timeseries_without_video_access(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
