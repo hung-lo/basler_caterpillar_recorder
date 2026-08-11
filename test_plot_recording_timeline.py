@@ -484,6 +484,10 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(len(stim_bars), 1)
         lightning_calls = [call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "\u26a1"]
         self.assertEqual(len(lightning_calls), 1)
+        self.assertEqual(lightning_calls[0].kwargs["zorder"], timeline.STIM_MARKER_ZORDER)
+        self.assertFalse(lightning_calls[0].kwargs.get("clip_on", True))
+        self.assertIn("path_effects", lightning_calls[0].kwargs)
+        self.assertGreaterEqual(len(lightning_calls[0].kwargs["path_effects"]), 1)
         self.assertAlmostEqual(
             lightning_calls[0].args[0],
             timeline.mdates.date2num(dt.datetime(2026, 8, 9, 13, 37, 0)),
@@ -516,10 +520,59 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(len(stim_bars), 1)
         lightning_calls = [call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "\u26a1"]
         self.assertEqual(len(lightning_calls), 1)
+        self.assertEqual(lightning_calls[0].kwargs["zorder"], timeline.STIM_MARKER_ZORDER)
+        self.assertFalse(lightning_calls[0].kwargs.get("clip_on", True))
+        self.assertIn("path_effects", lightning_calls[0].kwargs)
+        self.assertGreaterEqual(len(lightning_calls[0].kwargs["path_effects"]), 1)
         self.assertAlmostEqual(
             lightning_calls[0].args[0],
             timeline.mdates.date2num(dt.datetime(2026, 8, 9, 13, 40, 0)),
         )
+
+    def test_real_stimulation_rows_render_in_final_overlay_with_diagnostics(self) -> None:
+        csv_text = (
+            "animal_id,start_local,end_local,event,kind,approximate,notes\n"
+            "C01,2026-08-09T13:37:00-04:00,2026-08-09T13:37:10-04:00,electrical_stimulation,stimulus,FALSE,50 uA pulse train at 100 Hz for 10 seconds\n"
+            "C08,2026-08-09T13:40:00-04:00,2026-08-09T13:40:10-04:00,electrical_stimulation,stimulus,FALSE,50 uA pulse train at 100 Hz for 10 seconds\n"
+        )
+        events, _global_events = timeline.load_event_tables_from_text(
+            csv_text,
+            dt.timezone(dt.timedelta(hours=-4)),
+            source_name="inline.csv",
+        )
+
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(timeline.is_stimulation_event(event) for event in events))
+
+        with self.assertLogs("plot_recording_timeline", level="DEBUG") as logs:
+            with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+                with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+                    timeline.plot_recording_timeline(
+                        clips=[],
+                        events=events,
+                        motion_states=[],
+                        animals=timeline.ANIMAL_ORDER,
+                        timezone=dt.timezone(dt.timedelta(hours=-4)),
+                        output_path=Path("ignored.png"),
+                        annotate_clips=False,
+                    )
+
+        lightning_calls = [call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "\u26a1"]
+        self.assertEqual(len(lightning_calls), 2)
+        self.assertEqual(
+            {call.kwargs["zorder"] for call in lightning_calls},
+            {timeline.STIM_MARKER_ZORDER},
+        )
+        self.assertTrue(all(not call.kwargs.get("clip_on", True) for call in lightning_calls))
+        self.assertTrue(all("path_effects" in call.kwargs for call in lightning_calls))
+        self.assertGreaterEqual(
+            sum(1 for call in mock_broken_barh.call_args_list if call.kwargs.get("facecolors") == timeline.STIM_COLOR),
+            2,
+        )
+        self.assertTrue(any("Electrical stimulation events available: 2" in line for line in logs.output))
+        self.assertTrue(any("Electrical stimulation markers rendered: 2" in line for line in logs.output))
+        self.assertTrue(any("stimulation C01" in line for line in logs.output))
+        self.assertTrue(any("stimulation C08" in line for line in logs.output))
 
     def test_behavior_axis_uses_canonical_animal_order(self) -> None:
         events = [

@@ -28,6 +28,7 @@ try:
     import matplotlib
 
     matplotlib.use("Agg")
+    import matplotlib.patheffects as patheffects
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -67,6 +68,7 @@ SHORT_EVENT_THRESHOLD_SECONDS = 300
 DEFAULT_POINT_MARKER_SIZE = 70
 SHED_MARKER_SIZE = 100
 STIM_MARKER_SIZE = 180
+STIM_MARKER_ZORDER = 100
 DEATH_MARKER_SIZE = 120
 MOTION_IMMOBILE_COLOR = "#bdbdbd"
 MOTION_MOBILE_COLOR = "#59a14f"
@@ -1581,6 +1583,9 @@ def plot_recording_timeline(
             clipped_motion_spans,
         )
 
+    stim_event_count = sum(1 for event in events if is_stimulation_event(event))
+    LOG.info("Electrical stimulation events available: %d", stim_event_count)
+    stimulation_markers: list[tuple[str, float, int, dt.datetime]] = []
     for event in events:
         if event.animal_id not in behavior_index:
             continue
@@ -1600,7 +1605,7 @@ def plot_recording_timeline(
         left = mdates.date2num(event.start_local.replace(tzinfo=None))
 
         if is_stimulation_event(event):
-            if duration_s > 0:
+            if not event.is_point and duration_s > 0:
                 width = max(duration_s / 86400.0, 1e-9)
                 color = event_bar_color(event)
                 ax_beh.broken_barh(
@@ -1610,17 +1615,7 @@ def plot_recording_timeline(
                     alpha=0.74,
                     zorder=3,
                 )
-            ax_beh.text(
-                left,
-                y,
-                "\u26a1",
-                ha="center",
-                va="center",
-                fontsize=13,
-                color=STIM_COLOR,
-                fontweight="bold",
-                zorder=7,
-            )
+            stimulation_markers.append((event.animal_id, left, y, event.start_local))
             continue
 
         if event.is_point:
@@ -1663,6 +1658,31 @@ def plot_recording_timeline(
             facecolors=color,
             alpha=0.74,
             zorder=3,
+        )
+
+    rendered_stimulation_markers = 0
+    for animal_id, left, y, event_start_local in stimulation_markers:
+        LOG.debug("stimulation %s at %s", animal_id, event_start_local.isoformat(sep=" "))
+        ax_beh.text(
+            left,
+            y,
+            "\u26a1",
+            ha="center",
+            va="center",
+            fontsize=15,
+            color=STIM_COLOR,
+            fontweight="bold",
+            zorder=STIM_MARKER_ZORDER,
+            clip_on=False,
+            path_effects=[patheffects.withStroke(linewidth=2.2, foreground="white")],
+        )
+        rendered_stimulation_markers += 1
+
+    LOG.info("Electrical stimulation markers rendered: %d", rendered_stimulation_markers)
+    if stim_event_count > 0 and rendered_stimulation_markers == 0:
+        LOG.warning(
+            "Loaded %d electrical stimulation event(s) but rendered 0 marker(s)",
+            stim_event_count,
         )
 
     axes_to_style = [ax_cov, ax_beh]
