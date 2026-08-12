@@ -35,6 +35,7 @@ try:
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
+    from matplotlib.ticker import NullFormatter, NullLocator
 except ImportError as exc:  # pragma: no cover - import-time guard for missing optional deps
     raise SystemExit(
         "plot_recording_timeline.py requires matplotlib. Install dependencies with "
@@ -72,10 +73,11 @@ SHED_MARKER_SIZE = 100
 STIM_MARKER_SIZE = 180
 STIM_MARKER_ZORDER = 100
 DEATH_MARKER_SIZE = 120
-MOTION_IMMOBILE_COLOR = "#bdbdbd"
+MOTION_IMMOBILE_COLOR = "#e2e2e2"
 MOTION_MOBILE_COLOR = "#59a14f"
 RECORDING_COLOR = "#4c78a8"
-GAP_SHADE_COLOR = "#efefef"
+GAP_SHADE_COLOR = "#fafafa"
+GAP_BOUNDARY_COLOR = "#d1d5db"
 ROW_SEPARATOR_COLOR = "#e5e7eb"
 MAJOR_GAP_MIN_SECONDS = 5 * 60
 MAX_MAJOR_GAP_LABELS = 6
@@ -84,12 +86,12 @@ GOOGLE_SHEETS_TIMEOUT_SECONDS = 30
 GOOGLE_SHEETS_USER_AGENT = "basler-caterpillar-recorder/1.0"
 GLOBAL_EVENT_ALIASES = {"all", "global", "*"}
 VIDEO_QUALITY_LOW_COLOR = "#F59E0B"
-VIDEO_QUALITY_LOW_ALPHA = 0.12
+VIDEO_QUALITY_LOW_ALPHA = 0.08
 GENERIC_GLOBAL_EVENT_COLOR = "#94a3b8"
-GENERIC_GLOBAL_EVENT_ALPHA = 0.1
+GENERIC_GLOBAL_EVENT_ALPHA = 0.08
 MIN_GLOBAL_EVENT_LABEL_SECONDS = 5 * 60
 FOOD_UNAVAILABLE_COLOR = "#FB7185"
-FOOD_UNAVAILABLE_ALPHA = 0.10
+FOOD_UNAVAILABLE_ALPHA = 0.08
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -871,9 +873,18 @@ def major_tick_interval_hours(start_local: dt.datetime, end_local: dt.datetime) 
 
 
 def configure_time_axis(axis, start_local: dt.datetime, end_local: dt.datetime) -> None:
-    interval_h = major_tick_interval_hours(start_local, end_local)
-    axis.xaxis.set_major_locator(mdates.HourLocator(interval=interval_h))
-    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
+    span_h = max((end_local - start_local).total_seconds(), 0.0) / 3600.0
+    if span_h > 48:
+        axis.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        axis.xaxis.set_minor_locator(mdates.HourLocator(interval=12))
+        axis.xaxis.set_minor_formatter(NullFormatter())
+    else:
+        interval_h = 6 if span_h <= 24 else 12
+        axis.xaxis.set_major_locator(mdates.HourLocator(interval=interval_h))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
+        axis.xaxis.set_minor_locator(NullLocator())
+        axis.xaxis.set_minor_formatter(NullFormatter())
     axis.tick_params(axis="x", labelrotation=0)
     for label in axis.get_xticklabels():
         label.set_ha("center")
@@ -1024,10 +1035,18 @@ def global_annotation_legend_handles(global_events: list[GlobalEvent]) -> list[P
                 facecolor=FOOD_UNAVAILABLE_COLOR,
                 alpha=FOOD_UNAVAILABLE_ALPHA,
                 edgecolor="none",
-                label="food_unavailable",
+                label="Food unavailable",
             )
         )
     return handles
+
+
+def add_recording_gap_band(axis, gap_start: dt.datetime, gap_end: dt.datetime, timezone: dt.tzinfo) -> None:
+    start_local = to_plot_local(gap_start, timezone)
+    end_local = to_plot_local(gap_end, timezone)
+    axis.axvspan(start_local, end_local, facecolor=GAP_SHADE_COLOR, alpha=1.0, zorder=0.05)
+    axis.axvline(start_local, color=GAP_BOUNDARY_COLOR, alpha=0.9, linewidth=0.6, zorder=0.06)
+    axis.axvline(end_local, color=GAP_BOUNDARY_COLOR, alpha=0.9, linewidth=0.6, zorder=0.06)
 
 
 def timeline_bounds_utc(
@@ -1233,52 +1252,100 @@ def motion_legend_handles() -> list[Patch]:
     return [
         Patch(
             facecolor=MOTION_IMMOBILE_COLOR,
-            alpha=0.68,
+            alpha=0.42,
             edgecolor="none",
             label="Motion-derived immobile",
         ),
         Patch(
             facecolor=MOTION_MOBILE_COLOR,
-            alpha=0.68,
+            alpha=0.50,
             edgecolor="none",
             label="Motion-derived mobile",
         ),
     ]
 
 
-def manual_annotation_legend_handles() -> list[Line2D | Patch]:
-    return [
-        Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Duration / state"),
-        Line2D(
-            [0],
-            [0],
-            marker="^",
-            linestyle="None",
-            markersize=8,
-            markerfacecolor=SHED_COLOR,
-            markeredgecolor="black",
-            markeredgewidth=0.6,
-            label="Shed / molt",
-        ),
-        Line2D(
-            [0],
-            [0],
-            linestyle="None",
-            label="\u26a1 Electrical stimulation",
-            color=STIM_COLOR,
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="X",
-            linestyle="None",
-            markersize=8,
-            markerfacecolor=DEATH_COLOR,
-            markeredgecolor="black",
-            markeredgewidth=0.6,
-            label="Death",
-        ),
-    ]
+def manual_interval_legend_handle() -> Patch:
+    return Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Manual interval")
+
+
+def manual_annotation_legend_handles(events: Sequence[BehaviorEvent] | None = None) -> list[Line2D | Patch]:
+    if events is None:
+        return [
+            manual_interval_legend_handle(),
+            Line2D(
+                [0],
+                [0],
+                marker="^",
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=SHED_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Shed / molt",
+            ),
+            Line2D(
+                [0],
+                [0],
+                linestyle="None",
+                label="\u26a1 Electrical stimulation",
+                color=STIM_COLOR,
+            ),
+            Line2D(
+                [0],
+                [0],
+                marker="X",
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=DEATH_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Death",
+            ),
+        ]
+
+    handles: list[Line2D | Patch] = []
+    if any(is_manual_interval_event(event) for event in events):
+        handles.append(manual_interval_legend_handle())
+    if any(behavior_event_terms(event) & SHED_EVENT_NAMES for event in events):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="^",
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=SHED_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Shed / molt",
+            )
+        )
+    if any(is_stimulation_event(event) for event in events):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                linestyle="None",
+                label="\u26a1 Electrical stimulation",
+                color=STIM_COLOR,
+            )
+        )
+    if any(is_death_event(event) for event in events):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="X",
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=DEATH_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Death",
+            )
+        )
+    return handles
 
 
 def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
@@ -1287,11 +1354,34 @@ def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
     return [
         Patch(
             facecolor=FEEDING_COLOR,
-            alpha=0.82,
+            alpha=0.88,
             edgecolor="none",
-            label="Automatic feeding",
+            label="Automatic feeding bouts",
         )
     ]
+
+
+def is_manual_interval_event(event: BehaviorEvent) -> bool:
+    if event.is_point:
+        return False
+    if is_feeding_event(event) or is_stimulation_event(event):
+        return False
+    return True
+
+
+def timeline_legend_handles(
+    *,
+    events: Sequence[BehaviorEvent],
+    motion_states: Sequence[MotionState],
+    global_events: Sequence[GlobalEvent],
+) -> list[Line2D | Patch]:
+    handles: list[Line2D | Patch] = []
+    if motion_states:
+        handles.extend(motion_legend_handles())
+    handles.extend(feeding_legend_handles(events))
+    handles.extend(global_annotation_legend_handles(list(global_events)))
+    handles.extend(manual_annotation_legend_handles(events))
+    return handles
 
 
 def plot_recording_timeline(
@@ -1440,10 +1530,10 @@ def plot_recording_timeline(
     record_timing("plot data preparation", prep_start)
     artist_start = perf_counter() if timing_enabled else 0.0
     for gap_start_utc, gap_end_utc in major_gaps:
-        gap_start = to_plot_local(gap_start_utc, timezone)
-        gap_end = to_plot_local(gap_end_utc, timezone)
-        ax_cov.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
-        ax_beh.axvspan(gap_start, gap_end, facecolor=GAP_SHADE_COLOR, alpha=0.9, zorder=0.1)
+        add_recording_gap_band(ax_cov, gap_start_utc, gap_end_utc, timezone)
+        if ax_motion is not None:
+            add_recording_gap_band(ax_motion, gap_start_utc, gap_end_utc, timezone)
+        add_recording_gap_band(ax_beh, gap_start_utc, gap_end_utc, timezone)
 
     for event in global_events:
         style = global_event_band_style(event)
@@ -1461,7 +1551,7 @@ def plot_recording_timeline(
         ):
             ax_cov.text(
                 mdates.date2num(band_start + (band_end - band_start) / 2),
-                0.5,
+                0.82,
                 label,
                 ha="center",
                 va="center",
@@ -1497,7 +1587,7 @@ def plot_recording_timeline(
         ax_cov.set_ylim(0, 1)
         ax_cov.set_yticks([])
         ax_cov.set_ylabel("Recording", rotation=0, labelpad=34, va="center", fontsize=10, color="#334155")
-        ax_cov.grid(True, axis="x", color="#cbd5e1", alpha=0.4, linewidth=0.6)
+        ax_cov.grid(True, axis="x", color="#cbd5e1", alpha=0.18, linewidth=0.45)
     else:
         ax_cov.text(
             0.5,
@@ -1542,7 +1632,7 @@ def plot_recording_timeline(
         ax_motion.set_ylabel("Animal")
         ax_motion.set_ylim(-0.5, len(behavior_rows) - 0.5)
         ax_motion.invert_yaxis()
-        ax_motion.grid(True, axis="x", color="#cbd5e1", alpha=0.35, linewidth=0.6)
+        ax_motion.grid(True, axis="x", color="#cbd5e1", alpha=0.18, linewidth=0.45)
         ax_motion.tick_params(axis="x", labelbottom=False)
         for y in range(len(behavior_rows) + 1):
             ax_motion.axhline(y - 0.5, color=ROW_SEPARATOR_COLOR, linewidth=0.7, zorder=0.2)
@@ -1579,89 +1669,25 @@ def plot_recording_timeline(
             if current_segment_x:
                 ax_motion.plot(current_segment_x, current_segment_y, color="#0f766e", linewidth=1.2, zorder=2)
 
-    if motion_states:
-        motion_legend = ax_legend.legend(
-            handles=motion_legend_handles(),
-            loc="upper left",
-            bbox_to_anchor=(0.0, 1.0),
-            ncol=2,
-            frameon=False,
-            fontsize=8,
-            title="Motion-derived states",
-            title_fontsize=9,
-            handlelength=1.3,
-            handletextpad=0.5,
-            columnspacing=1.4,
-            borderaxespad=0.0,
-        )
-        ax_legend.add_artist(motion_legend)
-
-    global_handles = global_annotation_legend_handles(global_events)
-    if global_handles:
-        global_legend = ax_legend.legend(
-            handles=global_handles,
-            loc="upper left",
-            bbox_to_anchor=(0.34 if motion_states else 0.0, 1.0),
-            ncol=len(global_handles),
-            frameon=False,
-            fontsize=8,
-            title="Global intervals",
-            title_fontsize=9,
-            handlelength=1.3,
-            handletextpad=0.5,
-            columnspacing=1.2,
-            borderaxespad=0.0,
-        )
-        ax_legend.add_artist(global_legend)
-
-    feeding_handles = feeding_legend_handles(events)
-    if feeding_handles:
-        feeding_legend = ax_legend.legend(
-            handles=feeding_handles,
-            loc="upper left",
-            bbox_to_anchor=(
-                0.58 if motion_states and global_handles else
-                0.26 if global_handles else
-                0.32 if motion_states else
-                0.0,
-                1.0,
-            ),
-            ncol=1,
-            frameon=False,
-            fontsize=8,
-            title="Feeding",
-            title_fontsize=9,
-            handlelength=1.3,
-            handletextpad=0.5,
-            columnspacing=1.2,
-            borderaxespad=0.0,
-        )
-        ax_legend.add_artist(feeding_legend)
-
-    ax_legend.legend(
-        handles=manual_annotation_legend_handles(),
-        loc="upper left",
-        bbox_to_anchor=(
-            0.72 if feeding_handles and motion_states and global_handles else
-            0.42 if feeding_handles and global_handles else
-            0.46 if feeding_handles and motion_states else
-            0.14 if feeding_handles else
-            0.58 if motion_states and global_handles else
-            0.26 if global_handles else
-            0.32 if motion_states else
-            0.0,
-            1.0,
-        ),
-        ncol=5,
-        frameon=False,
-        fontsize=8,
-        title="Manual annotations",
-        title_fontsize=9,
-        handlelength=1.3,
-        handletextpad=0.5,
-        columnspacing=1.2,
-        borderaxespad=0.0,
+    legend_handles = timeline_legend_handles(
+        events=events,
+        motion_states=motion_states,
+        global_events=global_events,
     )
+    if legend_handles:
+        ax_legend.legend(
+            handles=legend_handles,
+            loc="upper left",
+            bbox_to_anchor=(0.0, 0.0, 1.0, 1.0),
+            mode="expand",
+            ncol=min(4, len(legend_handles)),
+            frameon=False,
+            fontsize=8,
+            handlelength=1.3,
+            handletextpad=0.5,
+            columnspacing=1.2,
+            borderaxespad=0.0,
+        )
 
     ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=10)
     ax_beh.set_yticks(range(len(behavior_rows)))
@@ -1669,7 +1695,7 @@ def plot_recording_timeline(
     ax_beh.set_ylabel("Animal")
     ax_beh.set_ylim(-0.5, len(behavior_rows) - 0.5)
     ax_beh.invert_yaxis()
-    ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.4, linewidth=0.6)
+    ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.18, linewidth=0.45)
     ax_beh.set_xlabel(x_axis_time_label(timezone, first_utc, last_utc))
 
     for y in range(len(behavior_rows) + 1):

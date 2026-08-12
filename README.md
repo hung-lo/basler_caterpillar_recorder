@@ -228,7 +228,7 @@ python plot_recording_timeline.py `
   --motion-energy "D:\Hung_MBL\monarch_behavior_windows\new_cohort_C01-C08\cropped_by_caterpillar\motion_energy\motion_energy_timeseries.csv"
 ```
 
-`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding events use the same interval bar renderer as manual feeding annotations, so short feeding bouts stay bars instead of turning into point markers. Semantic point events are rendered explicitly: shed / molt as a triangle, electrical stimulation as a red `⚡`, and death as an `X`. Generic point observations are kept in the event source but are not drawn on the timeline.
+`plot_recording_timeline.py` now accepts either legacy `start_local` / `end_local` fields or UTC-canonical `start_utc` / `end_utc` fields in event CSVs. Automatic feeding bouts use the same interval bar renderer as manual interval annotations, so short feeding bouts stay bars instead of turning into point markers. Semantic point events are rendered explicitly: shed / molt as a triangle, electrical stimulation as a red `⚡`, and death as an `X`. Generic point observations are kept in the event source but are not drawn on the timeline. Long multi-day timelines now place major ticks on local calendar days so the x-axis reads more naturally.
 
 ## New computer workflow
 

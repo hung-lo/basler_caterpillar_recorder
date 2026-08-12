@@ -876,11 +876,112 @@ class TimelinePlotTests(unittest.TestCase):
             any(len(call.args) >= 3 and call.args[2] == "\u26a1" for call in mock_text.call_args_list)
         )
 
-    def test_manual_annotation_legend_uses_lightning_label(self) -> None:
+    def test_manual_annotation_legend_uses_expected_labels(self) -> None:
         labels = [handle.get_label() for handle in timeline.manual_annotation_legend_handles()]
 
+        self.assertIn("Manual interval", labels)
+        self.assertIn("Shed / molt", labels)
         self.assertIn("\u26a1 Electrical stimulation", labels)
-        self.assertNotIn("Other point event", labels)
+        self.assertIn("Death", labels)
+        self.assertNotIn("Duration / state", labels)
+
+    def test_timeline_legend_handles_are_ordered_and_named(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            )
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 40, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+                event="observation",
+                kind="event",
+                notes="manual interval",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 5, 1),
+                event="shed",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 10, 1),
+                event="electrical_stimulation",
+                kind="stimulus",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 20, 1),
+                event="dead",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+        ]
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0, tzinfo=dt.timezone.utc),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 45, 0, tzinfo=dt.timezone.utc),
+                event="food_unavailable",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        labels = [handle.get_label() for handle in timeline.timeline_legend_handles(
+            events=events,
+            motion_states=motion_states,
+            global_events=global_events,
+        )]
+
+        self.assertEqual(
+            labels,
+            [
+                "Motion-derived immobile",
+                "Motion-derived mobile",
+                "Automatic feeding bouts",
+                "Low video quality",
+                "Food unavailable",
+                "Manual interval",
+                "Shed / molt",
+                "\u26a1 Electrical stimulation",
+                "Death",
+            ],
+        )
 
     def test_video_quality_and_food_unavailable_global_styles_are_rendered(self) -> None:
         events = [
@@ -1622,6 +1723,20 @@ class TimelinePlotTests(unittest.TestCase):
         end = dt.datetime(2026, 8, 11, 0, 0, 0)
 
         self.assertEqual(timeline.major_tick_interval_hours(start, end), 12)
+
+    def test_configure_time_axis_uses_day_locator_for_multi_day_span(self) -> None:
+        fig, ax = timeline.plt.subplots()
+        try:
+            timeline.configure_time_axis(
+                ax,
+                dt.datetime(2026, 8, 7, 0, 0, 0),
+                dt.datetime(2026, 8, 11, 0, 0, 0),
+            )
+
+            self.assertIsInstance(ax.xaxis.get_major_locator(), timeline.mdates.DayLocator)
+            self.assertEqual(ax.xaxis.get_major_formatter().fmt, "%b %d")
+        finally:
+            timeline.plt.close(fig)
 
     def test_parse_google_sheet_url_extracts_sheet_id_and_gid(self) -> None:
         source = timeline.parse_google_sheet_url(
