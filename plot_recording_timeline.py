@@ -96,17 +96,22 @@ GENERIC_GLOBAL_EVENT_ALPHA = 0.08
 MIN_GLOBAL_EVENT_LABEL_SECONDS = 5 * 60
 FOOD_UNAVAILABLE_COLOR = "#FB7185"
 FOOD_UNAVAILABLE_ALPHA = 0.08
+FOOD_UNAVAILABLE_EVENT_NAMES = {
+    "food_unavailable",
+}
 
 TIMELINE_LEGEND_ORDER = [
     "Shed / molt",
+    "J-hang",
+    "Pupation",
     "\u26a1 Electrical stimulation",
     "Death",
     "Automatic feeding bouts",
     "Motion-derived immobile",
     "Motion-derived mobile",
     "Low video quality",
-    "Manual interval",
     "Food unavailable",
+    "Manual interval",
 ]
 
 SHED_EVENT_NAMES = {
@@ -126,6 +131,12 @@ DEATH_EVENT_NAMES = {
     "death",
     "dead",
 }
+J_HANG_EVENT_NAMES = {
+    "j_hang",
+}
+PUPATION_EVENT_NAMES = {
+    "pupation",
+}
 VIDEO_QUALITY_GLOBAL_EVENT_NAMES = {
     "video_quality_low",
     "poor_video_quality",
@@ -135,11 +146,17 @@ VIDEO_QUALITY_GLOBAL_EVENT_NAMES = {
 }
 
 SHED_COLOR = "#d97706"
+J_HANG_COLOR = SHED_COLOR
+PUPATION_COLOR = SHED_COLOR
 STIM_COLOR = "#dc2626"
 DEATH_COLOR = "#111827"
 DEFAULT_POINT_COLOR = "#475569"
 INTERVAL_BAR_COLOR = "#8aa1c7"
 FEEDING_COLOR = "#7c3aed"
+J_HANG_MARKER = "v"
+PUPATION_MARKER = "D"
+J_HANG_MARKER_SIZE = SHED_MARKER_SIZE
+PUPATION_MARKER_SIZE = SHED_MARKER_SIZE
 RECORDING_COVERAGE_FIELDNAMES = [
     "clip_id",
     "timestamp_file",
@@ -975,6 +992,10 @@ def behavior_event_style(event: BehaviorEvent) -> Optional[tuple[str, float, str
     terms = behavior_event_terms(event)
     if terms & SHED_EVENT_NAMES:
         return "^", SHED_MARKER_SIZE, SHED_COLOR
+    if terms & J_HANG_EVENT_NAMES:
+        return J_HANG_MARKER, J_HANG_MARKER_SIZE, J_HANG_COLOR
+    if terms & PUPATION_EVENT_NAMES:
+        return PUPATION_MARKER, PUPATION_MARKER_SIZE, PUPATION_COLOR
     if terms & STIM_EVENT_NAMES:
         return "*", STIM_MARKER_SIZE, STIM_COLOR
     if terms & DEATH_EVENT_NAMES:
@@ -988,6 +1009,10 @@ def is_supported_behavior_point_event(event: BehaviorEvent) -> bool:
 
 def is_stimulation_event(event: BehaviorEvent) -> bool:
     return bool(behavior_event_terms(event) & STIM_EVENT_NAMES)
+
+
+def is_food_unavailable_behavior_event(event: BehaviorEvent) -> bool:
+    return bool(behavior_event_terms(event) & FOOD_UNAVAILABLE_EVENT_NAMES)
 
 
 def behavior_event_is_visible(event: BehaviorEvent) -> bool:
@@ -1010,7 +1035,7 @@ def is_video_quality_global_event(event: GlobalEvent) -> bool:
 
 def is_food_unavailable_global_event(event: GlobalEvent) -> bool:
     terms = global_event_terms(event)
-    return "food_unavailable" in terms
+    return bool(terms & FOOD_UNAVAILABLE_EVENT_NAMES)
 
 
 def rendered_global_event_style(event: GlobalEvent) -> Optional[tuple[str, float]]:
@@ -1043,15 +1068,6 @@ def global_annotation_legend_handles(global_events: list[GlobalEvent]) -> list[P
                 alpha=VIDEO_QUALITY_LOW_ALPHA,
                 edgecolor="none",
                 label="Low video quality",
-            )
-        )
-    if any(is_food_unavailable_global_event(event) for event in global_events):
-        handles.append(
-            Patch(
-                facecolor=FOOD_UNAVAILABLE_COLOR,
-                alpha=FOOD_UNAVAILABLE_ALPHA,
-                edgecolor="none",
-                label="Food unavailable",
             )
         )
     return handles
@@ -1163,6 +1179,12 @@ def get_point_event_style(event_name: str) -> tuple[str, float, str]:
     if normalized in SHED_EVENT_NAMES:
         return "^", SHED_MARKER_SIZE, SHED_COLOR
 
+    if normalized in J_HANG_EVENT_NAMES:
+        return J_HANG_MARKER, J_HANG_MARKER_SIZE, J_HANG_COLOR
+
+    if normalized in PUPATION_EVENT_NAMES:
+        return PUPATION_MARKER, PUPATION_MARKER_SIZE, PUPATION_COLOR
+
     if normalized in STIM_EVENT_NAMES:
         return "*", STIM_MARKER_SIZE, STIM_COLOR
 
@@ -1179,6 +1201,8 @@ def is_stimulation_event_name(event_name: str) -> bool:
 def event_bar_color(event: BehaviorEvent) -> str:
     if is_feeding_event(event):
         return FEEDING_COLOR
+    if is_food_unavailable_behavior_event(event):
+        return FOOD_UNAVAILABLE_COLOR
     style = behavior_event_style(event)
     if style is not None:
         return style[2]
@@ -1303,6 +1327,28 @@ def manual_annotation_legend_handles(events: Sequence[BehaviorEvent] | None = No
             Line2D(
                 [0],
                 [0],
+                marker=J_HANG_MARKER,
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=J_HANG_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="J-hang",
+            ),
+            Line2D(
+                [0],
+                [0],
+                marker=PUPATION_MARKER,
+                linestyle="None",
+                markersize=7.5,
+                markerfacecolor=PUPATION_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Pupation",
+            ),
+            Line2D(
+                [0],
+                [0],
                 linestyle="None",
                 label="\u26a1 Electrical stimulation",
                 color=STIM_COLOR,
@@ -1337,6 +1383,34 @@ def manual_annotation_legend_handles(events: Sequence[BehaviorEvent] | None = No
                 label="Shed / molt",
             )
         )
+    if any(behavior_event_terms(event) & J_HANG_EVENT_NAMES for event in events):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker=J_HANG_MARKER,
+                linestyle="None",
+                markersize=8,
+                markerfacecolor=J_HANG_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="J-hang",
+            )
+        )
+    if any(behavior_event_terms(event) & PUPATION_EVENT_NAMES for event in events):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker=PUPATION_MARKER,
+                linestyle="None",
+                markersize=7.5,
+                markerfacecolor=PUPATION_COLOR,
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label="Pupation",
+            )
+        )
     if any(is_stimulation_event(event) for event in events):
         handles.append(
             Line2D(
@@ -1364,6 +1438,23 @@ def manual_annotation_legend_handles(events: Sequence[BehaviorEvent] | None = No
     return handles
 
 
+def food_unavailable_legend_handle(
+    events: Sequence[BehaviorEvent],
+    global_events: Sequence[GlobalEvent],
+) -> Optional[Patch]:
+    has_behavior_food_unavailable = any(is_food_unavailable_behavior_event(event) for event in events)
+    has_global_food_unavailable = any(is_food_unavailable_global_event(event) for event in global_events)
+    if not has_behavior_food_unavailable and not has_global_food_unavailable:
+        return None
+    alpha = 0.74 if has_behavior_food_unavailable else FOOD_UNAVAILABLE_ALPHA
+    return Patch(
+        facecolor=FOOD_UNAVAILABLE_COLOR,
+        alpha=alpha,
+        edgecolor="none",
+        label="Food unavailable",
+    )
+
+
 def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
     if not any(is_feeding_event(event) for event in events):
         return []
@@ -1380,7 +1471,7 @@ def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
 def is_manual_interval_event(event: BehaviorEvent) -> bool:
     if event.is_point:
         return False
-    if is_feeding_event(event) or is_stimulation_event(event):
+    if is_feeding_event(event) or is_stimulation_event(event) or is_food_unavailable_behavior_event(event):
         return False
     return True
 
@@ -1391,12 +1482,16 @@ def timeline_legend_handles(
     motion_states: Sequence[MotionState],
     global_events: Sequence[GlobalEvent],
 ) -> list[Line2D | Patch]:
+    handle_map = timeline_legend_handle_map(
+        events=events,
+        motion_states=motion_states,
+        global_events=global_events,
+    )
     handles: list[Line2D | Patch] = []
-    if motion_states:
-        handles.extend(motion_legend_handles())
-    handles.extend(feeding_legend_handles(events))
-    handles.extend(global_annotation_legend_handles(list(global_events)))
-    handles.extend(manual_annotation_legend_handles(events))
+    for label in TIMELINE_LEGEND_ORDER:
+        handle = handle_map.get(label)
+        if handle is not None:
+            handles.append(handle)
     return handles
 
 
@@ -1406,14 +1501,20 @@ def timeline_legend_handle_map(
     motion_states: Sequence[MotionState],
     global_events: Sequence[GlobalEvent],
 ) -> dict[str, Line2D | Patch]:
-    return {
-        handle.get_label(): handle
-        for handle in timeline_legend_handles(
-            events=events,
-            motion_states=motion_states,
-            global_events=global_events,
-        )
-    }
+    handles: dict[str, Line2D | Patch] = {}
+    if motion_states:
+        for handle in motion_legend_handles():
+            handles[handle.get_label()] = handle
+    for handle in feeding_legend_handles(events):
+        handles[handle.get_label()] = handle
+    for handle in global_annotation_legend_handles(list(global_events)):
+        handles[handle.get_label()] = handle
+    food_unavailable_handle = food_unavailable_legend_handle(events, global_events)
+    if food_unavailable_handle is not None:
+        handles[food_unavailable_handle.get_label()] = food_unavailable_handle
+    for handle in manual_annotation_legend_handles(events):
+        handles[handle.get_label()] = handle
+    return handles
 
 
 def draw_timeline_legend(axis, legend_handle_map: dict[str, Line2D | Patch]) -> Optional[object]:

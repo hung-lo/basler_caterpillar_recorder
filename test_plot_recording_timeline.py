@@ -517,6 +517,24 @@ class TimelinePlotTests(unittest.TestCase):
                 ),
                 timeline.BehaviorEvent(
                     animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 2, 30),
+                    end_local=dt.datetime(2026, 8, 9, 15, 2, 31),
+                    event="J_hang",
+                    kind="status",
+                    notes="",
+                    is_point=True,
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 2, 45),
+                    end_local=dt.datetime(2026, 8, 9, 15, 2, 46),
+                    event="Pupation",
+                    kind="status",
+                    notes="",
+                    is_point=True,
+                ),
+                timeline.BehaviorEvent(
+                    animal_id="C01",
                     start_local=dt.datetime(2026, 8, 9, 15, 3, 0),
                     end_local=dt.datetime(2026, 8, 9, 15, 3, 1),
                     event="dead",
@@ -556,9 +574,11 @@ class TimelinePlotTests(unittest.TestCase):
                     )
 
             self.assertTrue(output_png.exists())
-            self.assertEqual(mock_scatter.call_count, 2)
+            self.assertEqual(mock_scatter.call_count, 4)
             scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
             self.assertIn("^", scatter_markers)
+            self.assertIn("v", scatter_markers)
+            self.assertIn("D", scatter_markers)
             self.assertIn("X", scatter_markers)
             self.assertNotIn("o", scatter_markers)
             self.assertTrue(any(call.args[2] == "\u26a1" for call in mock_text.call_args_list if len(call.args) >= 3))
@@ -803,6 +823,8 @@ class TimelinePlotTests(unittest.TestCase):
     def test_shed_and_molt_use_triangle_marker(self) -> None:
         self.assertEqual(timeline.get_point_event_style("shed")[0], "^")
         self.assertEqual(timeline.get_point_event_style("molt")[0], "^")
+        self.assertEqual(timeline.get_point_event_style("J_hang")[0], "v")
+        self.assertEqual(timeline.get_point_event_style("Pupation")[0], "D")
 
     def test_electrical_stimulation_is_recognized(self) -> None:
         self.assertTrue(timeline.is_stimulation_event_name("electrical_stimulation"))
@@ -813,6 +835,46 @@ class TimelinePlotTests(unittest.TestCase):
         marker, _size, _color = timeline.get_point_event_style("death")
 
         self.assertEqual(marker, "X")
+
+    def test_food_unavailable_behavior_interval_uses_dedicated_color_and_not_manual_interval(self) -> None:
+        event = timeline.BehaviorEvent(
+            animal_id="C01",
+            start_local=dt.datetime(2026, 8, 9, 15, 50, 0),
+            end_local=dt.datetime(2026, 8, 9, 15, 55, 0),
+            event="food_unavailable",
+            kind="event",
+            notes="behavior interval",
+        )
+
+        self.assertFalse(timeline.is_manual_interval_event(event))
+        self.assertEqual(timeline.event_bar_color(event), timeline.FOOD_UNAVAILABLE_COLOR)
+
+        legend_handle = timeline.food_unavailable_legend_handle([event], [])
+        self.assertIsNotNone(legend_handle)
+        self.assertEqual(legend_handle.get_alpha(), 0.74)
+
+        labels = [handle.get_label() for handle in timeline.timeline_legend_handles(
+            events=[event],
+            motion_states=[],
+            global_events=[],
+        )]
+
+        self.assertIn("Food unavailable", labels)
+        self.assertNotIn("Manual interval", labels)
+
+    def test_food_unavailable_global_event_uses_lighter_legend_alpha(self) -> None:
+        global_event = timeline.GlobalEvent(
+            start_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone.utc),
+            end_local=dt.datetime(2026, 8, 9, 15, 45, 0, tzinfo=dt.timezone.utc),
+            event="food_unavailable",
+            kind="event",
+            notes="global interval",
+        )
+
+        handle = timeline.food_unavailable_legend_handle([], [global_event])
+
+        self.assertIsNotNone(handle)
+        self.assertEqual(handle.get_alpha(), timeline.FOOD_UNAVAILABLE_ALPHA)
 
     def test_death_cutoffs_use_earliest_death_per_animal(self) -> None:
         events = [
@@ -882,6 +944,8 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertIn("Manual interval", labels)
         self.assertIn("Shed / molt", labels)
+        self.assertIn("J-hang", labels)
+        self.assertIn("Pupation", labels)
         self.assertIn("\u26a1 Electrical stimulation", labels)
         self.assertIn("Death", labels)
         self.assertNotIn("Duration / state", labels)
@@ -920,10 +984,36 @@ class TimelinePlotTests(unittest.TestCase):
             ),
             timeline.BehaviorEvent(
                 animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 50, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 55, 0),
+                event="food_unavailable",
+                kind="event",
+                notes="behavior interval",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
                 start_local=dt.datetime(2026, 8, 9, 16, 5, 0),
                 end_local=dt.datetime(2026, 8, 9, 16, 5, 1),
                 event="shed",
                 kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 6, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 6, 1),
+                event="J_hang",
+                kind="status",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 7, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 7, 1),
+                event="Pupation",
+                kind="status",
                 notes="",
                 is_point=True,
             ),
@@ -972,15 +1062,17 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
+                "Shed / molt",
+                "J-hang",
+                "Pupation",
+                "\u26a1 Electrical stimulation",
+                "Death",
+                "Automatic feeding bouts",
                 "Motion-derived immobile",
                 "Motion-derived mobile",
-                "Automatic feeding bouts",
                 "Low video quality",
                 "Food unavailable",
                 "Manual interval",
-                "Shed / molt",
-                "\u26a1 Electrical stimulation",
-                "Death",
             ],
         )
 
@@ -1139,9 +1231,19 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertNotIn("mode", legend_kwargs)
         self.assertEqual(
             legend_kwargs["labels"],
-            timeline.TIMELINE_LEGEND_ORDER,
+            [
+                "Shed / molt",
+                "\u26a1 Electrical stimulation",
+                "Death",
+                "Automatic feeding bouts",
+                "Motion-derived immobile",
+                "Motion-derived mobile",
+                "Low video quality",
+                "Food unavailable",
+                "Manual interval",
+            ],
         )
-        self.assertEqual(legend_kwargs["ncol"], len(timeline.TIMELINE_LEGEND_ORDER))
+        self.assertEqual(legend_kwargs["ncol"], 9)
         self.assertEqual(
             legend_kwargs["bbox_to_anchor"],
             (0.0, 0.52),
