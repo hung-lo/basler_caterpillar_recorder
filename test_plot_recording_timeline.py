@@ -37,6 +37,7 @@ class TimelinePlotTests(unittest.TestCase):
         motion_states: list[timeline.MotionState] | None = None,
         global_events: list[timeline.GlobalEvent] | None = None,
         animals: list[str] | None = None,
+        timezone: dt.tzinfo | None = None,
     ):
         captured: dict[str, object] = {}
 
@@ -51,7 +52,7 @@ class TimelinePlotTests(unittest.TestCase):
                     motion_states=motion_states or [],
                     animals=animals or timeline.ANIMAL_ORDER,
                     global_events=global_events or [],
-                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    timezone=timezone or dt.timezone(dt.timedelta(hours=-4)),
                     output_path=Path("ignored.png"),
                     annotate_clips=False,
                 )
@@ -983,6 +984,211 @@ class TimelinePlotTests(unittest.TestCase):
             ],
         )
 
+    def test_motion_alpha_constants_are_shared_between_bars_and_legend(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=2.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C02",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[],
+                motion_states=motion_states,
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        motion_alphas = sorted(
+            call.kwargs["alpha"]
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("alpha") in {timeline.MOTION_IMMOBILE_ALPHA, timeline.MOTION_MOBILE_ALPHA}
+        )
+        self.assertEqual(motion_alphas, [timeline.MOTION_IMMOBILE_ALPHA, timeline.MOTION_MOBILE_ALPHA])
+        self.assertLess(timeline.MOTION_IMMOBILE_ALPHA, timeline.MOTION_MOBILE_ALPHA)
+
+        legend_alphas = [handle.get_alpha() for handle in timeline.motion_legend_handles()]
+        self.assertEqual(legend_alphas, [timeline.MOTION_IMMOBILE_ALPHA, timeline.MOTION_MOBILE_ALPHA])
+
+    def test_legend_rows_use_fixed_anchors_without_expand_mode(self) -> None:
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=2.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C02",
+                clip_key="clip_1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+        ]
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 0),
+                event="feeding",
+                kind="event",
+                notes="",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 40, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+                event="observation",
+                kind="event",
+                notes="manual interval",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 5, 1),
+                event="shed",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 10, 1),
+                event="electrical_stimulation",
+                kind="stimulus",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 16, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 16, 20, 1),
+                event="dead",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+        ]
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0, tzinfo=dt.timezone.utc),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            ),
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 30, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 45, 0, tzinfo=dt.timezone.utc),
+                event="food_unavailable",
+                kind="event",
+                notes="",
+            ),
+        ]
+
+        with mock.patch("matplotlib.figure.Figure.savefig"):
+            with mock.patch("matplotlib.pyplot.close"):
+                with mock.patch("matplotlib.axes.Axes.legend") as mock_legend:
+                    timeline.plot_recording_timeline(
+                        clips=[],
+                        events=events,
+                        motion_states=motion_states,
+                        animals=timeline.ANIMAL_ORDER,
+                        global_events=global_events,
+                        timezone=dt.timezone(dt.timedelta(hours=-4)),
+                        output_path=Path("ignored.png"),
+                        annotate_clips=False,
+                    )
+
+        self.assertEqual(mock_legend.call_count, 3)
+        row_one_kwargs = mock_legend.call_args_list[0].kwargs
+        row_two_kwargs = mock_legend.call_args_list[1].kwargs
+        footer_kwargs = mock_legend.call_args_list[2].kwargs
+        self.assertNotIn("mode", row_one_kwargs)
+        self.assertNotIn("mode", row_two_kwargs)
+        self.assertNotIn("mode", footer_kwargs)
+        self.assertEqual(
+            row_one_kwargs["labels"],
+            [
+                "Shed / molt",
+                "\u26a1 Electrical stimulation",
+                "Death",
+                "Automatic feeding bouts",
+            ],
+        )
+        self.assertEqual(
+            row_two_kwargs["labels"],
+            [
+                "Motion-derived immobile",
+                "Motion-derived mobile",
+                "Low video quality",
+                "Food unavailable",
+            ],
+        )
+        self.assertEqual(footer_kwargs["labels"], ["Manual interval"])
+        self.assertEqual(
+            row_one_kwargs["bbox_to_anchor"],
+            (0.0, timeline.LEGEND_ROW_Y[0], 1.0, timeline.LEGEND_ROW_BOX_HEIGHT),
+        )
+        self.assertEqual(
+            row_two_kwargs["bbox_to_anchor"],
+            (0.0, timeline.LEGEND_ROW_Y[1], 1.0, timeline.LEGEND_ROW_BOX_HEIGHT),
+        )
+        self.assertEqual(
+            footer_kwargs["bbox_to_anchor"],
+            (0.0, timeline.LEGEND_FOOTER_Y, 1.0, 0.14),
+        )
+
+    def test_alternating_row_backgrounds_use_subtle_stripes(self) -> None:
+        axis = mock.Mock()
+
+        timeline.alternating_row_backgrounds(axis, 4)
+
+        self.assertEqual(
+            axis.axhspan.call_args_list,
+            [
+                mock.call(-0.5, 0.5, facecolor=timeline.ROW_BACKGROUND_COLOR, alpha=1.0, zorder=0.02),
+                mock.call(1.5, 2.5, facecolor=timeline.ROW_BACKGROUND_COLOR, alpha=1.0, zorder=0.02),
+            ],
+        )
+
     def test_video_quality_and_food_unavailable_global_styles_are_rendered(self) -> None:
         events = [
             timeline.GlobalEvent(
@@ -1033,6 +1239,82 @@ class TimelinePlotTests(unittest.TestCase):
                 None,
             ],
         )
+
+    def test_low_quality_label_is_placed_above_recording_band(self) -> None:
+        clips = [
+            timeline.RecordingClip(
+                clip_id="session_a/camera1",
+                timestamp_file=Path("camera1.timestamps.csv.gz"),
+                video_file=Path("camera1.mp4"),
+                camera_label="camera1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 30, 0, tzinfo=dt.timezone.utc),
+                duration_s=1800.0,
+                frames=9000,
+                timestamp_size_bytes=123,
+                timestamp_mtime_ns=456,
+            )
+        ]
+        global_events = [
+            timeline.GlobalEvent(
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0, tzinfo=dt.timezone.utc),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0, tzinfo=dt.timezone.utc),
+                event="video_quality_low",
+                kind="video_quality",
+                notes="",
+            )
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.text") as mock_text:
+            timeline.plot_recording_timeline(
+                clips=clips,
+                events=[],
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                global_events=global_events,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        label_calls = [
+            call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "Low video quality"
+        ]
+        self.assertEqual(len(label_calls), 1)
+        self.assertGreater(label_calls[0].args[1], 0.8)
+        self.assertIn("transform", label_calls[0].kwargs)
+
+    def test_plot_uses_clean_title_subtitle_and_timezone_axis_label(self) -> None:
+        clips = [
+            timeline.RecordingClip(
+                clip_id="session_a/camera1",
+                timestamp_file=Path("camera1.timestamps.csv.gz"),
+                video_file=Path("camera1.mp4"),
+                camera_label="camera1",
+                start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 30, 0, tzinfo=dt.timezone.utc),
+                duration_s=1800.0,
+                frames=9000,
+                timestamp_size_bytes=123,
+                timestamp_mtime_ns=456,
+            )
+        ]
+        fig = self.capture_timeline_figure(
+            clips=clips,
+            events=[],
+            motion_states=[],
+            global_events=[],
+            timezone=timeline.load_timezone("America/New_York"),
+        )
+
+        self.assertEqual(fig._suptitle.get_text(), "Continuous behavioral monitoring of monarch caterpillars")
+        subtitle_texts = [text.get_text() for text in fig.texts if text.get_text().startswith("Elapsed ")]
+        self.assertEqual(len(subtitle_texts), 1)
+        self.assertIn("recorded", subtitle_texts[0])
+        self.assertIn("coverage", subtitle_texts[0])
+        self.assertNotIn("Woods Hole local time", subtitle_texts[0])
+        self.assertIn("Local time - America/New_York", self.behavior_axis(fig).get_xlabel())
+        self.assertIn("EDT", self.behavior_axis(fig).get_xlabel())
 
     def test_subtract_intervals_no_overlap_returns_original_interval(self) -> None:
         start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
