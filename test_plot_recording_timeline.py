@@ -1034,7 +1034,7 @@ class TimelinePlotTests(unittest.TestCase):
         legend_alphas = [handle.get_alpha() for handle in timeline.motion_legend_handles()]
         self.assertEqual(legend_alphas, [timeline.MOTION_IMMOBILE_ALPHA, timeline.MOTION_MOBILE_ALPHA])
 
-    def test_legend_rows_use_fixed_anchors_without_expand_mode(self) -> None:
+    def test_draw_timeline_legend_uses_single_row_and_stable_order(self) -> None:
         motion_states = [
             timeline.MotionState(
                 animal_id="C01",
@@ -1123,58 +1123,39 @@ class TimelinePlotTests(unittest.TestCase):
             ),
         ]
 
-        with mock.patch("matplotlib.figure.Figure.savefig"):
-            with mock.patch("matplotlib.pyplot.close"):
-                with mock.patch("matplotlib.axes.Axes.legend") as mock_legend:
-                    timeline.plot_recording_timeline(
-                        clips=[],
-                        events=events,
-                        motion_states=motion_states,
-                        animals=timeline.ANIMAL_ORDER,
-                        global_events=global_events,
-                        timezone=dt.timezone(dt.timedelta(hours=-4)),
-                        output_path=Path("ignored.png"),
-                        annotate_clips=False,
-                    )
+        legend_handle_map = timeline.timeline_legend_handle_map(
+            events=events,
+            motion_states=motion_states,
+            global_events=global_events,
+        )
+        axis = mock.Mock()
 
-        self.assertEqual(mock_legend.call_count, 3)
-        row_one_kwargs = mock_legend.call_args_list[0].kwargs
-        row_two_kwargs = mock_legend.call_args_list[1].kwargs
-        footer_kwargs = mock_legend.call_args_list[2].kwargs
-        self.assertNotIn("mode", row_one_kwargs)
-        self.assertNotIn("mode", row_two_kwargs)
-        self.assertNotIn("mode", footer_kwargs)
+        legend = timeline.draw_timeline_legend(axis, legend_handle_map)
+
+        self.assertIsNotNone(legend)
+        axis.axis.assert_called_once_with("off")
+        axis.legend.assert_called_once()
+        legend_kwargs = axis.legend.call_args.kwargs
+        self.assertNotIn("mode", legend_kwargs)
         self.assertEqual(
-            row_one_kwargs["labels"],
-            [
-                "Shed / molt",
-                "\u26a1 Electrical stimulation",
-                "Death",
-                "Automatic feeding bouts",
-            ],
+            legend_kwargs["labels"],
+            timeline.TIMELINE_LEGEND_ORDER,
         )
+        self.assertEqual(legend_kwargs["ncol"], len(timeline.TIMELINE_LEGEND_ORDER))
         self.assertEqual(
-            row_two_kwargs["labels"],
-            [
-                "Motion-derived immobile",
-                "Motion-derived mobile",
-                "Low video quality",
-                "Food unavailable",
-            ],
+            legend_kwargs["bbox_to_anchor"],
+            (0.0, 0.52),
         )
-        self.assertEqual(footer_kwargs["labels"], ["Manual interval"])
-        self.assertEqual(
-            row_one_kwargs["bbox_to_anchor"],
-            (0.0, timeline.LEGEND_ROW_Y[0], 1.0, timeline.LEGEND_ROW_BOX_HEIGHT),
-        )
-        self.assertEqual(
-            row_two_kwargs["bbox_to_anchor"],
-            (0.0, timeline.LEGEND_ROW_Y[1], 1.0, timeline.LEGEND_ROW_BOX_HEIGHT),
-        )
-        self.assertEqual(
-            footer_kwargs["bbox_to_anchor"],
-            (0.0, timeline.LEGEND_FOOTER_Y, 1.0, 0.14),
-        )
+
+    def test_draw_timeline_legend_skips_missing_categories(self) -> None:
+        axis = mock.Mock()
+        legend = timeline.draw_timeline_legend(axis, {"Manual interval": timeline.manual_interval_legend_handle()})
+
+        self.assertIsNotNone(legend)
+        axis.axis.assert_called_once_with("off")
+        axis.legend.assert_called_once()
+        self.assertEqual(axis.legend.call_args.kwargs["labels"], ["Manual interval"])
+        self.assertEqual(axis.legend.call_args.kwargs["ncol"], 1)
 
     def test_alternating_row_backgrounds_use_subtle_stripes(self) -> None:
         axis = mock.Mock()

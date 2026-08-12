@@ -82,7 +82,7 @@ RECORDING_COLOR = "#4c78a8"
 GAP_SHADE_COLOR = "#fafafa"
 GAP_BOUNDARY_COLOR = "#d1d5db"
 ROW_SEPARATOR_COLOR = "#e5e7eb"
-ROW_BACKGROUND_COLOR = "#f7f7f7"
+ROW_BACKGROUND_COLOR = "#fbfbfc"
 MAJOR_GAP_MIN_SECONDS = 5 * 60
 MAX_MAJOR_GAP_LABELS = 6
 GOOGLE_SHEETS_HOST = "docs.google.com"
@@ -97,10 +97,17 @@ MIN_GLOBAL_EVENT_LABEL_SECONDS = 5 * 60
 FOOD_UNAVAILABLE_COLOR = "#FB7185"
 FOOD_UNAVAILABLE_ALPHA = 0.08
 
-LEGEND_COLUMN_X = [0.00, 0.31, 0.62, 0.86]
-LEGEND_ROW_Y = [0.68, 0.25]
-LEGEND_ROW_BOX_HEIGHT = 0.26
-LEGEND_FOOTER_Y = 0.02
+TIMELINE_LEGEND_ORDER = [
+    "Shed / molt",
+    "\u26a1 Electrical stimulation",
+    "Death",
+    "Automatic feeding bouts",
+    "Motion-derived immobile",
+    "Motion-derived mobile",
+    "Low video quality",
+    "Manual interval",
+    "Food unavailable",
+]
 
 SHED_EVENT_NAMES = {
     "shed",
@@ -1278,10 +1285,6 @@ def manual_interval_legend_handle() -> Patch:
     return Patch(facecolor=INTERVAL_BAR_COLOR, alpha=0.72, edgecolor="none", label="Manual interval")
 
 
-def blank_legend_handle() -> Patch:
-    return Patch(facecolor="none", edgecolor="none", alpha=0.0, label="")
-
-
 def manual_annotation_legend_handles(events: Sequence[BehaviorEvent] | None = None) -> list[Line2D | Patch]:
     if events is None:
         return [
@@ -1403,11 +1406,44 @@ def timeline_legend_handle_map(
     motion_states: Sequence[MotionState],
     global_events: Sequence[GlobalEvent],
 ) -> dict[str, Line2D | Patch]:
-    return {handle.get_label(): handle for handle in timeline_legend_handles(
-        events=events,
-        motion_states=motion_states,
-        global_events=global_events,
-    )}
+    return {
+        handle.get_label(): handle
+        for handle in timeline_legend_handles(
+            events=events,
+            motion_states=motion_states,
+            global_events=global_events,
+        )
+    }
+
+
+def draw_timeline_legend(axis, legend_handle_map: dict[str, Line2D | Patch]) -> Optional[object]:
+    handles: list[Line2D | Patch] = []
+    labels: list[str] = []
+    for label in TIMELINE_LEGEND_ORDER:
+        handle = legend_handle_map.get(label)
+        if handle is None:
+            continue
+        handles.append(handle)
+        labels.append(label)
+
+    axis.axis("off")
+    if not handles:
+        return None
+
+    return axis.legend(
+        handles=handles,
+        labels=labels,
+        loc="center left",
+        bbox_to_anchor=(0.0, 0.52),
+        frameon=False,
+        fontsize=8.0,
+        handlelength=1.25,
+        handletextpad=0.45,
+        columnspacing=1.05,
+        borderaxespad=0.0,
+        labelspacing=0.4,
+        ncol=len(handles),
+    )
 
 
 def alternating_row_backgrounds(axis, row_count: int) -> None:
@@ -1486,9 +1522,9 @@ def plot_recording_timeline(
     has_motion_plot = bool(motion_energy_samples)
     fig = plt.figure(figsize=(17, 10 if has_motion_plot else 9), constrained_layout=False)
     if has_motion_plot:
-        gs = fig.add_gridspec(4, 1, height_ratios=[0.86, 1.92, 0.72, 6.1], hspace=0.06)
+        gs = fig.add_gridspec(4, 1, height_ratios=[0.86, 1.92, 0.42, 6.1], hspace=0.08)
     else:
-        gs = fig.add_gridspec(3, 1, height_ratios=[0.86, 0.72, 6.1], hspace=0.04)
+        gs = fig.add_gridspec(3, 1, height_ratios=[0.86, 0.42, 6.1], hspace=0.08)
     ax_cov = fig.add_subplot(gs[0])
     ax_motion = fig.add_subplot(gs[1], sharex=ax_cov) if has_motion_plot else None
     ax_legend = fig.add_subplot(gs[2] if has_motion_plot else gs[1])
@@ -1585,14 +1621,15 @@ def plot_recording_timeline(
         ):
             ax_cov.text(
                 mdates.date2num(band_start + (band_end - band_start) / 2),
-                0.88,
+                0.86,
                 label,
                 transform=blended_transform_factory(ax_cov.transData, ax_cov.transAxes),
                 ha="center",
-                va="top",
-                fontsize=8,
+                va="bottom",
+                fontsize=7.5,
                 color="#92400e",
-                zorder=3,
+                zorder=4,
+                clip_on=True,
             )
 
     if clips:
@@ -1710,61 +1747,9 @@ def plot_recording_timeline(
         motion_states=motion_states,
         global_events=global_events,
     )
-    legend_rows = [
-        [
-            ("Shed / molt", legend_handle_map.get("Shed / molt")),
-            ("\u26a1 Electrical stimulation", legend_handle_map.get("\u26a1 Electrical stimulation")),
-            ("Death", legend_handle_map.get("Death")),
-            ("Automatic feeding bouts", legend_handle_map.get("Automatic feeding bouts")),
-        ],
-        [
-            ("Motion-derived immobile", legend_handle_map.get("Motion-derived immobile")),
-            ("Motion-derived mobile", legend_handle_map.get("Motion-derived mobile")),
-            ("Low video quality", legend_handle_map.get("Low video quality")),
-            ("Food unavailable", legend_handle_map.get("Food unavailable")),
-        ],
-    ]
-    legend_row_boxes = [
-        (0.0, LEGEND_ROW_Y[0], 1.0, LEGEND_ROW_BOX_HEIGHT),
-        (0.0, LEGEND_ROW_Y[1], 1.0, LEGEND_ROW_BOX_HEIGHT),
-    ]
-    for row_items, bbox in zip(legend_rows, legend_row_boxes):
-        if not any(handle is not None for _label, handle in row_items):
-            continue
-        row_handles = [handle if handle is not None else blank_legend_handle() for _label, handle in row_items]
-        row_labels = [label if handle is not None else "" for label, handle in row_items]
-        row_legend = ax_legend.legend(
-            handles=row_handles,
-            labels=row_labels,
-            loc="upper left",
-            bbox_to_anchor=bbox,
-            frameon=False,
-            fontsize=8,
-            handlelength=1.3,
-            handletextpad=0.5,
-            columnspacing=1.2,
-            borderaxespad=0.0,
-            ncol=4,
-        )
-        ax_legend.add_artist(row_legend)
-    manual_interval_handle = legend_handle_map.get("Manual interval")
-    if manual_interval_handle is not None:
-        footer_legend = ax_legend.legend(
-            handles=[manual_interval_handle],
-            labels=["Manual interval"],
-            loc="upper left",
-            bbox_to_anchor=(0.0, LEGEND_FOOTER_Y, 1.0, 0.14),
-            frameon=False,
-            fontsize=7.6,
-            handlelength=1.3,
-            handletextpad=0.5,
-            columnspacing=1.2,
-            borderaxespad=0.0,
-            ncol=1,
-        )
-        ax_legend.add_artist(footer_legend)
+    draw_timeline_legend(ax_legend, legend_handle_map)
 
-    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=10)
+    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=5)
     ax_beh.set_yticks(range(len(behavior_rows)))
     ax_beh.set_yticklabels(behavior_rows)
     ax_beh.set_ylabel("Animal")
