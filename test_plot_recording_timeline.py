@@ -876,6 +876,90 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertIsNotNone(handle)
         self.assertEqual(handle.get_alpha(), timeline.FOOD_UNAVAILABLE_ALPHA)
 
+    def test_low_mobility_interval_is_hidden_and_not_manual_interval(self) -> None:
+        low_mobility_event = timeline.BehaviorEvent(
+            animal_id="C03",
+            start_local=dt.datetime(2026, 8, 9, 15, 40, 0),
+            end_local=dt.datetime(2026, 8, 9, 16, 0, 0),
+            event="low_mobility",
+            kind="event",
+            notes="manual low mobility",
+        )
+        manual_interval_event = timeline.BehaviorEvent(
+            animal_id="C03",
+            start_local=dt.datetime(2026, 8, 9, 16, 10, 0),
+            end_local=dt.datetime(2026, 8, 9, 16, 30, 0),
+            event="observation",
+            kind="event",
+            notes="manual interval",
+        )
+
+        self.assertTrue(timeline.is_low_mobility_event(low_mobility_event))
+        self.assertFalse(timeline.is_manual_interval_event(low_mobility_event))
+        self.assertFalse(timeline.behavior_event_is_visible(low_mobility_event))
+        self.assertTrue(timeline.is_manual_interval_event(manual_interval_event))
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            timeline.plot_recording_timeline(
+                clips=[],
+                events=[low_mobility_event, manual_interval_event],
+                motion_states=[],
+                animals=timeline.ANIMAL_ORDER,
+                timezone=dt.timezone(dt.timedelta(hours=-4)),
+                output_path=Path("ignored.png"),
+                annotate_clips=False,
+            )
+
+        self.assertEqual(mock_broken_barh.call_count, 1)
+        self.assertEqual(mock_broken_barh.call_args.kwargs["facecolors"], timeline.INTERVAL_BAR_COLOR)
+
+    def test_display_time_bounds_adds_small_symmetric_padding(self) -> None:
+        plot_start = dt.datetime(2026, 8, 9, 15, 0, 0)
+        plot_end = dt.datetime(2026, 8, 9, 15, 30, 0)
+
+        display_start, display_end = timeline.display_time_bounds(plot_start, plot_end)
+
+        self.assertLess(display_start, plot_start)
+        self.assertGreater(display_end, plot_end)
+        self.assertGreaterEqual(display_end - plot_end, dt.timedelta(minutes=10))
+        self.assertGreaterEqual(plot_start - display_start, dt.timedelta(minutes=10))
+
+        fig = self.capture_timeline_figure(
+            clips=[
+                timeline.RecordingClip(
+                    clip_id="session_a/camera1",
+                    timestamp_file=Path("camera1.timestamps.csv.gz"),
+                    video_file=Path("camera1.mp4"),
+                    camera_label="camera1",
+                    start_utc=dt.datetime(2026, 8, 9, 19, 0, 0, tzinfo=dt.timezone.utc),
+                    end_utc=dt.datetime(2026, 8, 9, 19, 30, 0, tzinfo=dt.timezone.utc),
+                    duration_s=1800.0,
+                    frames=9000,
+                    timestamp_size_bytes=123,
+                    timestamp_mtime_ns=456,
+                )
+            ],
+            events=[
+                timeline.BehaviorEvent(
+                    animal_id="C01",
+                    start_local=dt.datetime(2026, 8, 9, 15, 30, 0),
+                    end_local=dt.datetime(2026, 8, 9, 15, 30, 1),
+                    event="Pupation",
+                    kind="status",
+                    notes="",
+                    is_point=True,
+                )
+            ],
+        )
+
+        coverage_xlim = fig.axes[0].get_xlim()
+        behavior_xlim = fig.axes[-1].get_xlim()
+        self.assertEqual(coverage_xlim, behavior_xlim)
+        scientific_start = timeline.mdates.date2num(plot_start)
+        scientific_end = timeline.mdates.date2num(plot_end)
+        self.assertLess(coverage_xlim[0], scientific_start)
+        self.assertGreater(coverage_xlim[1], scientific_end)
+
     def test_death_cutoffs_use_earliest_death_per_animal(self) -> None:
         events = [
             timeline.BehaviorEvent(
@@ -1564,8 +1648,12 @@ class TimelinePlotTests(unittest.TestCase):
         ax_beh = self.behavior_axis(fig)
 
         xmin, xmax = ax_beh.get_xlim()
-        self.assertAlmostEqual(xmin, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 0, 0)))
-        self.assertAlmostEqual(xmax, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 10, 0)))
+        expected_xmin, expected_xmax = timeline.display_time_bounds(
+            dt.datetime(2026, 8, 9, 15, 0, 0),
+            dt.datetime(2026, 8, 9, 15, 10, 0),
+        )
+        self.assertAlmostEqual(xmin, timeline.mdates.date2num(expected_xmin))
+        self.assertAlmostEqual(xmax, timeline.mdates.date2num(expected_xmax))
 
     def test_manual_markers_survive_global_quality_spans(self) -> None:
         global_events = [

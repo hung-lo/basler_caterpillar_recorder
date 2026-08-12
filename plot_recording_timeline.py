@@ -137,6 +137,9 @@ J_HANG_EVENT_NAMES = {
 PUPATION_EVENT_NAMES = {
     "pupation",
 }
+LOW_MOBILITY_EVENT_NAMES = {
+    "low_mobility",
+}
 VIDEO_QUALITY_GLOBAL_EVENT_NAMES = {
     "video_quality_low",
     "poor_video_quality",
@@ -1015,7 +1018,13 @@ def is_food_unavailable_behavior_event(event: BehaviorEvent) -> bool:
     return bool(behavior_event_terms(event) & FOOD_UNAVAILABLE_EVENT_NAMES)
 
 
+def is_low_mobility_event(event: BehaviorEvent) -> bool:
+    return bool(behavior_event_terms(event) & LOW_MOBILITY_EVENT_NAMES)
+
+
 def behavior_event_is_visible(event: BehaviorEvent) -> bool:
+    if is_low_mobility_event(event):
+        return False
     return not event.is_point or is_supported_behavior_point_event(event)
 
 
@@ -1471,9 +1480,23 @@ def feeding_legend_handles(events: Sequence[BehaviorEvent]) -> list[Patch]:
 def is_manual_interval_event(event: BehaviorEvent) -> bool:
     if event.is_point:
         return False
-    if is_feeding_event(event) or is_stimulation_event(event) or is_food_unavailable_behavior_event(event):
+    if (
+        is_feeding_event(event)
+        or is_stimulation_event(event)
+        or is_food_unavailable_behavior_event(event)
+        or is_low_mobility_event(event)
+    ):
         return False
     return True
+
+
+def display_time_bounds(
+    plot_start: dt.datetime,
+    plot_end: dt.datetime,
+) -> tuple[dt.datetime, dt.datetime]:
+    plot_span = plot_end - plot_start
+    display_pad = max(dt.timedelta(minutes=10), plot_span * 0.003)
+    return plot_start - display_pad, plot_end + display_pad
 
 
 def timeline_legend_handles(
@@ -1693,7 +1716,8 @@ def plot_recording_timeline(
         x_max = max(plot_ends)
         if x_max <= x_min:
             x_max = x_min + dt.timedelta(minutes=1)
-        ax_cov.set_xlim(x_min, x_max)
+        display_x_min, display_x_max = display_time_bounds(x_min, x_max)
+        ax_cov.set_xlim(display_x_min, display_x_max)
 
     major_gaps = find_major_recording_gaps(clips)
     video_quality_masks_utc = video_quality_mask_intervals_utc(global_events)
@@ -1933,6 +1957,8 @@ def plot_recording_timeline(
                 if event.start_local >= death_cutoff_local:
                     continue
         y = behavior_index[event.animal_id]
+        if not behavior_event_is_visible(event):
+            continue
         event_end_local = event.end_local
         if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
             event_end_local = death_cutoff_local
