@@ -1021,6 +1021,7 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(mock_broken_barh.call_args.kwargs["facecolors"], timeline.INTERVAL_BAR_COLOR)
 
     def test_display_time_bounds_adds_small_symmetric_padding(self) -> None:
+        self.assertEqual(timeline.DISPLAY_X_PADDING_FRACTION, 0.005)
         plot_start = dt.datetime(2026, 8, 9, 15, 0, 0)
         plot_end = dt.datetime(2026, 8, 9, 15, 30, 0)
 

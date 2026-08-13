@@ -171,6 +171,7 @@ PUPATION_MARKER = "D"
 J_HANG_MARKER_SIZE = SHED_MARKER_SIZE
 PUPATION_MARKER_SIZE = SHED_MARKER_SIZE
 ANIMAL_ID_SORT_RE = re.compile(r"^(.*?)(\d+)$")
+DISPLAY_X_PADDING_FRACTION = 0.005
 RECORDING_COVERAGE_FIELDNAMES = [
     "clip_id",
     "timestamp_file",
@@ -1599,7 +1600,7 @@ def display_time_bounds(
     plot_end: dt.datetime,
 ) -> tuple[dt.datetime, dt.datetime]:
     plot_span = plot_end - plot_start
-    display_pad = max(dt.timedelta(minutes=10), plot_span * 0.003)
+    display_pad = max(dt.timedelta(minutes=10), plot_span * DISPLAY_X_PADDING_FRACTION)
     return plot_start - display_pad, plot_end + display_pad
 
 
