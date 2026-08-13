@@ -35,6 +35,7 @@ class TimelinePlotTests(unittest.TestCase):
         clips: list[timeline.RecordingClip],
         events: list[timeline.BehaviorEvent],
         motion_states: list[timeline.MotionState] | None = None,
+        motion_energy_samples: list[timeline.MotionEnergySample] | None = None,
         global_events: list[timeline.GlobalEvent] | None = None,
         animals: list[str] | None = None,
         timezone: dt.tzinfo | None = None,
@@ -52,6 +53,7 @@ class TimelinePlotTests(unittest.TestCase):
                     motion_states=motion_states or [],
                     animals=animals or timeline.ANIMAL_ORDER,
                     global_events=global_events or [],
+                    motion_energy_samples=motion_energy_samples or [],
                     timezone=timezone or dt.timezone(dt.timedelta(hours=-4)),
                     output_path=Path("ignored.png"),
                     annotate_clips=False,
@@ -516,7 +518,7 @@ class TimelinePlotTests(unittest.TestCase):
                     is_point=True,
                 ),
                 timeline.BehaviorEvent(
-                    animal_id="C01",
+                    animal_id="C02",
                     start_local=dt.datetime(2026, 8, 9, 15, 2, 30),
                     end_local=dt.datetime(2026, 8, 9, 15, 2, 31),
                     event="J_hang",
@@ -525,7 +527,7 @@ class TimelinePlotTests(unittest.TestCase):
                     is_point=True,
                 ),
                 timeline.BehaviorEvent(
-                    animal_id="C01",
+                    animal_id="C03",
                     start_local=dt.datetime(2026, 8, 9, 15, 2, 45),
                     end_local=dt.datetime(2026, 8, 9, 15, 2, 46),
                     event="Pupation",
@@ -534,7 +536,7 @@ class TimelinePlotTests(unittest.TestCase):
                     is_point=True,
                 ),
                 timeline.BehaviorEvent(
-                    animal_id="C01",
+                    animal_id="C04",
                     start_local=dt.datetime(2026, 8, 9, 15, 3, 0),
                     end_local=dt.datetime(2026, 8, 9, 15, 3, 1),
                     event="dead",
@@ -1987,6 +1989,184 @@ class TimelinePlotTests(unittest.TestCase):
         expected_width = 10 * 60 / 86400.0
         self.assertAlmostEqual(rendered_left, expected_left)
         self.assertAlmostEqual(rendered_width, expected_width)
+
+    def test_terminal_activity_cutoff_prefers_earliest_terminal_event(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 10, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 1),
+                event="Pupation",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 30, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 30, 1),
+                event="death",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C02",
+                start_local=dt.datetime(2026, 8, 9, 15, 12, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 12, 1),
+                event="Pupation",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C03",
+                start_local=dt.datetime(2026, 8, 9, 15, 25, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 25, 1),
+                event="death",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+        ]
+
+        cutoffs = timeline.terminal_activity_cutoff_by_animal(events)
+
+        self.assertEqual(cutoffs["C01"], dt.datetime(2026, 8, 9, 15, 10, 0))
+        self.assertEqual(cutoffs["C02"], dt.datetime(2026, 8, 9, 15, 12, 0))
+        self.assertEqual(cutoffs["C03"], dt.datetime(2026, 8, 9, 15, 25, 0))
+        self.assertNotIn("C04", cutoffs)
+
+    def test_terminal_activity_cutoff_clips_derived_layers_and_keeps_marker(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 0, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 14, 58, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 2, 0),
+                event="feeding",
+                kind="event",
+                notes="before cutoff",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 5, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                event="feeding",
+                kind="event",
+                notes="after cutoff",
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 6, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                event="observation",
+                kind="event",
+                notes="manual after cutoff",
+            ),
+        ]
+        motion_states = [
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_a",
+                start_utc=dt.datetime(2026, 8, 9, 18, 55, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                state="mobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=5.0,
+                peak_motion_energy=7.0,
+                n_windows=300,
+            ),
+            timeline.MotionState(
+                animal_id="C01",
+                clip_key="clip_b",
+                start_utc=dt.datetime(2026, 8, 9, 19, 5, 0, tzinfo=dt.timezone.utc),
+                end_utc=dt.datetime(2026, 8, 9, 19, 15, 0, tzinfo=dt.timezone.utc),
+                state="immobile",
+                threshold=4.0,
+                threshold_source="manual",
+                mean_motion_energy=1.0,
+                peak_motion_energy=1.5,
+                n_windows=300,
+            ),
+        ]
+        motion_energy_samples = [
+            timeline.MotionEnergySample(
+                animal_id="C01",
+                clip_key="clip_a",
+                timestamp_utc=dt.datetime(2026, 8, 9, 18, 59, 0, tzinfo=dt.timezone.utc),
+                motion_energy=5.0,
+            ),
+            timeline.MotionEnergySample(
+                animal_id="C01",
+                clip_key="clip_a",
+                timestamp_utc=dt.datetime(2026, 8, 9, 20, 0, 0, tzinfo=dt.timezone.utc),
+                motion_energy=50.0,
+            ),
+        ]
+
+        with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+            with mock.patch("matplotlib.axes.Axes.scatter") as mock_scatter:
+                fig = self.capture_timeline_figure(
+                    clips=[],
+                    events=events,
+                    motion_states=motion_states,
+                    motion_energy_samples=motion_energy_samples,
+                    global_events=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                )
+
+        motion_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") in {timeline.MOTION_MOBILE_COLOR, timeline.MOTION_IMMOBILE_COLOR}
+        ]
+        self.assertEqual(len(motion_calls), 1)
+        motion_segments = motion_calls[0].args[0]
+        self.assertEqual(len(motion_segments), 1)
+        rendered_left, rendered_width = motion_segments[0]
+        self.assertAlmostEqual(rendered_left, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 55, 0)))
+        self.assertAlmostEqual(rendered_width, 5 * 60 / 86400.0)
+
+        feeding_calls = [call for call in mock_broken_barh.call_args_list if call.kwargs.get("facecolors") == timeline.FEEDING_COLOR]
+        self.assertEqual(len(feeding_calls), 1)
+        feeding_segments = feeding_calls[0].args[0]
+        self.assertEqual(len(feeding_segments), 1)
+        feeding_left, feeding_width = feeding_segments[0]
+        self.assertAlmostEqual(feeding_left, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 14, 58, 0)))
+        self.assertAlmostEqual(feeding_width, 2 * 60 / 86400.0)
+
+        scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
+        self.assertIn("v", scatter_markers)
+        self.assertNotIn("D", scatter_markers)
+        self.assertNotIn("X", scatter_markers)
+        self.assertTrue(fig.axes)
+        ax_motion = fig.axes[1]
+        line_xmax = max(
+            timeline.mdates.date2num(max(line.get_xdata()))
+            for line in ax_motion.get_lines()
+            if len(line.get_xdata()) > 0
+        )
+        self.assertLessEqual(line_xmax, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 0, 0)))
 
     def test_events_after_death_are_not_plotted_but_death_marker_is_kept(self) -> None:
         events = [

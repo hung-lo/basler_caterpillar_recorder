@@ -1095,6 +1095,8 @@ def timeline_bounds_utc(
     events: list[BehaviorEvent],
     motion_states: list[MotionState],
     global_events: list[GlobalEvent],
+    timezone: dt.tzinfo,
+    terminal_cutoffs_local: Optional[dict[str, dt.datetime]] = None,
 ) -> Optional[tuple[dt.datetime, dt.datetime]]:
     starts_utc: list[dt.datetime] = []
     ends_utc: list[dt.datetime] = []
@@ -1104,14 +1106,33 @@ def timeline_bounds_utc(
     for event in events:
         if not behavior_event_is_visible(event):
             continue
+        terminal_cutoff_local = terminal_cutoffs_local.get(event.animal_id) if terminal_cutoffs_local else None
+        if terminal_cutoff_local is not None:
+            terms = behavior_event_terms(event)
+            is_terminal_activity = bool(terms & (J_HANG_EVENT_NAMES | PUPATION_EVENT_NAMES | DEATH_EVENT_NAMES))
+            if is_terminal_activity:
+                if event.start_local != terminal_cutoff_local:
+                    continue
+            elif event.start_local >= terminal_cutoff_local:
+                continue
         starts_utc.append(event.start_local.astimezone(UTC))
         if event.is_point:
             ends_utc.append(event.start_local.astimezone(UTC))
         else:
             ends_utc.append(event.end_local.astimezone(UTC))
     for state in motion_states:
+        terminal_cutoff_local = terminal_cutoffs_local.get(state.animal_id) if terminal_cutoffs_local else None
+        if terminal_cutoff_local is not None:
+            if terminal_cutoff_local.tzinfo is None:
+                terminal_cutoff_local = terminal_cutoff_local.replace(tzinfo=timezone)
+            terminal_cutoff_utc = terminal_cutoff_local.astimezone(UTC)
+            if state.start_utc >= terminal_cutoff_utc:
+                continue
+            state_end_utc = min(state.end_utc, terminal_cutoff_utc)
+        else:
+            state_end_utc = state.end_utc
         starts_utc.append(state.start_utc)
-        ends_utc.append(state.end_utc)
+        ends_utc.append(state_end_utc)
     for event in global_events:
         style = rendered_global_event_style(event)
         if style is None:
@@ -1230,6 +1251,18 @@ def death_cutoffs_local(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetim
     cutoffs: dict[str, dt.datetime] = {}
     for event in events:
         if not is_death_event(event):
+            continue
+        cutoff = cutoffs.get(event.animal_id)
+        if cutoff is None or event.start_local < cutoff:
+            cutoffs[event.animal_id] = event.start_local
+    return cutoffs
+
+
+def terminal_activity_cutoff_by_animal(events: Iterable[BehaviorEvent]) -> dict[str, dt.datetime]:
+    cutoffs: dict[str, dt.datetime] = {}
+    for event in events:
+        terms = behavior_event_terms(event)
+        if not (terms & (J_HANG_EVENT_NAMES | PUPATION_EVENT_NAMES | DEATH_EVENT_NAMES)):
             continue
         cutoff = cutoffs.get(event.animal_id)
         if cutoff is None or event.start_local < cutoff:
@@ -1613,8 +1646,34 @@ def plot_recording_timeline(
             timing_sections.append((label, perf_counter() - started_at))
 
     prep_start = perf_counter() if timing_enabled else 0.0
+    terminal_cutoffs_local = terminal_activity_cutoff_by_animal(events)
+    terminal_cutoffs_utc: dict[str, dt.datetime] = {}
+    for animal_id, cutoff_local in terminal_cutoffs_local.items():
+        if cutoff_local.tzinfo is None:
+            cutoff_local = cutoff_local.replace(tzinfo=timezone)
+        terminal_cutoffs_utc[animal_id] = cutoff_local.astimezone(UTC)
 
-    bounds = timeline_bounds_utc(clips, events, motion_states, global_events)
+    behavior_rows = list(ANIMAL_ORDER)
+    behavior_index = {animal: index for index, animal in enumerate(behavior_rows)}
+
+    motion_energy_samples_for_plot = [
+        sample
+        for sample in motion_energy_samples
+        if sample.animal_id in behavior_index
+        and (
+            sample.animal_id not in terminal_cutoffs_utc
+            or sample.timestamp_utc < terminal_cutoffs_utc[sample.animal_id]
+        )
+    ]
+
+    bounds = timeline_bounds_utc(
+        clips,
+        events,
+        motion_states,
+        global_events,
+        timezone,
+        terminal_cutoffs_local,
+    )
     if clips:
         first_utc = min(clip.start_utc for clip in clips)
         last_utc = max(clip.end_utc for clip in clips)
@@ -1631,9 +1690,6 @@ def plot_recording_timeline(
         recorded_duration_s = 0.0
         elapsed_duration_s = 0.0
         recorded_fraction = 0.0
-
-    behavior_rows = list(ANIMAL_ORDER)
-    behavior_index = {animal: index for index, animal in enumerate(behavior_rows)}
     unknown_animals = sorted(
         {
             *(event.animal_id for event in events if event.animal_id not in behavior_index),
@@ -1643,7 +1699,7 @@ def plot_recording_timeline(
     for animal_id in unknown_animals:
         LOG.warning("Skipping timeline row for unknown animal ID: %s", animal_id)
 
-    has_motion_plot = bool(motion_energy_samples)
+    has_motion_plot = bool(motion_energy_samples_for_plot)
     fig = plt.figure(figsize=(17, 10 if has_motion_plot else 9), constrained_layout=False)
     if has_motion_plot:
         gs = fig.add_gridspec(4, 1, height_ratios=[0.86, 1.92, 0.42, 6.1], hspace=0.08)
@@ -1703,7 +1759,7 @@ def plot_recording_timeline(
         if rendered_global_event_style(event) is not None:
             plot_starts.append(event.start_local.replace(tzinfo=None))
             plot_ends.append(event.end_local.replace(tzinfo=None))
-    for sample in motion_energy_samples:
+    for sample in motion_energy_samples_for_plot:
         if sample.animal_id in behavior_index:
             sample_local = to_plot_local(sample.timestamp_utc, timezone)
             plot_starts.append(sample_local)
@@ -1819,7 +1875,7 @@ def plot_recording_timeline(
 
     if ax_motion is not None:
         aggregated_motion = aggregate_motion_energy_samples(
-            motion_energy_samples,
+            motion_energy_samples_for_plot,
             bin_minutes=motion_plot_bin_minutes,
             stat=motion_plot_stat,
         )
@@ -1900,9 +1956,16 @@ def plot_recording_timeline(
     for state in motion_states:
         if state.animal_id not in behavior_index:
             continue
-        death_cutoff_local = death_cutoffs.get(state.animal_id)
+        terminal_cutoff_utc = terminal_cutoffs_utc.get(state.animal_id)
         state_start_utc = state.start_utc
         state_end_utc = state.end_utc
+        if terminal_cutoff_utc is not None:
+            if state_start_utc >= terminal_cutoff_utc:
+                suppressed_motion_spans += 1
+                continue
+            if state_end_utc > terminal_cutoff_utc:
+                state_end_utc = terminal_cutoff_utc
+        death_cutoff_local = death_cutoffs.get(state.animal_id)
         if death_cutoff_local is not None:
             if death_cutoff_local.tzinfo is None:
                 death_cutoff_local = death_cutoff_local.replace(tzinfo=timezone)
@@ -1948,18 +2011,24 @@ def plot_recording_timeline(
     for event in events:
         if event.animal_id not in behavior_index:
             continue
-        death_cutoff_local = death_cutoffs.get(event.animal_id)
-        if death_cutoff_local is not None:
-            if is_death_event(event):
-                if event.start_local != death_cutoff_local:
+        terminal_cutoff_local = terminal_cutoffs_local.get(event.animal_id)
+        if terminal_cutoff_local is not None:
+            terms = behavior_event_terms(event)
+            is_terminal_activity = bool(terms & (J_HANG_EVENT_NAMES | PUPATION_EVENT_NAMES | DEATH_EVENT_NAMES))
+            if is_terminal_activity:
+                if event.start_local != terminal_cutoff_local:
                     continue
-            else:
-                if event.start_local >= death_cutoff_local:
-                    continue
+            elif event.start_local >= terminal_cutoff_local:
+                continue
         y = behavior_index[event.animal_id]
         if not behavior_event_is_visible(event):
             continue
         event_end_local = event.end_local
+        if terminal_cutoff_local is not None and not (
+            behavior_event_terms(event) & (J_HANG_EVENT_NAMES | PUPATION_EVENT_NAMES | DEATH_EVENT_NAMES)
+        ) and event_end_local > terminal_cutoff_local:
+            event_end_local = terminal_cutoff_local
+        death_cutoff_local = death_cutoffs.get(event.animal_id)
         if death_cutoff_local is not None and not is_death_event(event) and event_end_local > death_cutoff_local:
             event_end_local = death_cutoff_local
         duration_s = max((event_end_local - event.start_local).total_seconds(), 0.0)
