@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import sys
 from pathlib import Path
@@ -169,6 +170,7 @@ J_HANG_MARKER = "v"
 PUPATION_MARKER = "D"
 J_HANG_MARKER_SIZE = SHED_MARKER_SIZE
 PUPATION_MARKER_SIZE = SHED_MARKER_SIZE
+ANIMAL_ID_SORT_RE = re.compile(r"^(.*?)(\d+)$")
 RECORDING_COVERAGE_FIELDNAMES = [
     "clip_id",
     "timestamp_file",
@@ -1290,6 +1292,55 @@ def terminal_activity_cutoff_by_animal(events: Iterable[BehaviorEvent]) -> dict[
     return cutoffs
 
 
+def sort_datetime_for_timeline(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def animal_natural_sort_key(animal_id: str) -> tuple[str, int, str]:
+    match = ANIMAL_ID_SORT_RE.match(animal_id.strip())
+    if match is None:
+        normalized = animal_id.strip().lower()
+        return normalized, -1, normalized
+    prefix, digits = match.groups()
+    normalized_prefix = prefix.lower()
+    return normalized_prefix, int(digits), animal_id.strip().lower()
+
+
+def ordered_animals_for_timeline(animals: Sequence[str], events: Sequence[BehaviorEvent]) -> list[str]:
+    pupation_times: dict[str, dt.datetime] = {}
+    j_hang_times: dict[str, dt.datetime] = {}
+    death_times: dict[str, dt.datetime] = {}
+
+    for event in events:
+        event_time = sort_datetime_for_timeline(event.start_local)
+        terms = behavior_event_terms(event)
+        if terms & PUPATION_EVENT_NAMES:
+            cutoff = pupation_times.get(event.animal_id)
+            if cutoff is None or event_time < cutoff:
+                pupation_times[event.animal_id] = event_time
+        if terms & J_HANG_EVENT_NAMES:
+            cutoff = j_hang_times.get(event.animal_id)
+            if cutoff is None or event_time < cutoff:
+                j_hang_times[event.animal_id] = event_time
+        if terms & DEATH_EVENT_NAMES:
+            cutoff = death_times.get(event.animal_id)
+            if cutoff is None or event_time < cutoff:
+                death_times[event.animal_id] = event_time
+
+    def group_sort_key(animal_id: str) -> tuple[int, dt.datetime, tuple[str, int, str]]:
+        developmental_time = pupation_times.get(animal_id) or j_hang_times.get(animal_id)
+        death_time = death_times.get(animal_id)
+        if developmental_time is not None and (death_time is None or developmental_time < death_time):
+            return 0, developmental_time, animal_natural_sort_key(animal_id)
+        if death_time is None:
+            return 1, dt.datetime.max.replace(tzinfo=None), animal_natural_sort_key(animal_id)
+        return 2, death_time, animal_natural_sort_key(animal_id)
+
+    return sorted(dict.fromkeys(animals), key=group_sort_key)
+
+
 def load_motion_energy_samples(path: Optional[Path]) -> list[MotionEnergySample]:
     if path is None or not path.exists():
         return []
@@ -1673,7 +1724,7 @@ def plot_recording_timeline(
             cutoff_local = cutoff_local.replace(tzinfo=timezone)
         terminal_cutoffs_utc[animal_id] = cutoff_local.astimezone(UTC)
 
-    behavior_rows = list(ANIMAL_ORDER)
+    behavior_rows = ordered_animals_for_timeline(animals, events)
     behavior_index = {animal: index for index, animal in enumerate(behavior_rows)}
 
     motion_energy_samples_for_plot = [
@@ -1769,12 +1820,25 @@ def plot_recording_timeline(
         if event.animal_id in behavior_index and behavior_event_is_visible(event):
             start_local = event.start_local.replace(tzinfo=None)
             end_local = start_local if event.is_point else event.end_local.replace(tzinfo=None)
+            if is_feeding_event(event) and not event.is_point:
+                terminal_cutoff_local = terminal_cutoffs_local.get(event.animal_id)
+                if terminal_cutoff_local is not None:
+                    if event.start_local >= terminal_cutoff_local:
+                        continue
+                    end_local = min(end_local, terminal_cutoff_local.replace(tzinfo=None))
             plot_starts.append(start_local)
             plot_ends.append(end_local)
     for state in motion_states:
         if state.animal_id in behavior_index:
-            plot_starts.append(to_plot_local(state.start_utc, timezone))
-            plot_ends.append(to_plot_local(state.end_utc, timezone))
+            terminal_cutoff_utc = terminal_cutoffs_utc.get(state.animal_id)
+            state_start_utc = state.start_utc
+            state_end_utc = state.end_utc
+            if terminal_cutoff_utc is not None:
+                if state_start_utc >= terminal_cutoff_utc:
+                    continue
+                state_end_utc = min(state_end_utc, terminal_cutoff_utc)
+            plot_starts.append(to_plot_local(state_start_utc, timezone))
+            plot_ends.append(to_plot_local(state_end_utc, timezone))
     for event in global_events:
         if rendered_global_event_style(event) is not None:
             plot_starts.append(event.start_local.replace(tzinfo=None))
@@ -1837,7 +1901,7 @@ def plot_recording_timeline(
         recording_segments = [_bar_left_width(clip.start_utc, clip.end_utc, timezone) for clip in clips]
         ax_cov.broken_barh(
             recording_segments,
-            (0.18, 0.64),
+            (0.24, 0.52),
             facecolors=RECORDING_COLOR,
             alpha=0.9,
             zorder=2,

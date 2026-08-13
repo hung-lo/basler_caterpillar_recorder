@@ -771,8 +771,113 @@ class TimelinePlotTests(unittest.TestCase):
 
         self.assertEqual(
             [tick.get_text() for tick in ax_beh.get_yticklabels()],
-            timeline.ANIMAL_ORDER,
+            ["C06", "C08", "C01"],
         )
+
+    def test_ordered_animals_follow_developmental_outcome_then_death(self) -> None:
+        events = [
+            timeline.BehaviorEvent(
+                animal_id="C02",
+                start_local=dt.datetime(2026, 8, 11, 17, 36, 0),
+                end_local=dt.datetime(2026, 8, 11, 17, 36, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C02",
+                start_local=dt.datetime(2026, 8, 12, 7, 44, 0),
+                end_local=dt.datetime(2026, 8, 12, 7, 44, 1),
+                event="Pupation",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C08",
+                start_local=dt.datetime(2026, 8, 11, 18, 29, 0),
+                end_local=dt.datetime(2026, 8, 11, 18, 29, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C08",
+                start_local=dt.datetime(2026, 8, 12, 8, 33, 0),
+                end_local=dt.datetime(2026, 8, 12, 8, 33, 1),
+                event="Pupation",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
+                start_local=dt.datetime(2026, 8, 12, 14, 50, 0),
+                end_local=dt.datetime(2026, 8, 12, 14, 50, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C06",
+                start_local=dt.datetime(2026, 8, 12, 16, 50, 0),
+                end_local=dt.datetime(2026, 8, 12, 16, 50, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C04",
+                start_local=dt.datetime(2026, 8, 12, 17, 47, 0),
+                end_local=dt.datetime(2026, 8, 12, 17, 47, 1),
+                event="J_hang",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C07",
+                start_local=dt.datetime(2026, 8, 9, 9, 0, 0),
+                end_local=dt.datetime(2026, 8, 9, 9, 0, 1),
+                event="death",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C05",
+                start_local=dt.datetime(2026, 8, 10, 8, 10, 0),
+                end_local=dt.datetime(2026, 8, 10, 8, 10, 1),
+                event="death",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C03",
+                start_local=dt.datetime(2026, 8, 11, 5, 15, 0),
+                end_local=dt.datetime(2026, 8, 11, 5, 15, 1),
+                event="death",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+        ]
+
+        ordered = timeline.ordered_animals_for_timeline(timeline.ANIMAL_ORDER, events)
+
+        self.assertEqual(ordered, ["C02", "C08", "C01", "C06", "C04", "C07", "C05", "C03"])
+        self.assertLess(ordered.index("C02"), ordered.index("C07"))
+        self.assertLess(ordered.index("C08"), ordered.index("C03"))
+        self.assertLess(ordered.index("C01"), ordered.index("C07"))
+        self.assertLess(ordered.index("C06"), ordered.index("C05"))
+        self.assertLess(ordered.index("C04"), ordered.index("C03"))
+        self.assertLess(ordered.index("C07"), ordered.index("C05"))
+        self.assertLess(ordered.index("C05"), ordered.index("C03"))
 
     def test_global_events_do_not_create_a_ninth_animal_row(self) -> None:
         global_events = [
@@ -1436,16 +1541,17 @@ class TimelinePlotTests(unittest.TestCase):
         ]
 
         with mock.patch("matplotlib.axes.Axes.text") as mock_text:
-            timeline.plot_recording_timeline(
-                clips=clips,
-                events=[],
-                motion_states=[],
-                animals=timeline.ANIMAL_ORDER,
-                global_events=global_events,
-                timezone=dt.timezone(dt.timedelta(hours=-4)),
-                output_path=Path("ignored.png"),
-                annotate_clips=False,
-            )
+            with mock.patch("matplotlib.axes.Axes.broken_barh") as mock_broken_barh:
+                timeline.plot_recording_timeline(
+                    clips=clips,
+                    events=[],
+                    motion_states=[],
+                    animals=timeline.ANIMAL_ORDER,
+                    global_events=global_events,
+                    timezone=dt.timezone(dt.timedelta(hours=-4)),
+                    output_path=Path("ignored.png"),
+                    annotate_clips=False,
+                )
 
         label_calls = [
             call for call in mock_text.call_args_list if len(call.args) >= 3 and call.args[2] == "Low video quality"
@@ -1453,6 +1559,11 @@ class TimelinePlotTests(unittest.TestCase):
         self.assertEqual(len(label_calls), 1)
         self.assertGreater(label_calls[0].args[1], 0.8)
         self.assertIn("transform", label_calls[0].kwargs)
+        recording_calls = [
+            call for call in mock_broken_barh.call_args_list if call.kwargs.get("facecolors") == timeline.RECORDING_COLOR
+        ]
+        self.assertEqual(len(recording_calls), 1)
+        self.assertEqual(recording_calls[0].args[1], (0.24, 0.52))
 
     def test_plot_uses_clean_title_subtitle_and_timezone_axis_label(self) -> None:
         clips = [
