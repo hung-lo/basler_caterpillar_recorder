@@ -2148,7 +2148,7 @@ def plot_recording_timeline(
     if timing_enabled:
         record_timing("Matplotlib artist creation", artist_start)
         savefig_start = perf_counter()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     if timing_enabled:
         record_timing("savefig", savefig_start)
         record_timing("plot total", timing_start)
