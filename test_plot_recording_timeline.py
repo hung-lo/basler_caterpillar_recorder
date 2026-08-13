@@ -2059,6 +2059,15 @@ class TimelinePlotTests(unittest.TestCase):
             ),
             timeline.BehaviorEvent(
                 animal_id="C01",
+                start_local=dt.datetime(2026, 8, 9, 15, 10, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 10, 1),
+                event="Pupation",
+                kind="event",
+                notes="",
+                is_point=True,
+            ),
+            timeline.BehaviorEvent(
+                animal_id="C01",
                 start_local=dt.datetime(2026, 8, 9, 14, 58, 0),
                 end_local=dt.datetime(2026, 8, 9, 15, 2, 0),
                 event="feeding",
@@ -2076,7 +2085,7 @@ class TimelinePlotTests(unittest.TestCase):
             timeline.BehaviorEvent(
                 animal_id="C01",
                 start_local=dt.datetime(2026, 8, 9, 15, 6, 0),
-                end_local=dt.datetime(2026, 8, 9, 15, 20, 0),
+                end_local=dt.datetime(2026, 8, 9, 15, 8, 0),
                 event="observation",
                 kind="event",
                 notes="manual after cutoff",
@@ -2157,16 +2166,21 @@ class TimelinePlotTests(unittest.TestCase):
 
         scatter_markers = [call.kwargs["marker"] for call in mock_scatter.call_args_list]
         self.assertIn("v", scatter_markers)
-        self.assertNotIn("D", scatter_markers)
+        self.assertIn("D", scatter_markers)
         self.assertNotIn("X", scatter_markers)
         self.assertTrue(fig.axes)
-        ax_motion = fig.axes[1]
-        line_xmax = max(
-            timeline.mdates.date2num(max(line.get_xdata()))
-            for line in ax_motion.get_lines()
-            if len(line.get_xdata()) > 0
-        )
-        self.assertLessEqual(line_xmax, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 0, 0)))
+        manual_calls = [
+            call
+            for call in mock_broken_barh.call_args_list
+            if call.kwargs.get("facecolors") == timeline.INTERVAL_BAR_COLOR
+        ]
+        self.assertEqual(len(manual_calls), 1)
+        manual_left, manual_width = manual_calls[0].args[0][0]
+        self.assertAlmostEqual(manual_left, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 6, 0)))
+        self.assertAlmostEqual(manual_width, 2 * 60 / 86400.0)
+        ax_beh = fig.axes[-1]
+        _xmin, xmax = ax_beh.get_xlim()
+        self.assertGreater(xmax, timeline.mdates.date2num(dt.datetime(2026, 8, 9, 15, 10, 0)))
 
     def test_events_after_death_are_not_plotted_but_death_marker_is_kept(self) -> None:
         events = [
