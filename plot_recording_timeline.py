@@ -88,6 +88,15 @@ MAX_MAJOR_GAP_LABELS = 6
 GOOGLE_SHEETS_HOST = "docs.google.com"
 GOOGLE_SHEETS_TIMEOUT_SECONDS = 30
 GOOGLE_SHEETS_USER_AGENT = "basler-caterpillar-recorder/1.0"
+TITLE_FONTSIZE = 16.5
+SUBTITLE_FONTSIZE = 10.5
+PANEL_TITLE_FONTSIZE = 11.5
+LEGEND_FONTSIZE = 9.25
+ANIMAL_TICK_FONTSIZE = 10.0
+TIME_TICK_FONTSIZE = 10.0
+AXIS_LABEL_FONTSIZE = 10.5
+SMALL_ANNOTATION_FONTSIZE = 8.0
+GAP_LABEL_FONTSIZE = 8.75
 GLOBAL_EVENT_ALIASES = {"all", "global", "*"}
 VIDEO_QUALITY_LOW_COLOR = "#F59E0B"
 VIDEO_QUALITY_LOW_ALPHA = 0.08
@@ -922,6 +931,7 @@ def configure_time_axis(axis, start_local: dt.datetime, end_local: dt.datetime) 
         axis.xaxis.set_minor_locator(NullLocator())
         axis.xaxis.set_minor_formatter(NullFormatter())
     axis.tick_params(axis="x", labelrotation=0)
+    axis.tick_params(axis="x", labelsize=TIME_TICK_FONTSIZE)
     for label in axis.get_xticklabels():
         label.set_ha("center")
 
@@ -1603,7 +1613,7 @@ def draw_timeline_legend(axis, legend_handle_map: dict[str, Line2D | Patch]) -> 
         loc="center left",
         bbox_to_anchor=(0.0, 0.52),
         frameon=False,
-        fontsize=8.0,
+        fontsize=LEGEND_FONTSIZE,
         handlelength=1.25,
         handletextpad=0.45,
         columnspacing=1.05,
@@ -1736,7 +1746,7 @@ def plot_recording_timeline(
         x=0.08,
         y=0.975,
         ha="left",
-        fontsize=14.5,
+        fontsize=TITLE_FONTSIZE,
         fontweight="bold",
         color="#0f172a",
     )
@@ -1746,7 +1756,7 @@ def plot_recording_timeline(
         subtitle,
         ha="left",
         va="top",
-        fontsize=10,
+        fontsize=SUBTITLE_FONTSIZE,
         color="#475569",
     )
 
@@ -1817,7 +1827,7 @@ def plot_recording_timeline(
                 transform=blended_transform_factory(ax_cov.transData, ax_cov.transAxes),
                 ha="center",
                 va="bottom",
-                fontsize=7.5,
+                fontsize=SMALL_ANNOTATION_FONTSIZE,
                 color="#92400e",
                 zorder=4,
                 clip_on=True,
@@ -1837,15 +1847,15 @@ def plot_recording_timeline(
                 center = left + width / 2.0
                 duration_min = clip.duration_s / 60.0
                 ax_cov.text(
-                    center,
-                    0.86,
-                    f"{clip.camera_label}  {duration_min:.1f}m",
-                    ha="center",
-                    va="bottom",
-                    fontsize=7,
-                    color="#1f2937",
-                    clip_on=True,
-                )
+                center,
+                0.86,
+                f"{clip.camera_label}  {duration_min:.1f}m",
+                ha="center",
+                va="bottom",
+                fontsize=SMALL_ANNOTATION_FONTSIZE,
+                color="#1f2937",
+                clip_on=True,
+            )
 
         ax_cov.set_ylim(0, 1)
         ax_cov.set_yticks([])
@@ -1875,12 +1885,12 @@ def plot_recording_timeline(
                 format_gap_duration((gap_end_utc - gap_start_utc).total_seconds()),
                 ha="center",
                 va="center",
-                fontsize=8,
+                fontsize=GAP_LABEL_FONTSIZE,
                 color="#475569",
                 zorder=1,
             )
 
-    ax_cov.set_title("Recording coverage", loc="left", fontsize=11, color="#0f172a", pad=8)
+    ax_cov.set_title("Recording coverage", loc="left", fontsize=PANEL_TITLE_FONTSIZE, color="#0f172a", pad=8)
     ax_cov.tick_params(axis="x", labelbottom=False)
 
     if ax_motion is not None:
@@ -1889,14 +1899,15 @@ def plot_recording_timeline(
             bin_minutes=motion_plot_bin_minutes,
             stat=motion_plot_stat,
         )
-        ax_motion.set_title("Motion energy", loc="left", fontsize=11, color="#0f172a", pad=8)
+        ax_motion.set_title("Motion energy", loc="left", fontsize=PANEL_TITLE_FONTSIZE, color="#0f172a", pad=8)
         ax_motion.set_yticks(range(len(behavior_rows)))
         ax_motion.set_yticklabels(behavior_rows)
-        ax_motion.set_ylabel("Animal")
+        ax_motion.set_ylabel("Animal", fontsize=AXIS_LABEL_FONTSIZE)
         ax_motion.set_ylim(-0.5, len(behavior_rows) - 0.5)
         ax_motion.invert_yaxis()
         ax_motion.grid(True, axis="x", color="#cbd5e1", alpha=0.18, linewidth=0.45)
         ax_motion.tick_params(axis="x", labelbottom=False)
+        ax_motion.tick_params(axis="y", labelsize=ANIMAL_TICK_FONTSIZE)
         alternating_row_backgrounds(ax_motion, len(behavior_rows))
         for y in range(len(behavior_rows) + 1):
             ax_motion.axhline(y - 0.5, color=ROW_SEPARATOR_COLOR, linewidth=0.7, zorder=0.2)
@@ -1940,15 +1951,16 @@ def plot_recording_timeline(
     )
     draw_timeline_legend(ax_legend, legend_handle_map)
 
-    ax_beh.set_title("Behavior annotations", loc="left", fontsize=11, color="#0f172a", pad=5)
+    ax_beh.set_title("Behavior annotations", loc="left", fontsize=PANEL_TITLE_FONTSIZE, color="#0f172a", pad=5)
     ax_beh.set_yticks(range(len(behavior_rows)))
     ax_beh.set_yticklabels(behavior_rows)
-    ax_beh.set_ylabel("Animal")
+    ax_beh.set_ylabel("Animal", fontsize=AXIS_LABEL_FONTSIZE)
     ax_beh.set_ylim(-0.5, len(behavior_rows) - 0.5)
     ax_beh.invert_yaxis()
     ax_beh.grid(True, axis="x", color="#cbd5e1", alpha=0.18, linewidth=0.45)
-    ax_beh.set_xlabel(x_axis_time_label(timezone, first_utc, last_utc))
+    ax_beh.set_xlabel(x_axis_time_label(timezone, first_utc, last_utc), fontsize=AXIS_LABEL_FONTSIZE)
     alternating_row_backgrounds(ax_beh, len(behavior_rows))
+    ax_beh.tick_params(axis="y", labelsize=ANIMAL_TICK_FONTSIZE)
 
     for y in range(len(behavior_rows) + 1):
         ax_beh.axhline(y - 0.5, color=ROW_SEPARATOR_COLOR, linewidth=0.7, zorder=0.35)
@@ -2077,7 +2089,7 @@ def plot_recording_timeline(
                     "\u26a1",
                     ha="center",
                     va="center",
-                    fontsize=13,
+                    fontsize=14.0,
                     color=point_color,
                     fontweight="bold",
                     zorder=6,
@@ -2126,7 +2138,7 @@ def plot_recording_timeline(
             "\u26a1",
             ha="center",
             va="center",
-            fontsize=15,
+            fontsize=16.0,
             color=STIM_COLOR,
             fontweight="bold",
             zorder=STIM_MARKER_ZORDER,

@@ -1329,6 +1329,7 @@ class TimelinePlotTests(unittest.TestCase):
                 "Manual interval",
             ],
         )
+        self.assertEqual(legend_kwargs["fontsize"], timeline.LEGEND_FONTSIZE)
         self.assertEqual(legend_kwargs["ncol"], 9)
         self.assertEqual(
             legend_kwargs["bbox_to_anchor"],
@@ -1477,13 +1478,19 @@ class TimelinePlotTests(unittest.TestCase):
         )
 
         self.assertEqual(fig._suptitle.get_text(), "Continuous behavioral monitoring of monarch caterpillars")
+        self.assertEqual(fig._suptitle.get_fontsize(), timeline.TITLE_FONTSIZE)
         subtitle_texts = [text.get_text() for text in fig.texts if text.get_text().startswith("Elapsed ")]
         self.assertEqual(len(subtitle_texts), 1)
+        subtitle_artist = next(text for text in fig.texts if text.get_text().startswith("Elapsed "))
+        self.assertEqual(subtitle_artist.get_fontsize(), timeline.SUBTITLE_FONTSIZE)
         self.assertIn("recorded", subtitle_texts[0])
         self.assertIn("coverage", subtitle_texts[0])
         self.assertNotIn("Woods Hole local time", subtitle_texts[0])
-        self.assertIn("Local time - America/New_York", self.behavior_axis(fig).get_xlabel())
-        self.assertIn("EDT", self.behavior_axis(fig).get_xlabel())
+        behavior_axis = self.behavior_axis(fig)
+        self.assertIn("Local time - America/New_York", behavior_axis.get_xlabel())
+        self.assertIn("EDT", behavior_axis.get_xlabel())
+        self.assertEqual(behavior_axis.xaxis.label.get_fontsize(), timeline.AXIS_LABEL_FONTSIZE)
+        self.assertEqual(behavior_axis.get_yticklabels()[0].get_fontsize(), timeline.ANIMAL_TICK_FONTSIZE)
 
     def test_subtract_intervals_no_overlap_returns_original_interval(self) -> None:
         start = dt.datetime(2026, 8, 9, 10, 0, 0, tzinfo=dt.timezone.utc)
