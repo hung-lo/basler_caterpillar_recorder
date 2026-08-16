@@ -17,7 +17,7 @@ The recorder supports:
 
 If you use a different camera, copy a YAML template and update the model, serial, frame size, and rotation before recording.
 
-### Acquisition and preprocessing software
+## Acquisition and preprocessing software
 
 Camera acquisition and primary video preprocessing were performed using:
 
