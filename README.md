@@ -29,6 +29,16 @@ The recorder supports:
 
 If you use a different camera, copy a YAML template and update the model, serial, frame size, and rotation before recording.
 
+## Acquisition and preprocessing software
+
+Camera acquisition and primary video preprocessing were performed using:
+
+https://github.com/hung-lo/basler_caterpillar_recorder
+
+For reproduction of the MBL 2026 dataset, use the frozen release:
+
+**`mbl-2026-handoff`**
+
 ## At a glance
 
 - `record_basler.py` is the main CLI for listing cameras, previewing, dry runs, and scheduled recording.
