@@ -4,6 +4,18 @@ This repository documents and drives the current one-camera recording workflow f
 
 <img src="docs/images/recording_preview.png" alt="Recording preview window" width="720">
 
+## MBL 2026 project handoff
+
+This repository contains the acquisition and primary video-preprocessing software used for the MBL 2026 longitudinal monarch caterpillar recordings.
+
+For the frozen recorder/preprocessing snapshot associated with the MBL dataset, use the [`mbl-2026-handoff`](https://github.com/hung-lo/basler_caterpillar_recorder/releases/tag/mbl-2026-handoff) release (commit `fe56c46`).
+
+The downstream analysis, frozen analysis inputs, reproducible notebooks, figures, and handoff documentation are maintained separately in [`mbl2026-caterpillar-behavior-analysis`](https://github.com/hung-lo/mbl2026-caterpillar-behavior-analysis).
+
+Large raw and cropped video data are intentionally stored outside Git. Their archive locations are documented in the analysis repository's [`DATA_ACCESS.md`](https://github.com/hung-lo/mbl2026-caterpillar-behavior-analysis/blob/main/DATA_ACCESS.md).
+
+Development on this repository's `main` branch may continue after the frozen MBL release.
+
 The recorder supports:
 
 - setup preview that does not record;
